@@ -85,6 +85,45 @@ curl '<the-full-127.0.0.1-callback-url>'
 The CLI's local callback server then completes the login. (Alternative:
 `ssh -L <port>:127.0.0.1:<port> user@server`, then open the URL.)
 
+## PR gate — CodeRabbit-green before any PR
+
+`coderabbit-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "review before you
+open a PR". Wired as a Claude Code `PreToolUse` hook, it blocks `gh pr create`
+unless a CodeRabbit pass is recorded for the **current HEAD commit** — a stale
+pass from before later commits does not count.
+
+Wire the hook into `~/.claude/settings.json` (user-level → applies in every repo):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "bash /absolute/path/to/CodeRabbit-Claude-MCP/hooks/pre-pr-coderabbit-gate.sh" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Workflow:
+
+```bash
+coderabbit review --base main      # review the change, iterate until green
+./coderabbit-gate record           # record the pass for the current HEAD
+gh pr create ...                   # now allowed
+```
+
+`./coderabbit-gate status` shows the recorded pass vs HEAD; `clear` removes it.
+
+Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
+clients). The hook is **fail-open** — any internal error lets the command through
+rather than wedging your shell — so it is a strong speed-bump, not a hard
+security boundary.
+
 ## Notes
 
 - The server logs only to stderr; stdout is reserved for the MCP protocol.
