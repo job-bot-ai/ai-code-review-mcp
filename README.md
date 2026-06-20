@@ -120,8 +120,11 @@ gh pr create ...                   # now allowed
 `./coderabbit-gate status` shows the recorded pass vs HEAD; `clear` removes it.
 
 Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
-clients). The hook is **fail-open** — any internal error lets the command through
-rather than wedging your shell — so it is a strong speed-bump, not a hard
+clients). It requires `jq` (to extract the command from the hook payload) and
+matches `gh pr create` only in **command position** — so commands that merely
+mention the string (echo, grep, commit messages, heredocs) are not blocked. The
+hook is **fail-open** — any internal error, or a missing `jq`, lets the command
+through rather than wedging your shell — so it is a strong speed-bump, not a hard
 security boundary.
 
 ## Notes
