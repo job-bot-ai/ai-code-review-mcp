@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# PreToolUse(Bash) hook: block `gh pr create` unless a CodeRabbit pass is recorded
-# for the current HEAD. Wire into ~/.claude/settings.json (matcher: "Bash").
-# Part of https://github.com/job-bot-ai/CodeRabbit-Claude-MCP
+# PreToolUse(Bash) hook: block `gh pr create` unless all required reviewer passes
+# (CodeRabbit + Codex) are recorded for the current HEAD via `review-gate`.
+# Wire into ~/.claude/settings.json (matcher: "Bash"). Filename kept for back-compat
+# with existing settings.json entries.
+# Part of https://github.com/job-bot-ai/ai-code-review-mcp
 #
 # Fail-open by design: any unexpected error exits non-2 so it never wedges the shell;
 # only a genuine "no green light" condition returns exit 2 (which blocks the tool call).
@@ -33,7 +35,7 @@ case "$cmd" in *--help*|*" -h"*) exit 0;; esac
 printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+create([[:space:];|&)}]|$)' || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-gate="$here/../coderabbit-gate"
+gate="$here/../review-gate"
 
 # Fail-open if the gate helper is missing/unreadable — never wedge the shell.
 [ -r "$gate" ] || exit 0
@@ -47,10 +49,11 @@ fi
 if [ "$rc" -eq 1 ]; then               # genuine no-pass / stale → block
   why="$(cat "$err" 2>/dev/null || true)"; rm -f "$err"
   {
-    echo "BLOCKED by CodeRabbit PR gate: ${why:-no green light recorded}."
-    echo "Run a CodeRabbit review on this change, iterate until it is green, then record the pass:"
-    echo "    bash $gate record"
-    echo "and re-run \`gh pr create\`. (Standing rule: CodeRabbit-green before any PR.)"
+    echo "BLOCKED by the AI code-review PR gate: ${why:-no green light recorded}."
+    echo "Run BOTH reviews on this change, iterate until each is green, then record each pass:"
+    echo "    coderabbit review --base main  && bash $gate record coderabbit"
+    echo "    codex review --base main       && bash $gate record codex"
+    echo "then re-run \`gh pr create\`. (Standing rule: CodeRabbit + Codex green before any PR.)"
   } >&2
   exit 2
 fi
