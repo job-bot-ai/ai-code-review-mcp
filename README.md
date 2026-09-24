@@ -9,8 +9,13 @@ Reviewers wrapped (each shells out to its CLI; no review logic reimplemented):
 
 | Reviewer | CLI | Tools |
 |---|---|---|
-| CodeRabbit | `coderabbit review` (v0.6.1) | `coderabbit_review`, `coderabbit_status` |
+| CodeRabbit | `coderabbit review` (v0.8.0) | `coderabbit_review`, `coderabbit_status` |
 | OpenAI Codex | `codex review` (codex-cli 0.125) | `codex_review`, `codex_status` |
+
+`coderabbit_review` drives the CLI's `--agent` structured event stream and parses
+it into a findings report. It probes `coderabbit review --help` once (cached) to
+stay compatible across CLI versions — e.g. pre-0.8 CLIs used `--plain` and
+`--type <scope>`; 0.8+ dropped those for `--agent` and discrete scope flags.
 
 ## Prerequisites
 
@@ -64,7 +69,8 @@ follows the config key you choose, not the server's internal name).
 Each reviewer exposes a `*_status` tool (CLI version + auth) and a `*_review` tool.
 
 - **`coderabbit_review`** — `type` (`uncommitted`/`committed`/`all`), `base`,
-  `base_commit`, `output` (`plain`/`agent`), `light`, `path`, `extra_args`,
+  `base_commit`, `output` (`agent` default — parsed structured findings — or
+  `plain` for the CLI's own text report), `light`, `path`, `extra_args`,
   `timeout_seconds` (default 600).
 - **`codex_review`** — `base`, `uncommitted` (bool), `commit`, `title`,
   `instructions` (custom review prompt), `path`, `extra_args`, `timeout_seconds`
