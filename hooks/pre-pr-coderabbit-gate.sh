@@ -13,7 +13,7 @@
 input="$(cat)"
 
 # Fast path: if the payload can't possibly contain `gh ... pr ... create`, allow now.
-printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*create' || exit 0
+printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new)' || exit 0   # `gh pr new` is an alias
 
 # Pull the actual command string out of tool_input.command. jq is required to isolate the
 # command from surrounding JSON reliably; without it, warn (not silent) and fail open
@@ -31,7 +31,7 @@ fi
 # and pipes into shells, and lets mentions that are only data (commit messages, grep
 # patterns) through. Only the no-node fallback below keeps the command-position match.
 # (`\n`/`\t` escapes count as separators: `printf 'cd x\ngh pr create' | bash`.)
-printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+create([^[:alnum:]_-]|$)' || exit 0
+printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new)([^[:alnum:]_-]|$)' || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"
@@ -78,7 +78,7 @@ if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
 else
   # Without the resolver: gate only `gh pr create` in command position (start of the
   # command or after ; | & ( { ), as before; env-prefixed and `bash -c` forms aren't seen.
-  printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+create([[:space:];|&)}]|$)' || exit 0
+  printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+(create|new)([[:space:];|&)}]|$)' || exit 0
   case "$cmd" in *--help*|*" -h"*) exit 0;; esac   # crude help check without the resolver
   fallback_or_block "node unavailable"
 fi

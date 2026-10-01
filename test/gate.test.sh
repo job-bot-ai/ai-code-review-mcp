@@ -234,5 +234,8 @@ expect "if the resolver fails, a plain command falls back to the session cwd wit
 run "$T/a" "echo 'cd $T/u && gh pr create --fill' | cat | tee /dev/null | bash"
 expect "text passed through cat/tee before reaching bash is still walked" 2 stderr "$T/u: missing/stale"
 
+run "$T/u" "gh pr new --fill"
+expect "gh pr new (alias of create) is gated" 2 stderr "$T/u: missing/stale"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

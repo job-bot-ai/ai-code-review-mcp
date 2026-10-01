@@ -199,6 +199,10 @@ test('piped text survives pass-through filters', () => {
   assert.deepEqual(hits("echo 'cd /u && gh pr create' | cat | sort | bash").map((h) => h.dir), ['/u']);
 });
 
+test('gh pr new is the same command as gh pr create', () => {
+  assert.deepEqual(hits('cd /u && gh pr new --fill').map((h) => h.dir), ['/u']);
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');

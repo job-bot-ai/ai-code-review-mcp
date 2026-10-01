@@ -311,7 +311,7 @@ const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep',
 // Script interpreters: a heredoc/stdin/file fed to them is nearly always a file edit, so a
 // mention there is treated as data; inline code (-c/-e) that mentions gh pr create is opaque.
 const INTERPRETERS = new Set(['python', 'python3', 'node', 'perl', 'ruby', 'php']);
-const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+create\b/; // same boundary as the hook's pre-filter
+const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+(create|new)\b/; // same boundary as the hook's pre-filter
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
@@ -339,7 +339,9 @@ export function awkRuns(program) {
 }
 
 function isGhPrCreate(words) {
-  return words.length >= 3 && !words[0].dynamic && words[0].value === 'gh' && words[1].value === 'pr' && words[2].value === 'create';
+  // `gh pr new` is gh's built-in alias of `gh pr create`.
+  return words.length >= 3 && !words[0].dynamic && words[0].value === 'gh' && words[1].value === 'pr' &&
+    (words[2].value === 'create' || words[2].value === 'new');
 }
 
 /**
