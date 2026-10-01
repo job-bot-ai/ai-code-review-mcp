@@ -6,7 +6,7 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 hook="$root/hooks/pre-pr-coderabbit-gate.sh"
 gate="$root/review-gate"
-T="$(mktemp -d)"
+T="$(cd "$(mktemp -d)" && pwd -P)"   # physical path: macOS /var is a symlink to /private/var
 trap 'rm -rf "$T"' EXIT
 unset REVIEW_GATE_REQUIRED
 export GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -230,6 +230,9 @@ expect "if the resolver fails, a risky command blocks instead of using the sessi
 payload="$(jq -cn --arg c "gh pr create --fill" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
 out="$(printf '%s' "$payload" | bash "$T/broken/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
 expect "if the resolver fails, a plain command falls back to the session cwd with a note" 0 stdout "target resolver failed"
+
+run "$T/a" "echo 'cd $T/u && gh pr create --fill' | cat | tee /dev/null | bash"
+expect "text passed through cat/tee before reaching bash is still walked" 2 stderr "$T/u: missing/stale"
 
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

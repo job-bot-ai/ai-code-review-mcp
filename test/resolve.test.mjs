@@ -195,6 +195,10 @@ test('case arms: patterns vs subshells inside an arm', () => {
   assert.equal(dirOf('case x in y) cd /green ;; esac; gh pr create'), null);
 });
 
+test('piped text survives pass-through filters', () => {
+  assert.deepEqual(hits("echo 'cd /u && gh pr create' | cat | sort | bash").map((h) => h.dir), ['/u']);
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');

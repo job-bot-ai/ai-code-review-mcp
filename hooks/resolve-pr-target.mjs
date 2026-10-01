@@ -317,14 +317,15 @@ const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
 /** Roughly what a pipeline element writes to stdout, over-approximated so nothing is
  * hidden: echo's words joined by spaces; printf's format text and then each argument on
- * its own line; `\n` escapes as newlines; plus any heredoc/here-string body. */
-function pipedText(cmd) {
+ * its own line; `\n` escapes as newlines; any heredoc/here-string body; and whatever it
+ * received on its own stdin (pass-through filters: `... | cat | bash`, `| tee f | sh`). */
+function pipedText(cmd, stdin = null) {
   const c0 = cmd[0]?.value;
   let args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !/^\d*[<>]/.test(w.value));
   if (c0 === 'echo') while (args.length && /^-[neE]+$/.test(args[0].value)) args = args.slice(1); // echo's own flags
   const words = c0 === 'printf' ? args.map((w) => w.value).join('\n') : args.map((w) => w.value).join(' ');
   const bodies = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
-  return [words.replace(/\\n/g, '\n').replace(/\\t/g, '\t'), ...bodies].filter(Boolean).join('\n');
+  return [words.replace(/\\n/g, '\n').replace(/\\t/g, '\t'), ...bodies, stdin].filter(Boolean).join('\n');
 }
 
 /**
@@ -455,7 +456,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     let cmd = words;
     words = [];
     const fromPipe = prevOp === '|' ? pipeText : null;
-    pipeText = nextOp === '|' ? pipedText(cmd) : null;
+    pipeText = nextOp === '|' ? pipedText(cmd, fromPipe) : null;
     for (const w of cmd) {
       for (const body of w.substs ?? []) nested(body, scope().dir);
       for (const body of w.heredoc?.substs ?? []) nested(body, scope().dir);
