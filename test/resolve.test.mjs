@@ -166,6 +166,15 @@ test('agy review: piped words, push --repo, sed/awk only opaque when they run co
   assert.equal(hits("sed 's/.*/gh pr create --fill/e' x").opaque, 'sed');
 });
 
+test('agy re-review: single-arg printf and echo -e into a shell; awk || is not execution', () => {
+  assert.deepEqual(hits("printf 'cd /u && gh pr create --fill\\n' | bash").map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits("echo -e 'cd /u\\ngh pr create --fill' | bash").map((h) => h.dir), ['/u']);
+  assert.equal(hits("cd /r && awk '/gh pr create/ || count++' log.txt").opaque, undefined);
+  assert.equal(hits("awk '/gh pr create|gh pr view/ {n++}' log").opaque, undefined);
+  assert.equal(hits(`awk '{print "gh pr create --fill" | "sh"}'`).opaque, 'awk');
+  assert.equal(hits(`awk 'BEGIN{"gh pr create" | getline x}'`).opaque, 'awk');
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');

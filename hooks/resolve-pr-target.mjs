@@ -309,14 +309,16 @@ const MENTION = /(^|[^A-Za-z0-9_-])gh\s+pr\s+create\b/; // same boundary as the 
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
-/** Roughly what a pipeline element writes to stdout: echo's words joined by spaces,
- * printf's arguments one per line (the common '%s\n'), plus any heredoc/here-string body. */
+/** Roughly what a pipeline element writes to stdout, over-approximated so nothing is
+ * hidden: echo's words joined by spaces; printf's format text and then each argument on
+ * its own line; `\n` escapes as newlines; plus any heredoc/here-string body. */
 function pipedText(cmd) {
   const c0 = cmd[0]?.value;
-  const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !/^\d*[<>]/.test(w.value));
-  const words = c0 === 'printf' ? args.slice(1).map((w) => w.value).join('\n') : args.map((w) => w.value).join(' ');
+  let args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !/^\d*[<>]/.test(w.value));
+  if (c0 === 'echo') while (args.length && /^-[neE]+$/.test(args[0].value)) args = args.slice(1); // echo's own flags
+  const words = c0 === 'printf' ? args.map((w) => w.value).join('\n') : args.map((w) => w.value).join(' ');
   const bodies = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
-  return [words, ...bodies].filter(Boolean).join('\n');
+  return [words.replace(/\\n/g, '\n'), ...bodies].filter(Boolean).join('\n');
 }
 
 function isGhPrCreate(words) {
@@ -579,7 +581,9 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     // sed/awk only run commands via awk system()/print|"cmd" or sed's e command/flag.
     if (c0 === 'awk' || c0 === 'gawk' || c0 === 'sed') {
-      const runs = c0 === 'sed' ? /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/ : /system\s*\(|\|\s*["\w]|\|&/;
+      const runs = c0 === 'sed'
+        ? /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/
+        : /system\s*\(|\bprintf?\b[^;}]*\|\s*"|"\s*\|\s*getline|\|&/; // not `||` or regex alternation
       if (mentioned() && cmd.slice(1).some((w) => runs.test(w.value))) opaque(c0);
       return;
     }
