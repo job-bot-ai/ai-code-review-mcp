@@ -54,9 +54,9 @@ if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
   reason="$(printf '%s' "$res" | jq -r '.reason // empty' 2>/dev/null || true)"
   case "$status" in
     ok)    targets="$(printf '%s' "$res" | jq -c '.targets[]')" ;;
-    help)  exit 0 ;;
+    help|none) exit 0 ;;   # --help, or `gh pr create` only mentioned as data (heredoc, quotes)
     block) block "$reason" ;;
-    none|error)
+    error)
       # Falling back to the session cwd is only safe when nothing could move the PR elsewhere.
       if [ "$(printf '%s' "$res" | jq -r '.risky')" = "true" ]; then
         block "couldn't work out which repo this PR comes from ($reason), and the command changes directory or names a repo/branch. Simplify it, e.g. write the PR body to a file and use --body-file."

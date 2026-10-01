@@ -81,7 +81,38 @@ test('only gh pr create in command position counts', () => {
   assert.equal(hits('echo "gh pr create"').length, 0);
   assert.equal(hits('grep -r gh pr create .').length, 0);
   assert.equal(hits('gh pr view 12').length, 0);
-  assert.equal(hits("bash -c 'cd /x && gh pr create'").length, 0);
+});
+
+test('code that runs in a subshell is walked: $(...), backticks, <(...), bash -c, eval', () => {
+  assert.deepEqual(hits("bash -c 'cd /x && gh pr create'").map((h) => h.dir), ['/x']);
+  assert.deepEqual(hits('cd /a && PR_URL=$(gh pr create --head x --fill)').map((h) => h.dir), ['/a']);
+  assert.deepEqual(hits('cd /a && echo "$(cd /b && gh pr create)"').map((h) => h.dir), ['/b']);
+  assert.deepEqual(hits('cd /a && echo `gh pr create`').map((h) => h.dir), ['/a']);
+  assert.deepEqual(hits('eval gh pr create --fill').map((h) => h.dir), ['/session']);
+  assert.deepEqual(hits('timeout 60 gh pr create --fill').map((h) => h.dir), ['/session']);
+  assert.deepEqual(hits('env -C /x gh pr create').map((h) => h.dir), [null]);
+  // a cd inside a substitution doesn't move the outer shell
+  assert.equal(dirOf('x=$(cd /b); gh pr create'), '/session');
+});
+
+test('gh pr create mentioned only as data is not a PR', () => {
+  const commit = 'cd /w && git commit -m "$(cat <<\'EOF\'\ngh pr create --repo o/r used to be gated\nEOF\n)"';
+  assert.equal(hits(commit).length, 0);
+  assert.equal(hits("cat > x.sh <<'EOF'\ncd \"$1\"\ngh pr create --fill\nEOF").length, 0);
+});
+
+test('round-2 shell model: && lists, case in subshell, indirect cd, recovery, pushes', () => {
+  assert.equal(dirOf('false && cd /green; gh pr create'), null);
+  assert.equal(dirOf('cd /a && git push && gh pr create'), '/a');
+  assert.equal(dirOf('cd /a && make &\ngh pr create'), '/session'); // backgrounded list is a subshell
+  assert.equal(dirOf('(case x in y) ;; esac; cd /green); gh pr create'), '/session');
+  assert.equal(dirOf("$'cd' /x && gh pr create"), '/x');
+  assert.equal(dirOf('eval "$(echo cd /x)" && gh pr create'), null);
+  assert.equal(dirOf('source <(echo cd /x) && gh pr create'), null);
+  assert.equal(dirOf('cd "$(git rev-parse --show-toplevel)"; cd /repo && gh pr create'), '/repo');
+  const [h] = hits('git push -u origin HEAD:nice-name && gh pr create --head nice-name');
+  assert.deepEqual(h.pushes, [{ dir: '/session', src: 'HEAD', dst: 'nice-name' }]);
+  assert.deepEqual(hits('git -C /r push origin +feat:refs/heads/x; gh pr create')[0].pushes, [{ dir: '/r', src: 'feat', dst: 'x' }]);
 });
 
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {

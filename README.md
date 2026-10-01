@@ -90,19 +90,26 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
 
 - `cd`/`pushd`/`popd` before it are followed: literal paths, `~`, `$HOME`, `( ... )`
   subshells, `builtin cd`/`command cd`. A `cd` in a pipeline or background job doesn't
-  move `gh`, just as in bash. Heredocs and `$(...)` bodies (e.g. a PR body via
-  `--body "$(cat <<'EOF' ... EOF)"`) are treated as data and nested code.
+  move `gh`, just as in bash.
+- Code that runs is walked too, from the directory it runs in:
+  - `$(...)`, backticks and `<(...)` (e.g. `PR_URL=$(gh pr create ...)`);
+  - literal `bash -c '...'` and `eval ...` scripts;
+  - `timeout`/`env`/`sudo`-style runners.
+- Heredoc bodies and quoted strings are data. A command that only *mentions*
+  `gh pr create` (a commit message, a script being written) isn't gated.
 - When it can't know where `gh` runs, it **blocks** rather than guess:
   - a non-literal `cd` (`cd $X`, `cd -`);
-  - a `cd` that may or may not run (after `||`, inside `if`/`case`/loops/functions);
-  - `eval cd …` or `CDPATH`;
+  - a `cd` that may or may not run: after `||`, inside `if`/`case`/loops/functions, or
+    `x && cd dir` whose list ends before `gh pr create`;
+  - `eval cd …`, `eval`/`source` with a non-literal argument, or `CDPATH`;
   - `gh pr create` inside a function, or with a non-literal argument such as `$ARGS`.
 - `-R/--repo [HOST/]OWNER/REPO` (or `GH_REPO`) must match one of that checkout's
   remotes; otherwise it blocks and asks you to run `gh pr create` from the target checkout.
 - `-H/--head [OWNER:]BRANCH` (including clusters like `-dH`), resolved in this order:
   - the owner, if given, must own one of the checkout's remotes;
   - a branch checked out in another worktree is checked there;
-  - otherwise the local branch's tip, or a fetched remote branch's tip, must have been reviewed.
+  - otherwise the local branch's tip, a fetched remote branch's tip, or the source of a
+    `git push <remote> <src>:<branch>` earlier in the same command must have been reviewed.
 - A `--repo`/`--head` PR from a non-git directory is blocked. A plain `gh pr create`
   outside git is not gated (gh fails there anyway); this is announced.
 - If the command can't be parsed, the gate falls back to the session's cwd and says so,
@@ -110,6 +117,9 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
 - `gh pr create --help` isn't gated. A `-h` that is only part of an argument (for example
   a PR body that says "use -h") no longer skips the gate.
 - `git -C <dir>` is ignored on purpose: it never changes where `gh` runs.
+- Out of scope: deliberately hiding a `cd` behind a command word built from an expansion
+  (`$X /dir`, `$(echo cd) /dir`). The gate is a speed-bump against mistakes, not a
+  sandbox.
 
 When it gated on a different repo than the cwd, or relied on a skip, the hook says so
 (as a `systemMessage`).

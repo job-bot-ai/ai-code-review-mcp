@@ -9,10 +9,11 @@
 //   { "status": "ok", "targets": [{ "dir", "rev"|null, "note"|null }, ...] }
 //   { "status": "block", "reason": "..." }   a target can't be determined safely
 //   { "status": "help" }                     `gh pr create --help`: nothing to gate
-//   { "status": "none", "reason": "..." }    no `gh pr create` in command position
-//   { "status": "error", "reason": "..." }   the command couldn't be parsed
-// For "none"/"error", "risky": true means the command changes directory or names a
-// repo/branch, so falling back to the session cwd could check the wrong repo.
+//   { "status": "none" }                     `gh pr create` only appears as data (a heredoc
+//                                            body, a quoted string): no PR is created
+//   { "status": "error", "reason": "..." }   the command couldn't be parsed; "risky": true
+//                                            when it changes directory or names a repo/branch,
+//                                            so falling back to the session cwd could be wrong
 //
 // The shell model is deliberately conservative: when it can't tell where `gh` runs (a
 // non-literal `cd`, a `cd` that only runs conditionally, `eval cd ...`), the directory
@@ -126,23 +127,30 @@ function skipCommandSubst(src, i) {
   throw new Error('unterminated $(');
 }
 
+/** The code inside `...` (start = index of the opening backtick, end = past the closing one). */
+function backtickBody(src, start, end) {
+  return src.slice(start + 1, end - 1).replace(/\\([`\\$])/g, '$1');
+}
+
 /** Read a "..." string; i is just past the opening quote. */
 function readDoubleQuoted(src, i) {
   let value = '';
   let dynamic = false;
+  const substs = [];
   while (i < src.length) {
     const c = src[i];
-    if (c === '"') return { value, dynamic, end: i + 1 };
+    if (c === '"') return { value, dynamic, end: i + 1, substs };
     if (c === '\\') {
       const n = src[i + 1] ?? '';
       if ('"\\$`'.includes(n) && n) { value += n; i += 2; continue; }
       if (n === '\n') { i += 2; continue; }
       value += c; i += 1; continue;
     }
-    if (c === '`') { i = skipBackticks(src, i + 1); dynamic = true; continue; }
+    if (c === '`') { const end = skipBackticks(src, i + 1); substs.push(backtickBody(src, i, end)); dynamic = true; i = end; continue; }
     if (c === '$') {
       const v = readDollar(src, i);
       value += v.value; dynamic ||= v.dynamic; i = v.end;
+      if (v.subst !== undefined) substs.push(v.subst);
       continue;
     }
     value += c;
@@ -154,7 +162,10 @@ function readDoubleQuoted(src, i) {
 /** A `$...` expansion at i. $HOME is expanded; anything else is dynamic. */
 function readDollar(src, i) {
   const n = src[i + 1];
-  if (n === '(') return { value: '$(...)', dynamic: true, end: skipCommandSubst(src, i + 2) };
+  if (n === '(') {
+    const end = skipCommandSubst(src, i + 2);
+    return { value: '$(...)', dynamic: true, end, subst: src.slice(i + 2, end - 1) };
+  }
   if (n === '{') {
     if (src.startsWith('${HOME}', i)) return { value: homedir(), dynamic: false, end: i + 7 };
     return { value: '${...}', dynamic: true, end: skipBraceExpansion(src, i + 2) };
@@ -167,8 +178,9 @@ function readDollar(src, i) {
 
 /**
  * POSIX-shell tokenizer: words and the operators that separate commands. A word is
- * { type: 'word', value, dynamic, tilde } — `dynamic` when part of it comes from an
- * expansion we can't evaluate, `tilde` when it starts with an unquoted `~`.
+ * { type: 'word', value, dynamic, tilde, substs } — `dynamic` when part of it comes from
+ * an expansion we can't evaluate, `tilde` when it starts with an unquoted `~`, `substs`
+ * the bodies of any $(...), `...` or <(...) in it (code that runs, so it is walked too).
  */
 export function tokenize(src) {
   const out = [];
@@ -176,10 +188,11 @@ export function tokenize(src) {
   let word = null;
   let dynamic = false;
   let tilde = false;
+  let substs = [];
   const add = (s) => { if (word === null) tilde = false; word = (word ?? '') + s; };
   const push = () => {
-    if (word !== null) out.push({ type: 'word', value: word, dynamic, tilde });
-    word = null; dynamic = false; tilde = false;
+    if (word !== null) out.push({ type: 'word', value: word, dynamic, tilde, substs });
+    word = null; dynamic = false; tilde = false; substs = [];
   };
   let i = 0;
   while (i < src.length) {
@@ -191,16 +204,32 @@ export function tokenize(src) {
       continue;
     }
     if (c === "'") { const end = skipSingleQuoted(src, i + 1); add(src.slice(i + 1, end - 1)); i = end; continue; }
-    if (c === '"') { const r = readDoubleQuoted(src, i + 1); add(r.value); dynamic ||= r.dynamic; i = r.end; continue; }
-    if (c === '`') { i = skipBackticks(src, i + 1); add('`...`'); dynamic = true; continue; }
-    if (c === '$' && src[i + 1] === "'") { const end = skipAnsiC(src, i + 2); add(src.slice(i + 2, end - 1)); dynamic = true; i = end; continue; }
-    if (c === '$') { const r = readDollar(src, i); add(r.value); dynamic ||= r.dynamic; i = r.end; continue; }
+    if (c === '"') { const r = readDoubleQuoted(src, i + 1); add(r.value); dynamic ||= r.dynamic; substs.push(...r.substs); i = r.end; continue; }
+    if (c === '`') { const end = skipBackticks(src, i + 1); substs.push(backtickBody(src, i, end)); add('`...`'); dynamic = true; i = end; continue; }
+    if (c === '$' && src[i + 1] === "'") {
+      // ANSI-C quoting: literal unless it uses escapes we don't decode.
+      const end = skipAnsiC(src, i + 2);
+      const body = src.slice(i + 2, end - 1);
+      add(body); dynamic ||= body.includes('\\'); i = end;
+      continue;
+    }
+    if (c === '$') {
+      const r = readDollar(src, i);
+      add(r.value); dynamic ||= r.dynamic; i = r.end;
+      if (r.subst !== undefined) substs.push(r.subst);
+      continue;
+    }
     if (c === '<' && src.startsWith('<<<', i)) { push(); i += 3; continue; }
     if (c === '<' && src.startsWith('<<', i)) {
       push();
       const h = readHeredocDelim(src, i + 2);
       if (h.delim !== null) heredocs.push(h);
       i = h.end;
+      continue;
+    }
+    if ((c === '<' || c === '>') && src[i + 1] === '(') { // process substitution: code that runs
+      const end = skipCommandSubst(src, i + 2);
+      substs.push(src.slice(i + 2, end - 1)); add(`${c}(...)`); dynamic = true; i = end;
       continue;
     }
     if (c === '\n') {
@@ -241,7 +270,8 @@ export function tokenize(src) {
 const OPENERS = new Set(['if', 'while', 'until', 'for', 'select', 'case']);
 const CLOSERS = new Set(['fi', 'done', 'esac']);
 const CONTINUERS = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
-const WRAPPERS = new Set(['eval', 'exec', 'env', 'sudo', 'nohup', 'xargs', 'nice', 'timeout', 'bash', 'sh', 'zsh', 'source', '.']);
+const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
+const RUNNERS = new Set(['exec', 'env', 'sudo', 'nohup', 'xargs', 'nice', 'timeout']);
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
@@ -253,9 +283,24 @@ function isGhPrCreate(words) {
  * Walk the command, simulating the shell's working directory, and collect every
  * `gh pr create` in command position as { dir, args, ghRepo } (dir null = unknown).
  */
-export function findPrCreates(command, cwd, env = process.env) {
+export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   const tokens = tokenize(command);
-  const scopes = [{ dir: cwd, dirStack: [], ghRepo: env.GH_REPO || undefined, cdpath: Boolean(env.CDPATH) }];
+  const newScope = (from) => ({
+    dir: from.dir,
+    dirStack: [...from.dirStack],
+    ghRepo: from.ghRepo,
+    cdpath: from.cdpath,
+    pushes: [...from.pushes],
+    pendingCond: false, // a `&& cd` ran in the current and-or list
+    listStart: { dir: from.dir, dirStack: [...from.dirStack] },
+  });
+  const scopes = [newScope({
+    dir: cwd,
+    dirStack: [],
+    ghRepo: inherit.ghRepo !== undefined ? inherit.ghRepo : (env.GH_REPO || undefined),
+    cdpath: inherit.cdpath ?? Boolean(env.CDPATH),
+    pushes: inherit.pushes ?? [],
+  })];
   const braces = [];
   let cond = 0;
   let funcDepth = 0;
@@ -266,20 +311,31 @@ export function findPrCreates(command, cwd, env = process.env) {
   const found = [];
   const scope = () => scopes[scopes.length - 1];
 
+  // Code that runs in a subshell ($(...), `...`, <(...), bash -c, eval): gate any
+  // gh pr create inside it, starting from the current directory.
+  const nested = (script, dir) => {
+    const s = scope();
+    for (const h of findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes: s.pushes })) {
+      found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
+    }
+  };
+
   const applyDirCommand = (cmd, pipelined) => {
     const s = scope();
     const [w0, ...rest] = cmd;
     if (pipelined) return; // a pipeline/background element runs in a subshell
     if (cond > 0 || prevOp === '||') { s.dir = null; return; } // may or may not run
+    if (prevOp === '&&') s.pendingCond = true; // only runs if the list so far succeeded
     const args = rest.filter((w) => !/^-[LPe@]+$/.test(w.value) && w.value !== '--');
     const arg = args[0];
     const target = () => {
       if (!arg) return homedir();
-      if (arg.dynamic || arg.value === '-' || s.dir === null) return null;
+      if (arg.dynamic || arg.value === '-') return null;
       let p = arg.value;
       if (arg.tilde && (p === '~' || p.startsWith('~/'))) p = homedir() + p.slice(1);
       else if (arg.tilde) return null; // ~user
-      if (!path.isAbsolute(p) && s.cdpath) return null;
+      if (path.isAbsolute(p)) return path.resolve(p);
+      if (s.dir === null || s.cdpath) return null;
       return path.resolve(s.dir, p);
     };
     if (w0.value === 'cd') { s.dir = target(); return; }
@@ -295,9 +351,43 @@ export function findPrCreates(command, cwd, env = process.env) {
     s.dir = s.dirStack.length ? s.dirStack.pop() : null;
   };
 
+  const recordPush = (cmd) => {
+    // `git [-C dir] push [opts] <remote> <src>:<dst> ...` — lets `--head <dst>` be checked at
+    // <src> even though the push (and its remote-tracking ref) hasn't happened yet.
+    const s = scope();
+    let k = 1;
+    let gdir = s.dir;
+    while (k < cmd.length && cmd[k].value.startsWith('-')) {
+      const v = cmd[k].value;
+      if (v === '-C') {
+        const d = cmd[k + 1];
+        gdir = !d || d.dynamic ? null : path.isAbsolute(d.value) ? d.value : gdir === null ? null : path.resolve(gdir, d.value);
+        k += 2;
+        continue;
+      }
+      k += ['-c', '--git-dir', '--work-tree', '--namespace'].includes(v) ? 2 : 1;
+    }
+    if (cmd[k]?.value !== 'push' || cmd[k].dynamic) return;
+    const positional = [];
+    const rest = cmd.slice(k + 1);
+    for (let j = 0; j < rest.length; j++) {
+      const v = rest[j].value;
+      if (v === '--') { positional.push(...rest.slice(j + 1)); break; }
+      if (v.startsWith('-')) { if (['-o', '--push-option', '--repo', '--receive-pack', '--exec'].includes(v)) j += 1; continue; }
+      positional.push(rest[j]);
+    }
+    for (const spec of positional.slice(1)) {
+      if (spec.dynamic || gdir === null) continue;
+      const r = spec.value.replace(/^\+/, '');
+      const [src, dst] = r.includes(':') ? [r.slice(0, r.indexOf(':')), r.slice(r.indexOf(':') + 1)] : [r, r];
+      if (src && dst) s.pushes.push({ dir: gdir, src, dst: dst.replace(/^refs\/heads\//, '') });
+    }
+  };
+
   const flush = (nextOp) => {
     let cmd = words;
     words = [];
+    for (const w of cmd) for (const body of w.substs ?? []) nested(body, scope().dir);
     const pipelined = prevOp === '|' || prevOp === '&' || nextOp === '|' || nextOp === '&';
     // Reserved words and brace groups.
     while (cmd.length && !cmd[0].dynamic) {
@@ -350,14 +440,53 @@ export function findPrCreates(command, cwd, env = process.env) {
         dir: funcDepth > 0 ? null : s.dir, // a function body runs later, from wherever it's called
         args: cmd.slice(3),
         ghRepo: prefixed ? (prefixed.dynamic ? null : prefixed.value.slice('GH_REPO='.length)) : s.ghRepo,
+        pushes: [...s.pushes],
       });
       return;
     }
+    // A command word built from an expansion ($X, $(...)) is opaque. Deliberately hiding
+    // a `cd` that way is out of scope for this speed-bump; see the README.
     if (cmd[0].dynamic) return;
     let c0 = cmd[0].value;
     if ((c0 === 'builtin' || c0 === 'command') && cmd[1]) { cmd = cmd.slice(1); c0 = cmd[0].value; }
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
-    if (WRAPPERS.has(c0) && !pipelined && cmd.slice(1).some((w) => DIR_WORD.test(w.value))) { s.dir = null; }
+    if (c0 === 'git') { recordPush(cmd); return; }
+    if (c0 === 'eval') {
+      // eval runs in this shell: gate any gh pr create in it; a cd in it isn't modelled.
+      const args = cmd.slice(1);
+      if (args.some((w) => w.dynamic)) { if (!pipelined) s.dir = null; return; }
+      const script = args.map((w) => w.value).join(' ');
+      nested(script, s.dir);
+      if (!pipelined && DIR_WORD.test(script)) s.dir = null;
+      return;
+    }
+    if (c0 === 'source' || c0 === '.') {
+      if (!pipelined && cmd.slice(1).some((w) => w.dynamic)) s.dir = null; // e.g. source <(...)
+      return;
+    }
+    if (SHELLS.has(c0)) {
+      // A child shell can't move us, but a gh pr create in its -c script still runs.
+      const ci = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*c$/.test(w.value));
+      const script = ci > 0 ? cmd[ci + 1] : undefined;
+      if (script && !script.dynamic) nested(script.value, s.dir);
+      return;
+    }
+    if (RUNNERS.has(c0)) {
+      // `timeout 60 gh pr create ...`, `env -C dir gh pr create ...`
+      const k = cmd.findIndex((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
+      if (k > 0) {
+        const chdir = c0 === 'env' && cmd.slice(1, k).some((w) => /^(--chdir|-[A-Za-z]*C)/.test(w.value));
+        found.push({ dir: chdir || funcDepth > 0 ? null : s.dir, args: cmd.slice(k + 3), ghRepo: s.ghRepo, pushes: [...s.pushes] });
+      }
+    }
+  };
+
+  const endList = (op) => {
+    const s = scope();
+    if (op === '&') { s.dir = s.listStart.dir; s.dirStack = [...s.listStart.dirStack]; } // a background list is a subshell
+    else if (s.pendingCond) s.dir = null; // the `&& cd` may not have run
+    s.pendingCond = false;
+    s.listStart = { dir: s.dir, dirStack: [...s.dirStack] };
   };
 
   for (let k = 0; k < tokens.length; k++) {
@@ -365,17 +494,24 @@ export function findPrCreates(command, cwd, env = process.env) {
     if (t.type === 'word') { words.push(t); continue; }
     const op = t.value;
     if (op === '(' || op === ')') {
+      if (caseDepth === 0 && words.length && !words[0].dynamic && words[0].value === 'case') {
+        flush(';'); prevOp = ';'; continue; // `case x in y)` / `case x in (y)`: header + first pattern
+      }
       if (caseDepth > 0) { if (op === ')') { words = []; prevOp = ';'; } continue; } // case patterns
       if (op === '(' && tokens[k + 1]?.value === ')' && words.length === 1) {
         funcPending = true; words = []; k += 1; continue; // `name()` function definition
       }
       flush(op);
-      if (op === '(') scopes.push({ ...scope(), dirStack: [...scope().dirStack] });
+      if (op === '(') scopes.push(newScope(scope()));
       else if (scopes.length > 1) scopes.pop();
       prevOp = ';';
       continue;
     }
-    if (OPS.has(op)) { flush(op); prevOp = op; }
+    if (OPS.has(op)) {
+      flush(op);
+      if (op === ';' || op === '&') endList(op);
+      prevOp = op;
+    }
   }
   flush(';');
   return found;
@@ -506,6 +642,12 @@ function resolveOne(hit) {
           if (new Set(refs).size === 1) rev = refs[0];
         }
         if (!rev) {
+          // Pushed earlier in this same command (`git push origin HEAD:name && gh pr create --head name`).
+          const pushed = (hit.pushes ?? []).filter((p) => p.dst === branch && git(p.dir, 'rev-parse', '--show-toplevel') === dir);
+          const last = pushed[pushed.length - 1];
+          if (last) rev = git(last.dir, 'rev-parse', '--verify', '--quiet', `${last.src}^{commit}`);
+        }
+        if (!rev) {
           return {
             block: `--head ${head} isn't a local branch or a fetched remote branch in ${dir}, so there's no way to tell which commit was reviewed. ` +
               'Push it first, or run `gh pr create` from a checkout of that branch.',
@@ -524,9 +666,7 @@ export function resolveTargets(command, cwd, env = process.env) {
   } catch (err) {
     return { status: 'error', reason: String(err?.message ?? err), risky: RISKY.test(command) };
   }
-  if (!hits.length) {
-    return { status: 'none', reason: '`gh pr create` only appears inside quoted text, a heredoc or a nested shell', risky: RISKY.test(command) };
-  }
+  if (!hits.length) return { status: 'none' }; // only mentioned as data (heredoc body, quoted text)
   const targets = [];
   let allHelp = true;
   for (const hit of hits) {

@@ -120,7 +120,7 @@ expect "' -h' inside a value no longer skips the gate" 2 stderr "missing/stale"
 run "$T/u" "gh pr create --help"
 expect "gh pr create --help is not gated" 0
 run "$T/a" "bash -c 'cd $T/u && gh pr create --fill'"
-expect "gh pr create hidden in bash -c with a cd is blocked, not checked on the session cwd" 2 stderr "couldn't work out which repo"
+expect "gh pr create inside bash -c is gated where it runs" 2 stderr "$T/u: missing/stale"
 git -C "$T/a" update-ref refs/remotes/origin/feat/nice HEAD
 run "$T/a" "git push -u origin HEAD:feat/nice && gh pr create --head feat/nice --fill"
 expect "--head that only exists as a fetched remote branch uses that commit" 0
@@ -132,6 +132,25 @@ run "$T/u" "cd $T/a || cd $T/u && gh pr create --fill"
 expect "a cd after || makes the directory unknown (blocked)" 2 stderr "isn't a literal path, or only runs conditionally"
 (cd "$T/a" && REVIEW_GATE_REQUIRED=" " bash "$gate" check >/dev/null 2>"$T/e2"); rc=$?; err="$(cat "$T/e2")"
 expect "an empty REVIEW_GATE_REQUIRED says so" 1 stderr "names no reviewers"
+
+# ── Round 2 ──
+run "$T/u" "git commit -q --allow-empty -m \"\$(cat <<'EOF'
+gh pr create --repo o/r used to be gated
+EOF
+)\""
+expect "a commit message that mentions gh pr create is not a PR (passes even in an unreviewed repo)" 0
+[ -z "$out$err" ] || { fail=$((fail + 1)); echo "FAIL - data-only mention printed: $out$err"; }
+run "$T/u" "cat > x.sh <<'EOF'
+cd \"\$1\"
+gh pr create --fill
+EOF"
+expect "writing a script that contains gh pr create is not a PR" 0
+run "$T/a" "git push -u origin HEAD:nice-name && gh pr create --head nice-name --fill"
+expect "--head pushed earlier in the same command is checked at the pushed commit" 0
+run "$T/u" "false && cd $T/a; gh pr create --fill"
+expect "an && cd whose list ends before gh makes the directory unknown" 2 stderr "only runs conditionally"
+run "$T/a" "cd $T/u && PR=\$(gh pr create --fill)"
+expect "gh pr create inside \$(...) is gated where it runs" 2 stderr "$T/u: missing/stale"
 
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]
