@@ -20,7 +20,7 @@
 // becomes unknown and the gate blocks rather than guess. `git -C <dir>` is ignored on
 // purpose: it never changes where `gh` runs.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -848,7 +848,17 @@ export function resolveTargets(command, cwd, env = process.env) {
   return allHelp && !targets.length ? { status: 'help' } : { status: 'ok', targets };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+// Run as a script? Compare real paths: node resolves symlinks for import.meta.url but
+// argv[1] keeps the path it was invoked by (e.g. a symlinked install dir).
+function isMain() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+}
+
+if (isMain()) {
   const cwd = process.argv[2] || process.cwd();
   let result;
   try {

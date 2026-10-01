@@ -243,5 +243,11 @@ expect "gh pr new (alias of create) is gated" 2 stderr "$T/u: missing/stale"
 run "$T/u" "/usr/bin/env true; \$(command -v true) ; /usr/local/bin/gh pr create --fill"
 expect "gh invoked by path is gated" 2 stderr "$T/u: missing/stale"
 
+# Installed through a symlink: the resolver must still run (not fall back silently).
+ln -s "$root" "$T/linked"
+payload="$(jq -cn --arg c "cd $T/u && gh pr create --fill" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | bash "$T/linked/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "a hook installed via a symlinked path still resolves the target" 2 stderr "$T/u: missing/stale"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]
