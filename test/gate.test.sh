@@ -182,5 +182,22 @@ EOF"
 expect "a python heredoc that only writes text mentioning gh pr create is data" 0
 [ -z "$out$err" ] || { fail=$((fail + 1)); echo "FAIL - python data printed: $out$err"; }
 
+# ── agy review: forms the old command-position pre-filter never handed to the resolver ──
+run "$T/u" "timeout 60 gh pr create --fill"
+expect "timeout 60 gh pr create is gated" 2 stderr "$T/u: missing/stale"
+run "$T/a" "GH_REPO=acme/beta gh pr create --fill"
+expect "GH_REPO= prefix is gated and checked against the checkout" 2 stderr "the PR targets acme/beta"
+run "$T/u" "bash -c \"gh pr create --fill\""
+expect "bash -c \"gh pr create\" is gated" 2 stderr "$T/u: missing/stale"
+run "$T/u" "eval \"gh pr create --fill\""
+expect "eval \"gh pr create\" is gated" 2 stderr "$T/u: missing/stale"
+run "$T/u" "PR=\`gh pr create --fill\`"
+expect "a backtick gh pr create is gated" 2 stderr "$T/u: missing/stale"
+run "$T/a" "echo cd $T/u '&&' gh pr create --fill | bash"
+expect "echo words piped to bash are joined like echo prints them" 2 stderr "$T/u: missing/stale"
+run "$T/u" "grep -rn 'gh pr create' . ; sed -n '/gh pr create/p' x 2>/dev/null"
+expect "grep/sed that only mention gh pr create still pass silently" 0
+[ -z "$out$err" ] || { fail=$((fail + 1)); echo "FAIL - mention printed: $out$err"; }
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

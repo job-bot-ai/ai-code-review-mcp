@@ -26,13 +26,11 @@ else
 fi
 [ -n "$cmd" ] || exit 0
 
-# Match `gh pr create` only in COMMAND POSITION: at the start of the command or right after
-# a shell separator ( ; | & ( { ), spaces allowed between. This avoids firing when the
-# string merely appears as an argument (echo/printf/grep), inside a heredoc, or in a commit
-# message. grep is line-based, so `gh pr create` starting its own line also matches via ^.
-# Trade-off: env-prefixed or `bash -c "gh pr create"` forms are not gated — acceptable for a
-# speed-bump, not a security boundary.
-printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+create([[:space:];|&)}]|$)' || exit 0
+# Any `gh pr create` words anywhere go to the resolver, which follows runners
+# (`timeout 60 gh pr create`), `GH_REPO=... gh pr create`, `bash -c`, `eval`, backticks
+# and pipes into shells, and lets mentions that are only data (commit messages, grep
+# patterns) through. Only the no-node fallback below keeps the command-position match.
+printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])gh[[:space:]]+pr[[:space:]]+create([^[:alnum:]_-]|$)' || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"
@@ -65,6 +63,9 @@ if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
     *) notes="review-gate: target resolver failed; checked the session cwd" ;;
   esac
 else
+  # Without the resolver: gate only `gh pr create` in command position (start of the
+  # command or after ; | & ( { ), as before; env-prefixed and `bash -c` forms aren't seen.
+  printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+create([[:space:];|&)}]|$)' || exit 0
   case "$cmd" in *--help*|*" -h"*) exit 0;; esac   # crude help check without the resolver
   notes="review-gate: node unavailable; checked the session cwd"
 fi

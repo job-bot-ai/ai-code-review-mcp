@@ -102,7 +102,7 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
   `gh`, `grep`, `jq`, …) is data, e.g. a commit message or a script being written,
   and isn't gated. Text fed to `python`/`node`/`perl`/`ruby` on a heredoc or stdin is
   also treated as data, since it's nearly always a file edit.
-- A mention the gate can't follow (`ssh`, `awk`/`sed` (which can run commands),
+- A mention the gate can't follow (`ssh`, an `awk` script using `system(...)` or a `sed` `e` command,
   `bash script.sh`, `bash <(...)`, `python3 -c "..."`) is treated like an unparseable
   command.
 - When it can't know where `gh` runs, it **blocks** rather than guess:
@@ -166,8 +166,10 @@ per-commit record.
 
 Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
 clients). The hook requires `jq` (to extract the command from the payload) and
-matches `gh pr create` only in **command position** — so commands that merely
-mention the string (echo, grep, commit messages, heredocs) are not blocked. It is
+hands any command containing the words `gh pr create` to the resolver above, which
+gates real invocations wherever they run and lets data-only mentions (echo, grep,
+commit messages, heredocs) through. Without `node`, it falls back to gating only
+`gh pr create` in **command position** of the session cwd. It is
 **fail-open** — any internal error, or a missing `jq`, lets the command through
 rather than wedging your shell — so it is a strong speed-bump, not a hard security
 boundary.

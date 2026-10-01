@@ -305,9 +305,19 @@ const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep',
 // Script interpreters: a heredoc/stdin/file fed to them is nearly always a file edit, so a
 // mention there is treated as data; inline code (-c/-e) that mentions gh pr create is opaque.
 const INTERPRETERS = new Set(['python', 'python3', 'node', 'perl', 'ruby', 'php']);
-const MENTION = /(^|[\s;&|(){}`'"])gh\s+pr\s+create\b/;
+const MENTION = /(^|[^A-Za-z0-9_-])gh\s+pr\s+create\b/; // same boundary as the hook's pre-filter
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+
+/** Roughly what a pipeline element writes to stdout: echo's words joined by spaces,
+ * printf's arguments one per line (the common '%s\n'), plus any heredoc/here-string body. */
+function pipedText(cmd) {
+  const c0 = cmd[0]?.value;
+  const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !/^\d*[<>]/.test(w.value));
+  const words = c0 === 'printf' ? args.slice(1).map((w) => w.value).join('\n') : args.map((w) => w.value).join(' ');
+  const bodies = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
+  return [words, ...bodies].filter(Boolean).join('\n');
+}
 
 function isGhPrCreate(words) {
   return words.length >= 3 && !words[0].dynamic && words[0].value === 'gh' && words[1].value === 'pr' && words[2].value === 'create';
@@ -406,13 +416,15 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     if (cmd[k]?.value !== 'push' || cmd[k].dynamic) return;
     const positional = [];
     const rest = cmd.slice(k + 1);
+    let remoteGiven = false; // `--repo <remote>` means every positional is a refspec
     for (let j = 0; j < rest.length; j++) {
       const v = rest[j].value;
       if (v === '--') { positional.push(...rest.slice(j + 1)); break; }
-      if (v.startsWith('-')) { if (['-o', '--push-option', '--repo', '--receive-pack', '--exec'].includes(v)) j += 1; continue; }
+      if (v === '--repo' || v.startsWith('--repo=')) { remoteGiven = true; if (v === '--repo') j += 1; continue; }
+      if (v.startsWith('-')) { if (['-o', '--push-option', '--receive-pack', '--exec'].includes(v)) j += 1; continue; }
       positional.push(rest[j]);
     }
-    for (const spec of positional.slice(1)) {
+    for (const spec of remoteGiven ? positional : positional.slice(1)) {
       if (spec.dynamic || gdir === null) continue;
       const r = spec.value.replace(/^\+/, '');
       const [src, dst] = r.includes(':') ? [r.slice(0, r.indexOf(':')), r.slice(r.indexOf(':') + 1)] : [r, r];
@@ -424,7 +436,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     let cmd = words;
     words = [];
     const fromPipe = prevOp === '|' ? pipeText : null;
-    pipeText = nextOp === '|' ? cmd.slice(1).map((w) => (w.heredoc ? w.heredoc.body ?? '' : w.value)).join('\n') : null;
+    pipeText = nextOp === '|' ? pipedText(cmd) : null;
     for (const w of cmd) {
       for (const body of w.substs ?? []) nested(body, scope().dir);
       for (const body of w.heredoc?.substs ?? []) nested(body, scope().dir);
@@ -563,6 +575,12 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         });
         return;
       }
+    }
+    // sed/awk only run commands via awk system()/print|"cmd" or sed's e command/flag.
+    if (c0 === 'awk' || c0 === 'gawk' || c0 === 'sed') {
+      const runs = c0 === 'sed' ? /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/ : /system\s*\(|\|\s*["\w]|\|&/;
+      if (mentioned() && cmd.slice(1).some((w) => runs.test(w.value))) opaque(c0);
+      return;
     }
     // Anything else that receives `gh pr create` as input might run it (ssh, python, ...).
     if (!DATA_SINKS.has(c0) && mentioned()) opaque(c0);
