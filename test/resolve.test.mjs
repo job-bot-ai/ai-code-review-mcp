@@ -188,6 +188,13 @@ test('awkRuns: execution forms vs data processing', () => {
   assert.equal(hits("echo 'gh pr create' | grep -c create").opaque, undefined);
 });
 
+test('case arms: patterns vs subshells inside an arm', () => {
+  assert.deepEqual(hits('case x in y) (gh pr create --fill) ;; esac').map((h) => h.dir), ['/session']);
+  assert.deepEqual(hits('case $1 in\n  (a|b) gh pr create ;;\n  c) (cd /u && gh pr create) ;&\n  *) true ;;\nesac').map((h) => h.dir), ['/session', null]);
+  assert.equal(dirOf('(case x in y) ;; esac; cd /green); gh pr create'), '/session');
+  assert.equal(dirOf('case x in y) cd /green ;; esac; gh pr create'), null);
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');
@@ -235,7 +242,7 @@ test('repoSlug normalises remotes and gh repo values', () => {
 
 test('tokenizer: operators split commands, quotes and escapes join words, errors are thrown', () => {
   const t = tokenize('a "b c" d\\ e && f|g ;; h');
-  assert.deepEqual(t.map((x) => x.value), ['a', 'b c', 'd e', '&&', 'f', '|', 'g', ';', 'h']);
+  assert.deepEqual(t.map((x) => x.value), ['a', 'b c', 'd e', '&&', 'f', '|', 'g', ';;', 'h']);
   assert.deepEqual(tokenize('a#b # comment').map((x) => x.value), ['a#b']);
   assert.throws(() => tokenize("echo 'unterminated"));
   assert.throws(() => tokenize('echo "$(unterminated'));

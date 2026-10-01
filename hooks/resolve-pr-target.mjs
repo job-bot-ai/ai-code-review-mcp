@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 
 // ── Tokenizer ────────────────────────────────────────────────────────────────
 
-const OPS = new Set([';', '&&', '||', '|', '&', '(', ')']);
+const OPS = new Set([';', ';;', '&&', '||', '|', '&', '(', ')']); // ';;' = case arm end (also ;& ;;&)
 
 function readHeredocDelim(src, i) {
   // i is just past `<<`. Returns { delim, strip, end }.
@@ -263,7 +263,13 @@ export function tokenize(src) {
       i = heredocs.length ? skipHeredocBodies(src, i + 1, heredocs) : i + 1;
       continue;
     }
-    if (c === ';') { push(); out.push({ type: 'op', value: ';' }); i += src[i + 1] === ';' ? 2 : 1; continue; }
+    if (c === ';') {
+      push();
+      const arm = src.startsWith(';;&', i) ? 3 : src.startsWith(';;', i) || src.startsWith(';&', i) ? 2 : 0;
+      out.push({ type: 'op', value: arm ? ';;' : ';' });
+      i += arm || 1;
+      continue;
+    }
     if (c === '&' || c === '|') {
       push();
       const two = src.slice(i, i + 2);
@@ -362,6 +368,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   let cond = 0;
   let funcDepth = 0;
   let caseDepth = 0;
+  let casePattern = false; // next `)` ends a case pattern (after `in`, `;;` or `;&`)
   let funcPending = false;
   let prevOp = ';';
   let words = [];
@@ -459,12 +466,12 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       const v = cmd[0].value;
       if (OPENERS.has(v)) {
         cond += 1;
-        if (v === 'case') { caseDepth += 1; cmd = []; break; } // `case x in` header
+        if (v === 'case') { caseDepth += 1; casePattern = true; cmd = []; break; } // `case x in` header
         if (v === 'for' || v === 'select') { cmd = []; break; } // `for x in ...` header
         cmd = cmd.slice(1);
       } else if (CLOSERS.has(v)) {
         cond = Math.max(0, cond - 1);
-        if (v === 'esac') caseDepth = Math.max(0, caseDepth - 1);
+        if (v === 'esac') { caseDepth = Math.max(0, caseDepth - 1); casePattern = false; }
         cmd = cmd.slice(1);
       } else if (CONTINUERS.has(v)) {
         if (v !== '!' && v !== 'time') prevOp = ';'; // first command of a body isn't &&-chained
@@ -628,9 +635,14 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const op = t.value;
     if (op === '(' || op === ')') {
       if (caseDepth === 0 && words.length && !words[0].dynamic && words[0].value === 'case') {
-        flush(';'); prevOp = ';'; continue; // `case x in y)` / `case x in (y)`: header + first pattern
+        flush(';'); prevOp = ';'; // `case x in y)` / `case x in (y)`: header + first pattern
+        if (op === ')') casePattern = false;
+        continue;
       }
-      if (caseDepth > 0) { if (op === ')') { words = []; prevOp = ';'; } continue; } // case patterns
+      if (caseDepth > 0 && casePattern) { // pattern position: `(y)` / `y)` / `a|b)`
+        if (op === ')') { words = []; prevOp = ';'; casePattern = false; }
+        continue;
+      }
       if (op === '(' && tokens[k + 1]?.value === ')' && words.length === 1) {
         funcPending = true; words = []; k += 1; continue; // `name()` function definition
       }
@@ -642,8 +654,9 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     if (OPS.has(op)) {
       flush(op);
-      if (op === ';' || op === '&') endList(op);
-      prevOp = op;
+      if (op === ';' || op === ';;' || op === '&') endList(op === '&' ? '&' : ';');
+      if (op === ';;' && caseDepth > 0) casePattern = true;
+      prevOp = op === ';;' ? ';' : op;
     }
   }
   flush(';');
