@@ -95,17 +95,25 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
   - `$(...)`, backticks and `<(...)` (e.g. `PR_URL=$(gh pr create ...)`), including
     those in unquoted heredocs;
   - `bash`/`sh -c` and `eval` scripts, even when part of the script is a variable;
-  - code fed to a shell or `source` on stdin (`bash <<'EOF'`, `bash <<< "..."`);
+  - code fed to a shell or `source` on stdin: a heredoc, a here-string, or a pipe
+    (`cat <<'EOF' | bash`, `echo "..." | bash`);
   - `timeout`/`env`/`sudo`-style runners (`env -C`/`GH_REPO=` operands included).
 - A mention fed to a command that never runs its input (`cat`, `tee`, `echo`, `git`,
   `gh`, `grep`, `jq`, …) is data, e.g. a commit message or a script being written,
-  and isn't gated. A mention fed to anything else (`ssh`, `python`, `bash script.sh`, …)
-  can't be followed: the gate treats it like an unparseable command.
+  and isn't gated. Text fed to `python`/`node`/`perl`/`ruby` on a heredoc or stdin is
+  also treated as data, since it's nearly always a file edit.
+- A mention the gate can't follow (`ssh`, `awk`/`sed` (which can run commands),
+  `bash script.sh`, `bash <(...)`, `python3 -c "..."`) is treated like an unparseable
+  command.
 - When it can't know where `gh` runs, it **blocks** rather than guess:
   - a non-literal `cd` (`cd $X`, `cd -`);
-  - a `cd` that may or may not run: after `||`, inside `if`/`case`/loops/functions or an
-    `x && { ...; }` group, or `x && cd dir` whose list ends before `gh pr create` (a
-    trailing `&&`/`||`/`|` continues the list onto the next line, as in bash);
+  - a `cd` that may or may not run before `gh pr create`:
+    - after `||`;
+    - inside `if`/`case`/loops/functions;
+    - `x && cd dir` whose list ends before `gh pr create` (a trailing `&&`/`||`/`|`
+      continues the list onto the next line, as in bash);
+    - `x && { cd dir; }` followed by `gh pr create` outside the group. Inside the
+      group the `cd` holds, so `test -d d && { cd d; gh pr create; }` is fine;
   - `eval cd …`, `eval`/`source` with a non-literal argument, or `CDPATH`;
   - `gh pr create` inside a function, or with a non-literal argument such as `$ARGS`.
 - `-R/--repo [HOST/]OWNER/REPO` (or `GH_REPO`) must match one of that checkout's
@@ -124,9 +132,10 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
 - `gh pr create --help` isn't gated. A `-h` that is only part of an argument (for example
   a PR body that says "use -h") no longer skips the gate.
 - `git -C <dir>` is ignored on purpose: it never changes where `gh` runs.
-- Out of scope: deliberately hiding a `cd` behind a command word built from an expansion
-  (`$X /dir`, `$(echo cd) /dir`). The gate is a speed-bump against mistakes, not a
-  sandbox.
+- Out of scope: deliberately hiding a `cd` or `gh pr create` from the gate. Examples:
+  a command word built from an expansion (`$X /dir`, `$(echo cd) /dir`), or a script
+  interpreter told to run it (`python3 - <<EOF ... os.system(...)`). The gate is a
+  speed-bump against mistakes, not a sandbox.
 
 When it gated on a different repo than the cwd, or relied on a skip, the hook says so
 (as a `systemMessage`).

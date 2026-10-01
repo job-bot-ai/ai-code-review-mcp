@@ -168,5 +168,19 @@ expect "gh pr create passed to an unknown command with a cd is blocked" 2 stderr
 run "$T/a" "ssh host 'true; gh pr create --fill'"
 expect "gh pr create passed to an unknown command without a cd falls back to the session cwd" 0 stdout "checked the session cwd"
 
+# ── Round 4 ──
+run "$T/a" "cat <<'EOF' | bash
+cd $T/u
+gh pr create --fill
+EOF"
+expect "code piped into bash is gated where it runs" 2 stderr "$T/u: missing/stale"
+run "$T/u" "test -d $T/a && { cd $T/a; gh pr create --fill; }"
+expect "a cd inside an && { } group holds for gh in the same group" 0
+run "$T/u" "python3 - <<'EOF'
+open('/dev/null', 'w').write('cd x && gh pr create --fill')
+EOF"
+expect "a python heredoc that only writes text mentioning gh pr create is data" 0
+[ -z "$out$err" ] || { fail=$((fail + 1)); echo "FAIL - python data printed: $out$err"; }
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

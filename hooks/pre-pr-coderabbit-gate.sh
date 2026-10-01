@@ -71,15 +71,13 @@ fi
 [ -n "$targets" ] || targets="$(jq -cn --arg d "$session_cwd" '{dir: $d, rev: null, note: null}')"
 
 msgs="$notes"; blocked=""
-err="$(mktemp 2>/dev/null || echo "/tmp/cr-gate-check.$$")"
 while IFS= read -r t; do
   [ -n "$t" ] || continue
   dir="$(printf '%s' "$t" | jq -r '.dir')"
   rev="$(printf '%s' "$t" | jq -r '.rev // empty')"
   note="$(printf '%s' "$t" | jq -r '.note // empty')"
   where="$dir${rev:+ @ ${rev:0:12}}"
-  (cd "$dir" && bash "$gate" check ${rev:+--rev "$rev"}) 2>"$err"; rc=$?
-  out="$(cat "$err" 2>/dev/null || true)"
+  out="$( (cd "$dir" && bash "$gate" check ${rev:+--rev "$rev"}) 2>&1 >/dev/null )"; rc=$?
   [ -n "$note" ] && msgs="${msgs:+$msgs
 }review-gate: $note"
   case "$rc" in
@@ -94,7 +92,6 @@ while IFS= read -r t; do
 }review-gate: $dir is not a git repo with commits; not gated" ;;   # fail-open by design
   esac
 done <<<"$targets"
-rm -f "$err"
 
 if [ -n "$blocked" ]; then
   {

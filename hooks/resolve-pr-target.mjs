@@ -299,9 +299,12 @@ const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
 const RUNNERS = new Set(['exec', 'env', 'sudo', 'nohup', 'xargs', 'nice', 'timeout']);
 // Commands that never execute their arguments or stdin as shell code: a `gh pr create`
 // mentioned in their input (a commit message, a file being written) is just text.
-const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep', 'egrep', 'fgrep', 'rg', 'sed',
-  'awk', 'jq', 'head', 'tail', 'less', 'more', 'wc', 'sort', 'uniq', 'diff', 'cut', 'tr', 'base64', 'column',
+const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep', 'egrep', 'fgrep', 'rg',
+  'jq', 'head', 'tail', 'less', 'more', 'wc', 'sort', 'uniq', 'diff', 'cut', 'tr', 'base64', 'column',
   'touch', 'mkdir', 'ls', 'true', 'false', ':', 'test', '[', 'read', 'mapfile']);
+// Script interpreters: a heredoc/stdin/file fed to them is nearly always a file edit, so a
+// mention there is treated as data; inline code (-c/-e) that mentions gh pr create is opaque.
+const INTERPRETERS = new Set(['python', 'python3', 'node', 'perl', 'ruby', 'php']);
 const MENTION = /(^|[\s;&|(){}`'"])gh\s+pr\s+create\b/;
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
@@ -321,7 +324,6 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     dirStack: [...from.dirStack],
     ghRepo: from.ghRepo,
     cdpath: from.cdpath,
-    pushes: [...from.pushes],
     pendingCond: false, // a `&& cd` ran in the current and-or list
     listStart: { dir: from.dir, dirStack: [...from.dirStack] },
   });
@@ -330,8 +332,10 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     dirStack: [],
     ghRepo: inherit.ghRepo !== undefined ? inherit.ghRepo : (env.GH_REPO || undefined),
     cdpath: inherit.cdpath ?? Boolean(env.CDPATH),
-    pushes: inherit.pushes ?? [],
   })];
+  // A push changes the remote, not the shell, so it isn't scoped to a subshell.
+  const pushes = [...(inherit.pushes ?? [])];
+  let pipeText = null; // what the previous pipeline element feeds on stdin
   const braces = [];
   let cond = 0;
   let funcDepth = 0;
@@ -346,7 +350,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   // gh pr create inside it, starting from the current directory.
   const nested = (script, dir) => {
     const s = scope();
-    const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes: s.pushes });
+    const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
   };
@@ -412,13 +416,15 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       if (spec.dynamic || gdir === null) continue;
       const r = spec.value.replace(/^\+/, '');
       const [src, dst] = r.includes(':') ? [r.slice(0, r.indexOf(':')), r.slice(r.indexOf(':') + 1)] : [r, r];
-      if (src && dst) s.pushes.push({ dir: gdir, src, dst: dst.replace(/^refs\/heads\//, '') });
+      if (src && dst) pushes.push({ dir: gdir, src, dst: dst.replace(/^refs\/heads\//, '') });
     }
   };
 
   const flush = (nextOp) => {
     let cmd = words;
     words = [];
+    const fromPipe = prevOp === '|' ? pipeText : null;
+    pipeText = nextOp === '|' ? cmd.slice(1).map((w) => (w.heredoc ? w.heredoc.body ?? '' : w.value)).join('\n') : null;
     for (const w of cmd) {
       for (const body of w.substs ?? []) nested(body, scope().dir);
       for (const body of w.heredoc?.substs ?? []) nested(body, scope().dir);
@@ -437,21 +443,24 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         if (v === 'esac') caseDepth = Math.max(0, caseDepth - 1);
         cmd = cmd.slice(1);
       } else if (CONTINUERS.has(v)) {
+        if (v !== '!' && v !== 'time') prevOp = ';'; // first command of a body isn't &&-chained
         cmd = cmd.slice(1);
       } else if (v === 'function') {
         funcPending = true;
         cmd = cmd.slice(2);
       } else if (v === '{') {
         const isFunc = funcPending;
-        const conditional = !isFunc && (prevOp === '&&' || prevOp === '||'); // `x && { ...; }`
-        braces.push(isFunc ? 'func' : conditional ? 'cond' : 'group');
+        // `x && { cd d; gh pr create; }`: inside the group its cds hold; after it, the
+        // directory is unknown if the group changed it (it may not have run).
+        const conditional = !isFunc && (prevOp === '&&' || prevOp === '||');
+        braces.push({ kind: isFunc ? 'func' : conditional ? 'cond' : 'group', startDir: scope().dir });
         if (isFunc) { cond += 1; funcDepth += 1; funcPending = false; }
-        if (conditional) cond += 1;
+        prevOp = ';';
         cmd = cmd.slice(1);
       } else if (v === '}') {
-        const kind = braces.pop();
-        if (kind === 'func') { cond = Math.max(0, cond - 1); funcDepth = Math.max(0, funcDepth - 1); }
-        if (kind === 'cond') cond = Math.max(0, cond - 1);
+        const b = braces.pop();
+        if (b?.kind === 'func') { cond = Math.max(0, cond - 1); funcDepth = Math.max(0, funcDepth - 1); }
+        if (b?.kind === 'cond' && scope().dir !== b.startDir) scope().dir = null;
         cmd = cmd.slice(1);
       } else {
         break;
@@ -479,7 +488,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         dir: funcDepth > 0 ? null : s.dir, // a function body runs later, from wherever it's called
         args: cmd.slice(3),
         ghRepo: prefixed ? (prefixed.dynamic ? null : prefixed.value.slice('GH_REPO='.length)) : s.ghRepo,
-        pushes: [...s.pushes],
+        pushes: [...pushes],
       });
       return;
     }
@@ -501,20 +510,42 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       if (!pipelined && (args.some((w) => w.dynamic) || DIR_WORD.test(script))) s.dir = null;
       return;
     }
+    const substMention = () => cmd.some((w) => (w.substs ?? []).some((b) => MENTION.test(b)));
     if (c0 === 'source' || c0 === '.') {
-      // Runs in this shell: walk stdin code (source /dev/stdin <<EOF); can't read files.
-      for (const body of stdinCode) nested(body, s.dir);
-      if (!pipelined && (cmd.slice(1).some((w) => w.dynamic) || stdinCode.some((b) => DIR_WORD.test(b)))) s.dir = null;
+      // Runs in this shell: walk code on stdin (heredoc, here-string, a pipe into
+      // `source /dev/stdin`); files can't be read, and <(...) output is opaque.
+      const isRedirect = (w) => /^\d*[<>]/.test(w.value) && !/^[<>]\(/.test(w.value); // not <(...)
+      const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !isRedirect(w));
+      const code = [...stdinCode, ...(fromPipe !== null && (!args.length || ['/dev/stdin', '-'].includes(args[0].value)) ? [fromPipe] : [])];
+      for (const body of code) nested(body, s.dir);
+      if (substMention()) opaque(`${c0} <(...)`);
+      if (!pipelined && (args.some((w) => w.dynamic) || code.some((b) => DIR_WORD.test(b)))) s.dir = null;
       return;
     }
     if (SHELLS.has(c0)) {
       // A child shell can't move us, but a gh pr create in its script still runs: walk a
-      // -c script (even a partly dynamic one) or code fed on stdin (heredoc / here-string).
+      // -c script (even a partly dynamic one) or code on stdin (heredoc, here-string, pipe).
       const ci = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*c$/.test(w.value));
       if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, s.dir); return; }
-      const file = cmd.slice(1).find((w) => !w.heredoc && !w.herestring && !w.value.startsWith('-') && !/^[<>]/.test(w.value));
-      if (file) { if (mentioned()) opaque(`${c0} ${file.value}`); return; } // a script file we can't read
-      for (const body of stdinCode) nested(body, s.dir);
+      let file = null;
+      const rest = cmd.slice(1);
+      for (let j = 0; j < rest.length; j++) {
+        const w = rest[j];
+        if (w.heredoc || w.herestring) continue;
+        if (/^\d+$/.test(w.value) && /^[<>]/.test(rest[j + 1]?.value ?? '')) continue; // fd of `2>...`
+        if (/^[<>]/.test(w.value) && !w.value.startsWith('<(')) { if (/^[<>]+&?$/.test(w.value)) j += 1; continue; } // redirect
+        if (/^[-+][A-Za-z]*[oO]$|^--(rcfile|init-file)$/.test(w.value)) { j += 1; continue; } // -o / -euo / -O take a value
+        if (/^[-+]/.test(w.value)) continue;
+        file = w;
+        break;
+      }
+      if (file) { if (mentioned() || substMention()) opaque(`${c0} ${file.value}`); return; } // a script we can't read
+      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, s.dir);
+      return;
+    }
+    if (INTERPRETERS.has(c0)) {
+      const inline = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*[ce]$/.test(w.value));
+      if (inline > 0 && MENTION.test(cmd[inline + 1]?.value ?? '')) opaque(`${c0} ${cmd[inline].value}`);
       return;
     }
     if (RUNNERS.has(c0)) {
@@ -528,7 +559,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
           dir: chdir || funcDepth > 0 ? null : s.dir,
           args: cmd.slice(k + 3),
           ghRepo: repoArg ? (repoArg.dynamic ? null : repoArg.value.slice('GH_REPO='.length)) : s.ghRepo,
-          pushes: [...s.pushes],
+          pushes: [...pushes],
         });
         return;
       }

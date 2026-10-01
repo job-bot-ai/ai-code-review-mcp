@@ -137,6 +137,23 @@ test('round 3: list continuation across newlines; && before a { } group is condi
   assert.equal(dirOf('cd /a &&\n  git push &&\n  gh pr create'), '/a');
 });
 
+test('round 4: code piped into a shell, <(...) scripts, awk, interpreters, groups, pushes', () => {
+  assert.deepEqual(hits("cat <<'EOF' | bash\ncd /u\ngh pr create --fill\nEOF").map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits('echo "cd /u && gh pr create --fill" | bash').map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits("printf '%s' 'gh pr create' | sh -s").map((h) => h.dir), ['/session']);
+  assert.equal(hits("bash <(echo 'cd /u && gh pr create --fill')").opaque, 'bash <(...)');
+  assert.equal(hits(`awk 'BEGIN{system("cd /u && gh pr create --fill")}'`).opaque, 'awk');
+  assert.equal(hits(`python3 -c "import os; os.system('gh pr create')"`).opaque, 'python3 -c');
+  const edit = hits("python3 - <<'EOF'\nopen('t', 'w').write('cd r && gh pr create')\nEOF");
+  assert.equal(edit.length, 0); assert.equal(edit.opaque, undefined);
+  assert.deepEqual(hits("bash -euo pipefail <<'EOF'\ncd /w\ngh pr create --fill\nEOF").map((h) => h.dir), ['/w']);
+  assert.equal(dirOf('test -d /w && { cd /w; gh pr create --fill; }'), '/w');
+  assert.equal(dirOf('test -d /w && { cd /w; }; gh pr create'), null);
+  assert.equal(dirOf('if true; then cd /w && gh pr create; fi'), null); // if-bodies stay conservative
+  assert.deepEqual(hits('(git push -f origin HEAD:feat/x) && gh pr create --head feat/x')[0].pushes,
+    [{ dir: '/session', src: 'HEAD', dst: 'feat/x' }]);
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');
