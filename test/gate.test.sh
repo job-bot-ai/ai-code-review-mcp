@@ -152,5 +152,21 @@ expect "an && cd whose list ends before gh makes the directory unknown" 2 stderr
 run "$T/a" "cd $T/u && PR=\$(gh pr create --fill)"
 expect "gh pr create inside \$(...) is gated where it runs" 2 stderr "$T/u: missing/stale"
 
+# ── Round 3 ──
+run "$T/a" "bash <<'EOF'
+cd $T/u
+gh pr create --fill
+EOF"
+expect "gh pr create fed to bash on a heredoc is gated where it runs" 2 stderr "$T/u: missing/stale"
+run "$T/a" "T=x; bash -c \"cd $T/u && gh pr create --fill --title \$T\""
+expect "a partly dynamic bash -c script is still walked" 2 stderr "$T/u: missing/stale"
+mkrepo "$T/p" acme/pushy && green "$T/p" && git -C "$T/p" branch -q feat/x && git -C "$T/p" commit -q --allow-empty -m unreviewed
+run "$T/a" "cd $T/p && git push -f origin HEAD:feat/x && gh pr create --head feat/x --fill"
+expect "a same-command push decides --head's commit (not the stale reviewed branch)" 2 stderr "missing/stale"
+run "$T/a" "ssh host 'cd /srv/x && gh pr create --fill'"
+expect "gh pr create passed to an unknown command with a cd is blocked" 2 stderr "can't follow"
+run "$T/a" "ssh host 'true; gh pr create --fill'"
+expect "gh pr create passed to an unknown command without a cd falls back to the session cwd" 0 stdout "checked the session cwd"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

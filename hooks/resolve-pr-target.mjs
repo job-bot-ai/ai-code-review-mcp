@@ -34,22 +34,40 @@ function readHeredocDelim(src, i) {
   let strip = false;
   if (src[i] === '-') { strip = true; i += 1; }
   while (src[i] === ' ' || src[i] === '\t') i += 1;
-  const m = src.slice(i).match(/^(?:'([^']*)'|"([^"]*)"|\\?([^\s;&|()<>]+))/);
+  const m = src.slice(i).match(/^(?:'([^']*)'|"([^"]*)"|(\\?)([^\s;&|()<>]+))/);
   if (!m) return { delim: null, strip, end: i };
-  return { delim: m[1] ?? m[2] ?? m[3], strip, end: i + m[0].length };
+  const quoted = m[1] !== undefined || m[2] !== undefined || m[3] === '\\';
+  return { delim: m[1] ?? m[2] ?? m[4], strip, quoted, end: i + m[0].length };
 }
 
 function skipHeredocBodies(src, i, heredocs) {
-  // i is just past a newline; consume each pending heredoc body in order.
-  for (const { delim, strip } of heredocs.splice(0)) {
+  // i is just past a newline; consume each pending heredoc body in order, keeping the text
+  // (h.body) — it is data for most commands but code when fed to a shell.
+  for (const h of heredocs.splice(0)) {
+    const lines = [];
     while (i < src.length) {
       const end = src.indexOf('\n', i);
       const line = src.slice(i, end < 0 ? src.length : end);
       i = end < 0 ? src.length : end + 1;
-      if ((strip ? line.replace(/^\t+/, '') : line) === delim) break;
+      if ((h.strip ? line.replace(/^\t+/, '') : line) === h.delim) break;
+      lines.push(line);
     }
+    h.body = lines.join('\n');
+    if (!h.quoted) h.substs = substitutionsIn(h.body); // an unquoted heredoc expands $(...)
   }
   return i;
+}
+
+/** Bodies of the $(...) / `...` in expanding text (an unquoted heredoc). */
+function substitutionsIn(text) {
+  const out = [];
+  for (let i = 0; i < text.length;) {
+    if (text[i] === '\\') { i += 2; continue; }
+    if (text[i] === '$' && text[i + 1] === '(') { const end = skipCommandSubst(text, i + 2); out.push(text.slice(i + 2, end - 1)); i = end; continue; }
+    if (text[i] === '`') { const end = skipBackticks(text, i + 1); out.push(backtickBody(text, i, end)); i = end; continue; }
+    i += 1;
+  }
+  return out;
 }
 
 function skipSingleQuoted(src, i) {
@@ -189,9 +207,11 @@ export function tokenize(src) {
   let dynamic = false;
   let tilde = false;
   let substs = [];
+  let hereString = false;
   const add = (s) => { if (word === null) tilde = false; word = (word ?? '') + s; };
   const push = () => {
-    if (word !== null) out.push({ type: 'word', value: word, dynamic, tilde, substs });
+    if (word !== null) out.push({ type: 'word', value: word, dynamic, tilde, substs, herestring: hereString });
+    if (word !== null) hereString = false;
     word = null; dynamic = false; tilde = false; substs = [];
   };
   let i = 0;
@@ -219,11 +239,14 @@ export function tokenize(src) {
       if (r.subst !== undefined) substs.push(r.subst);
       continue;
     }
-    if (c === '<' && src.startsWith('<<<', i)) { push(); i += 3; continue; }
+    if (c === '<' && src.startsWith('<<<', i)) { push(); hereString = true; i += 3; continue; } // next word is stdin
     if (c === '<' && src.startsWith('<<', i)) {
       push();
       const h = readHeredocDelim(src, i + 2);
-      if (h.delim !== null) heredocs.push(h);
+      if (h.delim !== null) {
+        heredocs.push(h);
+        out.push({ type: 'word', value: '<<', dynamic: false, tilde: false, substs: [], heredoc: h });
+      }
       i = h.end;
       continue;
     }
@@ -234,7 +257,9 @@ export function tokenize(src) {
     }
     if (c === '\n') {
       push();
-      out.push({ type: 'op', value: ';' });
+      // A trailing && / || / | continues the list onto the next line.
+      const last = out[out.length - 1];
+      if (!(last?.type === 'op' && ['&&', '||', '|'].includes(last.value))) out.push({ type: 'op', value: ';' });
       i = heredocs.length ? skipHeredocBodies(src, i + 1, heredocs) : i + 1;
       continue;
     }
@@ -272,6 +297,12 @@ const CLOSERS = new Set(['fi', 'done', 'esac']);
 const CONTINUERS = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
 const RUNNERS = new Set(['exec', 'env', 'sudo', 'nohup', 'xargs', 'nice', 'timeout']);
+// Commands that never execute their arguments or stdin as shell code: a `gh pr create`
+// mentioned in their input (a commit message, a file being written) is just text.
+const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep', 'egrep', 'fgrep', 'rg', 'sed',
+  'awk', 'jq', 'head', 'tail', 'less', 'more', 'wc', 'sort', 'uniq', 'diff', 'cut', 'tr', 'base64', 'column',
+  'touch', 'mkdir', 'ls', 'true', 'false', ':', 'test', '[', 'read', 'mapfile']);
+const MENTION = /(^|[\s;&|(){}`'"])gh\s+pr\s+create\b/;
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
@@ -315,10 +346,11 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   // gh pr create inside it, starting from the current directory.
   const nested = (script, dir) => {
     const s = scope();
-    for (const h of findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes: s.pushes })) {
-      found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
-    }
+    const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes: s.pushes });
+    for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
+    if (inner.opaque) found.opaque = inner.opaque;
   };
+  const opaque = (why) => { found.opaque ??= why; };
 
   const applyDirCommand = (cmd, pipelined) => {
     const s = scope();
@@ -387,7 +419,10 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   const flush = (nextOp) => {
     let cmd = words;
     words = [];
-    for (const w of cmd) for (const body of w.substs ?? []) nested(body, scope().dir);
+    for (const w of cmd) {
+      for (const body of w.substs ?? []) nested(body, scope().dir);
+      for (const body of w.heredoc?.substs ?? []) nested(body, scope().dir);
+    }
     const pipelined = prevOp === '|' || prevOp === '&' || nextOp === '|' || nextOp === '&';
     // Reserved words and brace groups.
     while (cmd.length && !cmd[0].dynamic) {
@@ -408,11 +443,15 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         cmd = cmd.slice(2);
       } else if (v === '{') {
         const isFunc = funcPending;
-        braces.push(isFunc ? 'func' : 'group');
+        const conditional = !isFunc && (prevOp === '&&' || prevOp === '||'); // `x && { ...; }`
+        braces.push(isFunc ? 'func' : conditional ? 'cond' : 'group');
         if (isFunc) { cond += 1; funcDepth += 1; funcPending = false; }
+        if (conditional) cond += 1;
         cmd = cmd.slice(1);
       } else if (v === '}') {
-        if (braces.pop() === 'func') { cond = Math.max(0, cond - 1); funcDepth = Math.max(0, funcDepth - 1); }
+        const kind = braces.pop();
+        if (kind === 'func') { cond = Math.max(0, cond - 1); funcDepth = Math.max(0, funcDepth - 1); }
+        if (kind === 'cond') cond = Math.max(0, cond - 1);
         cmd = cmd.slice(1);
       } else {
         break;
@@ -446,39 +485,56 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     // A command word built from an expansion ($X, $(...)) is opaque. Deliberately hiding
     // a `cd` that way is out of scope for this speed-bump; see the README.
-    if (cmd[0].dynamic) return;
+    const stdinCode = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
+    const mentioned = () => cmd.some((w) => MENTION.test(w.heredoc ? w.heredoc.body ?? '' : w.value));
+    if (cmd[0].dynamic) { if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`); return; }
     let c0 = cmd[0].value;
     if ((c0 === 'builtin' || c0 === 'command') && cmd[1]) { cmd = cmd.slice(1); c0 = cmd[0].value; }
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
     if (c0 === 'git') { recordPush(cmd); return; }
     if (c0 === 'eval') {
-      // eval runs in this shell: gate any gh pr create in it; a cd in it isn't modelled.
-      const args = cmd.slice(1);
-      if (args.some((w) => w.dynamic)) { if (!pipelined) s.dir = null; return; }
+      // eval runs in this shell. Walk its script even when part of it is an expansion ($X
+      // stays a dynamic word); a cd in it isn't modelled, so the directory becomes unknown.
+      const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring);
       const script = args.map((w) => w.value).join(' ');
       nested(script, s.dir);
-      if (!pipelined && DIR_WORD.test(script)) s.dir = null;
+      if (!pipelined && (args.some((w) => w.dynamic) || DIR_WORD.test(script))) s.dir = null;
       return;
     }
     if (c0 === 'source' || c0 === '.') {
-      if (!pipelined && cmd.slice(1).some((w) => w.dynamic)) s.dir = null; // e.g. source <(...)
+      // Runs in this shell: walk stdin code (source /dev/stdin <<EOF); can't read files.
+      for (const body of stdinCode) nested(body, s.dir);
+      if (!pipelined && (cmd.slice(1).some((w) => w.dynamic) || stdinCode.some((b) => DIR_WORD.test(b)))) s.dir = null;
       return;
     }
     if (SHELLS.has(c0)) {
-      // A child shell can't move us, but a gh pr create in its -c script still runs.
+      // A child shell can't move us, but a gh pr create in its script still runs: walk a
+      // -c script (even a partly dynamic one) or code fed on stdin (heredoc / here-string).
       const ci = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*c$/.test(w.value));
-      const script = ci > 0 ? cmd[ci + 1] : undefined;
-      if (script && !script.dynamic) nested(script.value, s.dir);
+      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, s.dir); return; }
+      const file = cmd.slice(1).find((w) => !w.heredoc && !w.herestring && !w.value.startsWith('-') && !/^[<>]/.test(w.value));
+      if (file) { if (mentioned()) opaque(`${c0} ${file.value}`); return; } // a script file we can't read
+      for (const body of stdinCode) nested(body, s.dir);
       return;
     }
     if (RUNNERS.has(c0)) {
-      // `timeout 60 gh pr create ...`, `env -C dir gh pr create ...`
+      // `timeout 60 gh pr create ...`, `env -C dir GH_REPO=o/r gh pr create ...`
       const k = cmd.findIndex((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
       if (k > 0) {
-        const chdir = c0 === 'env' && cmd.slice(1, k).some((w) => /^(--chdir|-[A-Za-z]*C)/.test(w.value));
-        found.push({ dir: chdir || funcDepth > 0 ? null : s.dir, args: cmd.slice(k + 3), ghRepo: s.ghRepo, pushes: [...s.pushes] });
+        const pre = cmd.slice(1, k);
+        const chdir = c0 === 'env' && pre.some((w) => /^(--chdir|-[A-Za-z]*C)/.test(w.value));
+        const repoArg = c0 === 'env' ? pre.filter((w) => w.value.startsWith('GH_REPO=')).pop() : undefined;
+        found.push({
+          dir: chdir || funcDepth > 0 ? null : s.dir,
+          args: cmd.slice(k + 3),
+          ghRepo: repoArg ? (repoArg.dynamic ? null : repoArg.value.slice('GH_REPO='.length)) : s.ghRepo,
+          pushes: [...s.pushes],
+        });
+        return;
       }
     }
+    // Anything else that receives `gh pr create` as input might run it (ssh, python, ...).
+    if (!DATA_SINKS.has(c0) && mentioned()) opaque(c0);
   };
 
   const endList = (op) => {
@@ -625,8 +681,18 @@ function resolveOne(hit) {
     if (owner && !remoteSlugs().some((slug) => slug.split('/')[0] === owner)) {
       return { block: `--head ${head} is a branch in ${owner}'s repo, but none of ${dir}'s remotes belong to ${owner}` };
     }
+    // A push to this branch earlier in the same command decides what the PR contains,
+    // so it wins over a (possibly stale) local or remote-tracking branch.
+    const repoId = (d) => git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel');
+    const here = repoId(dir);
+    const pushed = (hit.pushes ?? []).filter((p) => p.dst === branch && repoId(p.dir) === here).pop();
     const current = git(dir, 'symbolic-ref', '--quiet', '--short', 'HEAD');
-    if (branch !== current) {
+    if (pushed) {
+      const top = git(pushed.dir, 'rev-parse', '--show-toplevel');
+      rev = git(pushed.dir, 'rev-parse', '--verify', '--quiet', `${pushed.src}^{commit}`);
+      if (!top || !rev) return { block: `can't resolve ${pushed.src}, pushed to ${branch} in ${pushed.dir}` };
+      dir = top; // its markers live in the checkout that pushed
+    } else if (branch !== current) {
       // Markers live in each worktree's own git dir: prefer the worktree that has the branch.
       const wt = (git(dir, 'worktree', 'list', '--porcelain') ?? '').split('\n\n').map((block) => ({
         path: block.match(/^worktree (.+)$/m)?.[1],
@@ -637,15 +703,9 @@ function resolveOne(hit) {
       } else {
         rev = git(dir, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`);
         if (!rev) {
-          // Pushed but never a local branch (e.g. `git push origin HEAD:name`): use the remote-tracking ref.
+          // Pushed earlier but never a local branch (e.g. `git push origin HEAD:name`): use the remote-tracking ref.
           const refs = (git(dir, 'for-each-ref', '--format=%(objectname)', `refs/remotes/*/${branch}`) ?? '').split('\n').filter(Boolean);
           if (new Set(refs).size === 1) rev = refs[0];
-        }
-        if (!rev) {
-          // Pushed earlier in this same command (`git push origin HEAD:name && gh pr create --head name`).
-          const pushed = (hit.pushes ?? []).filter((p) => p.dst === branch && git(p.dir, 'rev-parse', '--show-toplevel') === dir);
-          const last = pushed[pushed.length - 1];
-          if (last) rev = git(last.dir, 'rev-parse', '--verify', '--quiet', `${last.src}^{commit}`);
         }
         if (!rev) {
           return {
@@ -666,7 +726,12 @@ export function resolveTargets(command, cwd, env = process.env) {
   } catch (err) {
     return { status: 'error', reason: String(err?.message ?? err), risky: RISKY.test(command) };
   }
-  if (!hits.length) return { status: 'none' }; // only mentioned as data (heredoc body, quoted text)
+  if (!hits.length) {
+    if (hits.opaque) {
+      return { status: 'error', reason: `\`gh pr create\` is passed to ${hits.opaque}, which the gate can't follow`, risky: RISKY.test(command) };
+    }
+    return { status: 'none' }; // only mentioned as data (a commit message, a file being written)
+  }
   const targets = [];
   let allHelp = true;
   for (const hit of hits) {

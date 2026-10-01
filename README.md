@@ -92,15 +92,20 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
   subshells, `builtin cd`/`command cd`. A `cd` in a pipeline or background job doesn't
   move `gh`, just as in bash.
 - Code that runs is walked too, from the directory it runs in:
-  - `$(...)`, backticks and `<(...)` (e.g. `PR_URL=$(gh pr create ...)`);
-  - literal `bash -c '...'` and `eval ...` scripts;
-  - `timeout`/`env`/`sudo`-style runners.
-- Heredoc bodies and quoted strings are data. A command that only *mentions*
-  `gh pr create` (a commit message, a script being written) isn't gated.
+  - `$(...)`, backticks and `<(...)` (e.g. `PR_URL=$(gh pr create ...)`), including
+    those in unquoted heredocs;
+  - `bash`/`sh -c` and `eval` scripts, even when part of the script is a variable;
+  - code fed to a shell or `source` on stdin (`bash <<'EOF'`, `bash <<< "..."`);
+  - `timeout`/`env`/`sudo`-style runners (`env -C`/`GH_REPO=` operands included).
+- A mention fed to a command that never runs its input (`cat`, `tee`, `echo`, `git`,
+  `gh`, `grep`, `jq`, …) is data, e.g. a commit message or a script being written,
+  and isn't gated. A mention fed to anything else (`ssh`, `python`, `bash script.sh`, …)
+  can't be followed: the gate treats it like an unparseable command.
 - When it can't know where `gh` runs, it **blocks** rather than guess:
   - a non-literal `cd` (`cd $X`, `cd -`);
-  - a `cd` that may or may not run: after `||`, inside `if`/`case`/loops/functions, or
-    `x && cd dir` whose list ends before `gh pr create`;
+  - a `cd` that may or may not run: after `||`, inside `if`/`case`/loops/functions or an
+    `x && { ...; }` group, or `x && cd dir` whose list ends before `gh pr create` (a
+    trailing `&&`/`||`/`|` continues the list onto the next line, as in bash);
   - `eval cd …`, `eval`/`source` with a non-literal argument, or `CDPATH`;
   - `gh pr create` inside a function, or with a non-literal argument such as `$ARGS`.
 - `-R/--repo [HOST/]OWNER/REPO` (or `GH_REPO`) must match one of that checkout's
@@ -108,8 +113,10 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
 - `-H/--head [OWNER:]BRANCH` (including clusters like `-dH`), resolved in this order:
   - the owner, if given, must own one of the checkout's remotes;
   - a branch checked out in another worktree is checked there;
-  - otherwise the local branch's tip, a fetched remote branch's tip, or the source of a
-    `git push <remote> <src>:<branch>` earlier in the same command must have been reviewed.
+  - a `git push <remote> <src>:<branch>` earlier in the same command decides the commit
+    (it is what the PR will contain), checked in the checkout that pushed;
+  - otherwise the local branch's tip, or a fetched remote branch's tip, must have been
+    reviewed.
 - A `--repo`/`--head` PR from a non-git directory is blocked. A plain `gh pr create`
   outside git is not gated (gh fails there anyway); this is announced.
 - If the command can't be parsed, the gate falls back to the session's cwd and says so,

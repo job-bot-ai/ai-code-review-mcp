@@ -115,6 +115,28 @@ test('round-2 shell model: && lists, case in subshell, indirect cd, recovery, pu
   assert.deepEqual(hits('git -C /r push origin +feat:refs/heads/x; gh pr create')[0].pushes, [{ dir: '/r', src: 'feat', dst: 'x' }]);
 });
 
+test('round 3: code fed to a shell on stdin, dynamic eval/-c scripts, data sinks vs opaque', () => {
+  assert.deepEqual(hits("bash <<'EOF'\ncd /u\ngh pr create --fill\nEOF").map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits('bash <<< "cd /u && gh pr create --fill"').map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits('T=x; eval "cd /u && gh pr create --fill --title $T"').map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits('T=x; bash -c "cd /u && gh pr create --fill --title $T"').map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits('cat <<EOF\n$(cd /u && gh pr create)\nEOF').map((h) => h.dir), ['/u']); // unquoted heredoc expands
+  assert.equal(hits("cat <<'EOF'\n$(gh pr create)\nEOF").length, 0); // quoted heredoc doesn't
+  const data = hits("cat > x.sh <<'EOF'\ngh pr create\nEOF");
+  assert.equal(data.length, 0); assert.equal(data.opaque, undefined);
+  const remote = hits("ssh host 'cd x && gh pr create'");
+  assert.equal(remote.length, 0); assert.equal(remote.opaque, 'ssh');
+  assert.equal(hits("bash ./deploy.sh <<'EOF'\ngh pr create\nEOF").opaque, 'bash ./deploy.sh');
+  assert.equal(hits('env GH_REPO=o/r gh pr create')[0].ghRepo, 'o/r');
+});
+
+test('round 3: list continuation across newlines; && before a { } group is conditional', () => {
+  assert.equal(dirOf('false &&\ncd /green\ngh pr create --fill'), null);
+  assert.equal(dirOf('false && { true; cd /green; }; gh pr create --fill'), null);
+  assert.equal(dirOf('{ cd /g; }; gh pr create'), '/g');
+  assert.equal(dirOf('cd /a &&\n  git push &&\n  gh pr create'), '/a');
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');
