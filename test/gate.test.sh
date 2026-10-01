@@ -219,5 +219,8 @@ mkdir -p "$T/space dir" && mkrepo "$T/space dir/r" acme/space
 run "$T/a" "cd '$T/space dir/r' && gh pr create --fill"
 expect "remediation quotes paths with spaces" 2 stderr 'space\ dir/r && coderabbit review'
 
+run "$T/a" "B=feat/other; gh pr create --head \"\$B\" --fill"
+expect "a non-literal --head blocks (the PR's commit is unknown)" 2 stderr "--head is not a literal value"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

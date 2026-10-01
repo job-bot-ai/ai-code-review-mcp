@@ -750,7 +750,9 @@ function resolveOne(hit) {
   }
 
   let rev = null;
-  if (head === null) notes.push("--head is not a literal value; checked the checkout's HEAD");
+  if (head === null) {
+    return { block: '--head is not a literal value, so there is no way to tell which commit the PR contains. Pass the branch name literally.' };
+  }
   if (head) {
     const colon = head.indexOf(':');
     const owner = colon >= 0 ? head.slice(0, colon).toLowerCase() : null;

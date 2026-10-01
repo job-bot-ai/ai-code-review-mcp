@@ -91,14 +91,14 @@ while IFS= read -r t; do
 }review-gate: gated on $where (not the session's checkout)"
       [ -n "$out" ] && msgs="${msgs:+$msgs
 }$out" ;;
-    1)  q="$(printf '%q' "$dir")"
+    1)  q="$(printf '%q' "$dir")"; gq="$(printf '%q' "$gate")"
         revnote=""
         [ -n "$rev" ] && revnote="
     (commit ${rev:0:12} is not checked out there: check out that branch in a worktree and review it)"
         blocked="${blocked:+$blocked
 }  $where: ${out:-no green light recorded}
-    review there:  cd $q && coderabbit review --base main && bash $gate record coderabbit
-                   cd $q && codex review --base main && bash $gate record codex$revnote" ;;
+    review there:  cd $q && coderabbit review --base main && bash $gq record coderabbit
+                   cd $q && codex review --base main && bash $gq record codex$revnote" ;;
     *)  [ -n "$note" ] || msgs="${msgs:+$msgs
 }review-gate: $dir is not a git repo with commits; not gated" ;;   # fail-open by design
   esac
@@ -109,7 +109,7 @@ if [ -n "$blocked" ]; then
     echo "BLOCKED by the AI code-review PR gate (run BOTH reviews, iterate until green, record each pass):"
     echo "$blocked"
     echo "If a reviewer genuinely can't run (quota/outage), record an explicit, announced skip in that checkout:"
-    echo "    bash $gate record-skip <reviewer> --reason \"why\""
+    echo "    bash $(printf '%q' "$gate") record-skip <reviewer> --reason \"why\""
     echo "then re-run \`gh pr create\`. (Standing rule: CodeRabbit + Codex green before any PR.)"
   } >&2
   exit 2

@@ -118,7 +118,8 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
   - `gh pr create` inside a function, or with a non-literal argument such as `$ARGS`.
 - `-R/--repo [HOST/]OWNER/REPO` (or `GH_REPO`) must match one of that checkout's
   remotes; otherwise it blocks and asks you to run `gh pr create` from the target checkout.
-- `-H/--head [OWNER:]BRANCH` (including clusters like `-dH`), resolved in this order:
+- `-H/--head [OWNER:]BRANCH` (including clusters like `-dH`; a non-literal `--head "$B"`
+  blocks, since the PR's commit is unknown), resolved in this order:
   - the owner, if given, must own one of the checkout's remotes;
   - a branch checked out in another worktree is checked there;
   - a `git push <remote> <src>:<branch>` earlier in the same command decides the commit
