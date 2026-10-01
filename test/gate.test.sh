@@ -240,5 +240,8 @@ expect "text passed through cat/tee before reaching bash is still walked" 2 stde
 run "$T/u" "gh pr new --fill"
 expect "gh pr new (alias of create) is gated" 2 stderr "$T/u: missing/stale"
 
+run "$T/u" "/usr/bin/env true; \$(command -v true) ; /usr/local/bin/gh pr create --fill"
+expect "gh invoked by path is gated" 2 stderr "$T/u: missing/stale"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

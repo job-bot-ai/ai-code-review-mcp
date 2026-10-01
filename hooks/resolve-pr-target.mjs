@@ -340,7 +340,8 @@ export function awkRuns(program) {
 
 function isGhPrCreate(words) {
   // `gh pr new` is gh's built-in alias of `gh pr create`.
-  return words.length >= 3 && !words[0].dynamic && words[0].value === 'gh' && words[1].value === 'pr' &&
+  // ...and gh may be invoked by path (/usr/bin/gh, ./bin/gh).
+  return words.length >= 3 && !words[0].dynamic && path.basename(words[0].value) === 'gh' && words[1].value === 'pr' &&
     (words[2].value === 'create' || words[2].value === 'new');
 }
 
@@ -365,7 +366,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     cdpath: inherit.cdpath ?? Boolean(env.CDPATH),
   })];
   // A push changes the remote, not the shell, so it isn't scoped to a subshell.
-  const pushes = [...(inherit.pushes ?? [])];
+  const pushes = inherit.pushes ?? []; // shared with nested scripts, so their pushes count too
   let pipeText = null; // what the previous pipeline element feeds on stdin
   const braces = [];
   let cond = 0;

@@ -203,6 +203,12 @@ test('gh pr new is the same command as gh pr create', () => {
   assert.deepEqual(hits('cd /u && gh pr new --fill').map((h) => h.dir), ['/u']);
 });
 
+test('gh by path; pushes made in nested scripts reach the outer gh pr create', () => {
+  assert.deepEqual(hits('cd /u && /usr/bin/gh pr create --fill').map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits("bash -c 'git push origin HEAD:x'; gh pr create --head x")[0].pushes,
+    [{ dir: '/session', src: 'HEAD', dst: 'x' }]);
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');
