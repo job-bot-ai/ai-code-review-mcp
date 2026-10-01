@@ -80,9 +80,25 @@ Each reviewer exposes a `*_status` tool (CLI version + auth) and a `*_review` to
 
 `review-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "review before you open
 a PR". Wired as a Claude Code `PreToolUse` hook, it blocks `gh pr create` unless
-**every required reviewer** has a pass recorded for the **current HEAD commit** —
+**every required reviewer** has a pass recorded for the **commit the PR comes from** —
 a stale pass from before later commits does not count. Required reviewers default
 to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
+
+**Which repo is checked.** The PR's repo, not the session's working directory
+(`hooks/resolve-pr-target.mjs`):
+
+- `cd <dir>` / `pushd <dir>` before `gh pr create` is followed (also inside `( ... )`).
+  A `cd` whose target isn't a literal path (`cd $X`, `cd -`) is blocked: the gate
+  can't know which repo's reviews count.
+- `-R/--repo [HOST/]OWNER/REPO` must match one of that checkout's remotes; otherwise
+  the gate blocks and asks you to run `gh pr create` from the target checkout.
+- `-H/--head [OWNER:]BRANCH`: if that branch is checked out in another worktree, that
+  worktree's markers count; if it's only a local branch, its tip commit must have been
+  reviewed; if it isn't a local branch, the gate blocks.
+- `git -C <dir>` is ignored on purpose: it never changes where `gh` runs.
+
+If the command can't be parsed, the gate falls back to the session's cwd and says so.
+When it gated on a different repo than the cwd, it says which.
 
 > The hook file is named `pre-pr-coderabbit-gate.sh` for back-compat with existing
 > `settings.json` entries; it gates on all configured reviewers, not just CodeRabbit.
@@ -113,7 +129,20 @@ gh pr create ...                                                    # now allowe
 ```
 
 `./review-gate status` shows each reviewer's state vs HEAD; `clear [reviewer]`
-removes a pass.
+removes a pass (and any skip).
+
+**A reviewer that can't run** (quota exhausted, outage, no seat) can be skipped for
+one commit, with a reason:
+
+```bash
+./review-gate record-skip codex --reason "usage limit until 2026-10-03 13:32"
+```
+
+A skip is bound to HEAD like a pass, is printed by every `check` that relies on it
+(the hook surfaces it as a `systemMessage`), and never satisfies the gate alone: at
+least one required reviewer needs a real pass. Prefer this over
+`REVIEW_GATE_REQUIRED`, which can only be set in the hook's environment and leaves no
+per-commit record.
 
 Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
 clients). The hook requires `jq` (to extract the command from the payload) and
@@ -122,6 +151,8 @@ mention the string (echo, grep, commit messages, heredocs) are not blocked. It i
 **fail-open** — any internal error, or a missing `jq`, lets the command through
 rather than wedging your shell — so it is a strong speed-bump, not a hard security
 boundary.
+
+Tests: `npm test` (resolver unit tests + hook integration tests against throwaway repos).
 
 ## Env overrides
 

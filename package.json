@@ -6,7 +6,8 @@
   "description": "Thin MCP (stdio) server wrapping the CodeRabbit CLI for local AI code review.",
   "bin": { "coderabbit-mcp": "./server.mjs" },
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test test/*.test.mjs && bash test/gate.test.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"
