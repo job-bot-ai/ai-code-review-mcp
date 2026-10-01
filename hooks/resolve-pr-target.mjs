@@ -323,12 +323,12 @@ function pipedText(cmd) {
 
 /**
  * Does an awk program run commands? With string and regex literals blanked out, that is
- * system(...), getline (`"cmd" | getline`, `("cmd") | getline`) or a lone `|` (not `||`),
- * as in `print x | "sh"` or `|&`.
+ * system(...) or a lone `|` (not `||`): `print x | "sh"`, `"cmd" | getline`,
+ * `("cmd") | getline`, `|&`. A bare getline only reads input.
  */
 export function awkRuns(program) {
   const code = program.replace(/"(\\.|[^"\\])*"/g, '""').replace(/\/(\\.|[^/\\\n])+\//g, '//');
-  return /system\s*\(|getline|(^|[^|])\|(?!\|)/.test(code);
+  return /system\s*\(|(^|[^|])\|(?!\|)/.test(code); // piped getline has a lone | too; bare getline reads input
 }
 
 function isGhPrCreate(words) {
@@ -592,12 +592,26 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // sed/awk only run commands via awk system()/print|"cmd" or sed's e command/flag.
     if (c0 === 'awk' || c0 === 'gawk' || c0 === 'sed') {
       const sedRuns = /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/;
-      const runs = (v) => (c0 === 'sed' ? sedRuns.test(v) : awkRuns(v));
-      if (mentioned() && cmd.slice(1).some((w) => runs(w.value))) opaque(c0);
+      if (!mentioned()) return;
+      if (c0 === 'sed') { if (cmd.slice(1).some((w) => sedRuns.test(w.value))) opaque(c0); return; }
+      // awk: judge only the program text, not options like -F'|' or -v x=y.
+      const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !/^\d*[<>]/.test(w.value));
+      let program = null;
+      for (let j = 0; j < args.length; j++) {
+        const v = args[j].value;
+        if (v === '--') { program = args[j + 1] ?? null; break; }
+        if (v === '-f' || v.startsWith('-f')) { opaque(`${c0} -f`); return; } // program in a file we can't read
+        if (/^-[Fv]$/.test(v)) { j += 1; continue; }
+        if (/^-[A-Za-z]/.test(v) || v.startsWith('--')) continue;
+        program = args[j];
+        break;
+      }
+      if (program && awkRuns(program.value)) opaque(c0);
       return;
     }
-    // Anything else that receives `gh pr create` as input might run it (ssh, python, ...).
-    if (!DATA_SINKS.has(c0) && mentioned()) opaque(c0);
+    // Anything else that receives `gh pr create` (as arguments, a heredoc or on a pipe)
+    // might run it: ssh, xargs, ... Script interpreters were handled above as data.
+    if (!DATA_SINKS.has(c0) && (mentioned() || (fromPipe !== null && MENTION.test(fromPipe)))) opaque(c0);
   };
 
   const endList = (op) => {

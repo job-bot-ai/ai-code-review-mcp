@@ -179,7 +179,13 @@ test('awkRuns: execution forms vs data processing', () => {
   for (const prog of ['BEGIN{system("x")}', 'BEGIN{("cd /u && gh pr create") | getline}', '{print "x" | "sh"}',
     'BEGIN{"date" | getline d}', '{print |& "coproc"}']) assert.equal(awkRuns(prog), true, prog);
   for (const prog of ['/gh pr create/ || count++', '/gh pr create|gh pr view/ {n++}',
-    '{\n  print "gh pr create"\n  fallback || "default"\n}', '{ s = "a|b" } END { print n }']) assert.equal(awkRuns(prog), false, prog);
+    '{\n  print "gh pr create"\n  fallback || "default"\n}', '{ s = "a|b" } END { print n }',
+    '/gh pr create/ { getline; print }']) assert.equal(awkRuns(prog), false, prog);
+  assert.equal(hits("git log --format='%h|%s' | awk -F'|' '/gh pr create/ { print $1 }'").opaque, undefined);
+  assert.equal(hits("awk -F '|' -v x=1 '/gh pr create/ { print $1 }' f").opaque, undefined);
+  assert.equal(hits("awk -f prog.awk 'gh pr create' f").opaque, 'awk -f');
+  assert.equal(hits("echo 'cd /u && gh pr create --fill' | ssh host").opaque, 'ssh');
+  assert.equal(hits("echo 'gh pr create' | grep -c create").opaque, undefined);
 });
 
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
