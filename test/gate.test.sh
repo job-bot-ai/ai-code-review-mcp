@@ -96,11 +96,15 @@ expect "unparseable command that changes directory is blocked" 2 stderr "couldn'
 run "$T/a" "gh pr create --title \"unterminated"
 expect "unparseable command with no cd/--repo/--head falls back to the session cwd, with a note" 0 stdout "checked the session cwd"
 
-run "$T/b" "git commit -q -F - <<'EOF'
+run "$T/b" "cat > /dev/null <<'EOF'
 don't stop
 EOF
 gh pr create --fill"
 expect "heredoc with an apostrophe before gh pr create resolves normally" 0
+run "$T/b" "git commit -q --allow-empty -m wip && gh pr create --fill"
+expect "a commit made in the same command as gh pr create blocks (it can't have been reviewed)" 2 stderr "git commit"
+run "$T/b" "git checkout -q -b feat/new && gh pr create --fill"
+expect "creating a branch at HEAD before gh pr create keeps the reviewed commit" 0
 
 
 # ── Reproducers from the adversarial review ──

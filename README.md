@@ -126,6 +126,10 @@ to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
     (it is what the PR will contain), checked in the checkout that pushed;
   - otherwise the local branch's tip, or a fetched remote branch's tip, must have been
     reviewed.
+- A `git commit`/`merge`/`rebase`/`pull`/`reset`/`cherry-pick`/`revert`/`am`, or a
+  `checkout`/`switch` to another commit, earlier in the same command and repo blocks: the
+  hook runs before that commit exists, so it can't have been reviewed. Creating a branch
+  at HEAD (`checkout -b x`) is fine.
 - A `--repo`/`--head` PR from a non-git directory is blocked. A plain `gh pr create`
   outside git is not gated (gh fails there anyway); this is announced.
 - If the command can't be parsed, the gate falls back to the session's cwd and says so,

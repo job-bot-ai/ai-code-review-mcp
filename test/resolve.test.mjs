@@ -217,6 +217,13 @@ test('gh pr create as split arguments of another command is gated like a runner'
   assert.equal(hits("ssh host 'cd /x && gh' 'pr create'").opaque, 'ssh'); // split, not a clean word run
 });
 
+test('git commands that move HEAD earlier in the command are recorded', () => {
+  assert.deepEqual(hits('git commit -m x && gh pr create')[0].headMoves, [{ dir: '/session', sub: 'commit' }]);
+  assert.deepEqual(hits('git pull --rebase; git -C /r merge main; gh pr create')[0].headMoves.map((m) => m.sub), ['pull', 'merge']);
+  assert.deepEqual(hits('git checkout -b feat && git switch -c x && git checkout -- f && gh pr create')[0].headMoves, []);
+  assert.deepEqual(hits('git add . && git push && gh pr create')[0].headMoves, []);
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');

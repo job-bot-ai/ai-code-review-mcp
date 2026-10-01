@@ -302,6 +302,8 @@ const OPENERS = new Set(['if', 'while', 'until', 'for', 'select', 'case']);
 const CLOSERS = new Set(['fi', 'done', 'esac']);
 const CONTINUERS = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
+// git subcommands that can change which commit HEAD is (so the reviewed commit isn't the PR's).
+const HEAD_MOVERS = new Set(['commit', 'merge', 'rebase', 'reset', 'cherry-pick', 'revert', 'pull', 'am', 'checkout', 'switch']);
 const RUNNERS = new Set(['exec', 'env', 'sudo', 'nohup', 'xargs', 'nice', 'timeout']);
 // Commands that never execute their arguments or stdin as shell code: a `gh pr create`
 // mentioned in their input (a commit message, a file being written) is just text.
@@ -367,6 +369,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   })];
   // A push changes the remote, not the shell, so it isn't scoped to a subshell.
   const pushes = inherit.pushes ?? []; // shared with nested scripts, so their pushes count too
+  const headMoves = inherit.headMoves ?? []; // git commands that change HEAD's commit (shared too)
   let pipeText = null; // what the previous pipeline element feeds on stdin
   const braces = [];
   let cond = 0;
@@ -383,7 +386,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   // gh pr create inside it, starting from the current directory.
   const nested = (script, dir) => {
     const s = scope();
-    const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes });
+    const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes, headMoves });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
   };
@@ -436,7 +439,17 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       }
       k += ['-c', '--git-dir', '--work-tree', '--namespace'].includes(v) ? 2 : 1;
     }
-    if (cmd[k]?.value !== 'push' || cmd[k].dynamic) return;
+    const sub = cmd[k]?.dynamic ? null : cmd[k]?.value;
+    if (sub && HEAD_MOVERS.has(sub)) {
+      // Creating a branch at HEAD (`checkout -b x`, `switch -c x`) keeps the commit.
+      const rest = cmd.slice(k + 1).map((w) => w.value);
+      const newBranchAtHead = (sub === 'checkout' || sub === 'switch') &&
+        rest.some((v) => /^-[bBcC]$/.test(v)) && rest.filter((v) => !v.startsWith('-')).length <= 1;
+      const restoreFiles = sub === 'checkout' && rest.includes('--');
+      if (!newBranchAtHead && !restoreFiles) headMoves.push({ dir: gdir, sub });
+      return;
+    }
+    if (sub !== 'push') return;
     const positional = [];
     const rest = cmd.slice(k + 1);
     let remoteGiven = false; // `--repo <remote>` means every positional is a refspec
@@ -526,6 +539,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         args: cmd.slice(3),
         ghRepo: prefixed ? (prefixed.dynamic ? null : prefixed.value.slice('GH_REPO='.length)) : s.ghRepo,
         pushes: [...pushes],
+        headMoves: [...headMoves],
       });
       return;
     }
@@ -596,6 +610,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
           args: cmd.slice(k + 3),
           ghRepo: repoArg ? (repoArg.dynamic ? null : repoArg.value.slice('GH_REPO='.length)) : s.ghRepo,
           pushes: [...pushes],
+        headMoves: [...headMoves],
         });
         return;
       }
@@ -626,7 +641,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // gh pr create` (gated against the local checkout, conservatively).
     const k = cmd.findIndex((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
     if (k > 0) {
-      found.push({ dir: funcDepth > 0 ? null : s.dir, args: cmd.slice(k + 3), ghRepo: s.ghRepo, pushes: [...pushes] });
+      found.push({ dir: funcDepth > 0 ? null : s.dir, args: cmd.slice(k + 3), ghRepo: s.ghRepo, pushes: [...pushes], headMoves: [...headMoves] });
       return;
     }
     // Otherwise, anything that receives `gh pr create` (in one argument, split across
@@ -774,6 +789,14 @@ function resolveOne(hit) {
           `Run it from the target checkout so the gate checks that repo's reviews: cd <checkout of ${repo}> && gh pr create ...`,
       };
     }
+  }
+
+  // A commit made earlier in this same command (git commit/merge/rebase/pull...) is what
+  // the PR will contain, but the hook runs before it exists, so it can't have been reviewed.
+  const repoOf = (d) => (d ? git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel') : null);
+  const moved = (hit.headMoves ?? []).find((m) => m.dir === null || repoOf(m.dir) === repoOf(dir));
+  if (moved) {
+    return { block: `\`git ${moved.sub}\` runs before \`gh pr create\` in the same command, so the PR would contain a commit that doesn't exist yet and can't have been reviewed. Commit first, review it, then run gh pr create.` };
   }
 
   let rev = null;
