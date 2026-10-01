@@ -16,6 +16,7 @@ set -euo pipefail
 
 VALID="coderabbit codex"
 read -r -a REQUIRED <<<"${REVIEW_GATE_REQUIRED:-coderabbit codex}"
+# NB: "${arr[@]+"${arr[@]}"}" keeps empty arrays safe under `set -u` on bash < 4.4 (macOS).
 
 gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || {
   echo "review-gate: not inside a git repo" >&2; exit 3; }
@@ -57,6 +58,9 @@ case "${1:-help}" in
       rev="$(git rev-parse --verify -q "${3:-}^{commit}" 2>/dev/null)" || {
         echo "review-gate: --rev '${3:-}' is not a commit" >&2; exit 1; }
     fi
+    if [ "${#REQUIRED[@]}" -eq 0 ]; then
+      echo "REVIEW_GATE_REQUIRED is set but names no reviewers (valid: $VALID)" >&2; exit 1
+    fi
     missing=(); skips=(); passes=0
     for r in "${REQUIRED[@]}"; do
       if [ "$(recorded "$r")" = "$rev" ]; then
@@ -67,7 +71,7 @@ case "${1:-help}" in
         missing+=("$r")
       fi
     done
-    for r in "${skips[@]}"; do
+    for r in ${skips[@]+"${skips[@]}"}; do
       echo "review-gate: $r was SKIPPED for ${rev:0:12} — reason: $(skip_reason "$r")" >&2
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -89,7 +93,7 @@ case "${1:-help}" in
       elif [ -n "$rh" ]; then s="STALE @ ${rh:0:12}"
       elif [ -n "$sh" ]; then s="STALE skip @ ${sh:0:12}"
       else s="(none)"; fi
-      req=""; case " ${REQUIRED[*]} " in *" $r "*) req=" [required]";; esac
+      req=""; case " ${REQUIRED[*]-} " in *" $r "*) req=" [required]";; esac
       printf '  %-11s %s%s\n' "$r" "$s" "$req"
     done
     ;;
@@ -105,7 +109,7 @@ case "${1:-help}" in
     {
       echo "usage: review-gate {record <reviewer>|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer]}"
       echo "  reviewers: $VALID"
-      echo "  required : ${REQUIRED[*]}  (override with REVIEW_GATE_REQUIRED=\"coderabbit codex\")"
+      echo "  required : ${REQUIRED[*]-}  (override with REVIEW_GATE_REQUIRED=\"coderabbit codex\")"
     } >&2
     exit 2
     ;;

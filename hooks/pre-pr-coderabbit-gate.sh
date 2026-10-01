@@ -26,8 +26,6 @@ else
 fi
 [ -n "$cmd" ] || exit 0
 
-# Ignore help invocations.
-case "$cmd" in *--help*|*" -h"*) exit 0;; esac
 # Match `gh pr create` only in COMMAND POSITION: at the start of the command or right after
 # a shell separator ( ; | & ( { ), spaces allowed between. This avoids firing when the
 # string merely appears as an argument (echo/printf/grep), inside a heredoc, or in a commit
@@ -42,57 +40,74 @@ gate="$here/../review-gate"
 # Fail-open if the gate helper is missing/unreadable — never wedge the shell.
 [ -r "$gate" ] || exit 0
 
-# Which checkout does this PR come from? Not necessarily the session's cwd: follow a
-# `cd <dir>` before `gh pr create`, check `--repo` against that checkout's remotes and
-# prefer the worktree holding `--head` (resolve-pr-target.mjs). If the resolver can't run
-# or can't parse the command, fall back to the session cwd (the pre-resolver behaviour).
+# Which checkout(s) do the PR(s) come from? Not necessarily the session's cwd: the
+# resolver follows `cd` before each `gh pr create`, checks `--repo` against that checkout's
+# remotes and prefers the worktree holding `--head` (resolve-pr-target.mjs).
 session_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)"
 [ -n "$session_cwd" ] && [ -d "$session_cwd" ] || session_cwd="$PWD"
-target="$session_cwd"; rev=""; note=""
+
+block() { echo "BLOCKED by the AI code-review PR gate: $1" >&2; exit 2; }
+targets=""; notes=""
 if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
   res="$(printf '%s' "$cmd" | node "$here/resolve-pr-target.mjs" "$session_cwd" 2>/dev/null || true)"
   status="$(printf '%s' "$res" | jq -r '.status // empty' 2>/dev/null || true)"
+  reason="$(printf '%s' "$res" | jq -r '.reason // empty' 2>/dev/null || true)"
   case "$status" in
-    ok)
-      target="$(printf '%s' "$res" | jq -r '.dir')"
-      rev="$(printf '%s' "$res" | jq -r '.rev // empty')"
-      note="$(printf '%s' "$res" | jq -r '.note // empty')"
-      ;;
-    block)
-      echo "BLOCKED by the AI code-review PR gate: $(printf '%s' "$res" | jq -r '.reason')" >&2
-      exit 2
-      ;;
-    *) note="couldn't parse the command (${status:-resolver failed}); checked the session cwd" ;;
+    ok)    targets="$(printf '%s' "$res" | jq -c '.targets[]')" ;;
+    help)  exit 0 ;;
+    block) block "$reason" ;;
+    none|error)
+      # Falling back to the session cwd is only safe when nothing could move the PR elsewhere.
+      if [ "$(printf '%s' "$res" | jq -r '.risky')" = "true" ]; then
+        block "couldn't work out which repo this PR comes from ($reason), and the command changes directory or names a repo/branch. Simplify it, e.g. write the PR body to a file and use --body-file."
+      fi
+      notes="review-gate: checked the session cwd ($reason)" ;;
+    *) notes="review-gate: target resolver failed; checked the session cwd" ;;
   esac
+else
+  case "$cmd" in *--help*|*" -h"*) exit 0;; esac   # crude help check without the resolver
+  notes="review-gate: node unavailable; checked the session cwd"
 fi
+[ -n "$targets" ] || targets="$(jq -cn --arg d "$session_cwd" '{dir: $d, rev: null, note: null}')"
 
+msgs="$notes"; blocked=""
 err="$(mktemp 2>/dev/null || echo "/tmp/cr-gate-check.$$")"
-(cd "$target" && bash "$gate" check ${rev:+--rev "$rev"}) 2>"$err"; rc=$?
-where="$target${rev:+ @ ${rev:0:12}}"
-
-if [ "$rc" -eq 0 ]; then               # pass recorded → allow; never hide a skip
-  msgs="$(cat "$err" 2>/dev/null || true)"; rm -f "$err"
-  [ "$target" != "$session_cwd" ] && msgs="review-gate: gated on $where (not the session cwd)${msgs:+
-$msgs}"
+while IFS= read -r t; do
+  [ -n "$t" ] || continue
+  dir="$(printf '%s' "$t" | jq -r '.dir')"
+  rev="$(printf '%s' "$t" | jq -r '.rev // empty')"
+  note="$(printf '%s' "$t" | jq -r '.note // empty')"
+  where="$dir${rev:+ @ ${rev:0:12}}"
+  (cd "$dir" && bash "$gate" check ${rev:+--rev "$rev"}) 2>"$err"; rc=$?
+  out="$(cat "$err" 2>/dev/null || true)"
   [ -n "$note" ] && msgs="${msgs:+$msgs
 }review-gate: $note"
-  if [ -n "$msgs" ]; then
-    jq -cn --arg m "$msgs" '{systemMessage: $m}'
-  fi
-  exit 0
-fi
-if [ "$rc" -eq 1 ]; then               # genuine no-pass / stale → block
-  why="$(cat "$err" 2>/dev/null || true)"; rm -f "$err"
+  case "$rc" in
+    0)  # pass; never hide a skip or a cross-repo gate
+      [ "$dir" != "$session_cwd" ] && msgs="${msgs:+$msgs
+}review-gate: gated on $where (not the session cwd)"
+      [ -n "$out" ] && msgs="${msgs:+$msgs
+}$out" ;;
+    1)  blocked="${blocked:+$blocked
+}  $where: ${out:-no green light recorded}" ; last_dir="$dir" ;;
+    *)  [ -n "$note" ] || msgs="${msgs:+$msgs
+}review-gate: $dir is not a git repo with commits; not gated" ;;   # fail-open by design
+  esac
+done <<<"$targets"
+rm -f "$err"
+
+if [ -n "$blocked" ]; then
   {
-    echo "BLOCKED by the AI code-review PR gate (checked $where): ${why:-no green light recorded}."
-    echo "Run BOTH reviews on this change, iterate until each is green, then record each pass:"
-    echo "    cd $target && coderabbit review --base main  && bash $gate record coderabbit"
-    echo "    cd $target && codex review --base main       && bash $gate record codex"
+    echo "BLOCKED by the AI code-review PR gate:"
+    echo "$blocked"
+    echo "Run BOTH reviews on each change, iterate until each is green, then record each pass:"
+    echo "    cd $last_dir && coderabbit review --base main  && bash $gate record coderabbit"
+    echo "    cd $last_dir && codex review --base main       && bash $gate record codex"
     echo "If a reviewer genuinely can't run (quota/outage), record an explicit, announced skip:"
-    echo "    cd $target && bash $gate record-skip <reviewer> --reason \"why\""
+    echo "    cd $last_dir && bash $gate record-skip <reviewer> --reason \"why\""
     echo "then re-run \`gh pr create\`. (Standing rule: CodeRabbit + Codex green before any PR.)"
   } >&2
   exit 2
 fi
-# Any other exit code (e.g. 3 = not a git repo / empty) → fail-open per the design above.
-rm -f "$err"; exit 0
+[ -n "$msgs" ] && jq -cn --arg m "$msgs" '{systemMessage: $m}'
+exit 0

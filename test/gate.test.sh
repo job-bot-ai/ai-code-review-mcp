@@ -37,7 +37,7 @@ mkrepo "$T/b" acme/beta
 mkdir "$T/plain"
 
 run "$T/a" "cd $T/b && gh pr create --fill"
-expect "cd into an unreviewed repo is blocked even though the session repo is green" 2 stderr "checked $T/b"
+expect "cd into an unreviewed repo is blocked even though the session repo is green" 2 stderr "$T/b: missing/stale"
 
 green "$T/b"
 run "$T/a" "cd $T/b && gh pr create --fill"
@@ -89,13 +89,49 @@ expect "non-create commands pass silently" 0
 [ -z "$out$err" ] || { fail=$((fail + 1)); echo "FAIL - non-create printed something"; }
 
 run "$T/a" "cd $T/b && gh pr create --title \"unterminated"
-expect "unparseable command falls back to the session cwd, with a note" 0 stdout "couldn't parse"
+expect "unparseable command that changes directory is blocked" 2 stderr "couldn't work out which repo"
+run "$T/a" "gh pr create --title \"unterminated"
+expect "unparseable command with no cd/--repo/--head falls back to the session cwd, with a note" 0 stdout "checked the session cwd"
 
 run "$T/b" "git commit -q -F - <<'EOF'
 don't stop
 EOF
 gh pr create --fill"
 expect "heredoc with an apostrophe before gh pr create resolves normally" 0
+
+
+# ── Reproducers from the adversarial review ──
+mkrepo "$T/u" acme/unrev
+run "$T/a" "cd $T/u && gh pr create --title \"x\" --body \"\$(cat <<'EOF'
+- see \"issue #12\" for context
+EOF
+)\""
+expect "PR body via \$(cat <<'EOF' ...) with quotes and # inside still gates the cd target" 2 stderr "$T/u: missing/stale"
+run "$T/a" "gh pr create --fill && cd $T/u && gh pr create --fill"
+expect "every gh pr create is gated, not just the first" 2 stderr "$T/u"
+git -C "$T/a" branch -q feat/unrev-branch "$(git -C "$T/u" rev-parse HEAD 2>/dev/null || echo HEAD)" 2>/dev/null || git -C "$T/a" branch -q feat/unrev-branch
+git -C "$T/a" commit -q --allow-empty -m newer && git -C "$T/a" branch -qf feat/unrev-branch HEAD && git -C "$T/a" reset -q --hard HEAD~1
+run "$T/a" "gh pr create -dH feat/unrev-branch --fill"
+expect "clustered -dH is parsed (unreviewed branch tip is blocked)" 2 stderr "missing/stale"
+run "$T/a" "cd $T/plain && gh pr create -R acme/unrev -H main --title t --body b"
+expect "--repo/--head from a non-git directory is blocked" 2 stderr "isn't a git checkout"
+run "$T/u" "gh pr create --fill --body 'use -h for help'"
+expect "' -h' inside a value no longer skips the gate" 2 stderr "missing/stale"
+run "$T/u" "gh pr create --help"
+expect "gh pr create --help is not gated" 0
+run "$T/a" "bash -c 'cd $T/u && gh pr create --fill'"
+expect "gh pr create hidden in bash -c with a cd is blocked, not checked on the session cwd" 2 stderr "couldn't work out which repo"
+git -C "$T/a" update-ref refs/remotes/origin/feat/nice HEAD
+run "$T/a" "git push -u origin HEAD:feat/nice && gh pr create --head feat/nice --fill"
+expect "--head that only exists as a fetched remote branch uses that commit" 0
+run "$T/a" "gh pr create --head stranger:main --fill"
+expect "--head owner:branch whose owner matches no remote is blocked" 2 stderr "none of"
+run "$T/a" "cd $T/u | gh pr create --fill"
+expect "a cd in a pipeline does not move gh (gated on the session repo)" 0
+run "$T/u" "cd $T/a || cd $T/u && gh pr create --fill"
+expect "a cd after || makes the directory unknown (blocked)" 2 stderr "isn't a literal path, or only runs conditionally"
+(cd "$T/a" && REVIEW_GATE_REQUIRED=" " bash "$gate" check >/dev/null 2>"$T/e2"); rc=$?; err="$(cat "$T/e2")"
+expect "an empty REVIEW_GATE_REQUIRED says so" 1 stderr "names no reviewers"
 
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

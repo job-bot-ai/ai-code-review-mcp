@@ -85,40 +85,34 @@ a stale pass from before later commits does not count. Required reviewers defaul
 to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
 
 **Which repo is checked.** The PR's repo, not the session's working directory
-(`hooks/resolve-pr-target.mjs`):
+(`hooks/resolve-pr-target.mjs` reads the command the way bash would). Every
+`gh pr create` in the command is checked, each in its own repo:
 
-- `cd <dir>` / `pushd <dir>` before `gh pr create` is followed (also inside `( ... )`).
-  A `cd` whose target isn't a literal path (`cd $X`, `cd -`) is blocked: the gate
-  can't know which repo's reviews count.
-- `-R/--repo [HOST/]OWNER/REPO` must match one of that checkout's remotes; otherwise
-  the gate blocks and asks you to run `gh pr create` from the target checkout.
-- `-H/--head [OWNER:]BRANCH`: if that branch is checked out in another worktree, that
-  worktree's markers count; if it's only a local branch, its tip commit must have been
-  reviewed; if it isn't a local branch, the gate blocks.
+- `cd`/`pushd`/`popd` before it are followed: literal paths, `~`, `$HOME`, `( ... )`
+  subshells, `builtin cd`/`command cd`. A `cd` in a pipeline or background job doesn't
+  move `gh`, just as in bash. Heredocs and `$(...)` bodies (e.g. a PR body via
+  `--body "$(cat <<'EOF' ... EOF)"`) are treated as data and nested code.
+- When it can't know where `gh` runs, it **blocks** rather than guess:
+  - a non-literal `cd` (`cd $X`, `cd -`);
+  - a `cd` that may or may not run (after `||`, inside `if`/`case`/loops/functions);
+  - `eval cd …` or `CDPATH`;
+  - `gh pr create` inside a function, or with a non-literal argument such as `$ARGS`.
+- `-R/--repo [HOST/]OWNER/REPO` (or `GH_REPO`) must match one of that checkout's
+  remotes; otherwise it blocks and asks you to run `gh pr create` from the target checkout.
+- `-H/--head [OWNER:]BRANCH` (including clusters like `-dH`), resolved in this order:
+  - the owner, if given, must own one of the checkout's remotes;
+  - a branch checked out in another worktree is checked there;
+  - otherwise the local branch's tip, or a fetched remote branch's tip, must have been reviewed.
+- A `--repo`/`--head` PR from a non-git directory is blocked. A plain `gh pr create`
+  outside git is not gated (gh fails there anyway); this is announced.
+- If the command can't be parsed, the gate falls back to the session's cwd and says so,
+  unless the command changes directory or names a repo/branch: then it blocks.
+- `gh pr create --help` isn't gated. A `-h` that is only part of an argument (for example
+  a PR body that says "use -h") no longer skips the gate.
 - `git -C <dir>` is ignored on purpose: it never changes where `gh` runs.
 
-If the command can't be parsed, the gate falls back to the session's cwd and says so.
-When it gated on a different repo than the cwd, it says which.
-
-> The hook file is named `pre-pr-coderabbit-gate.sh` for back-compat with existing
-> `settings.json` entries; it gates on all configured reviewers, not just CodeRabbit.
-
-Wire the hook into `~/.claude/settings.json` (user-level → applies in every repo):
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "bash /absolute/path/to/ai-code-review-mcp/hooks/pre-pr-coderabbit-gate.sh" }
-        ]
-      }
-    ]
-  }
-}
-```
+When it gated on a different repo than the cwd, or relied on a skip, the hook says so
+(as a `systemMessage`).
 
 Workflow:
 
