@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
-import { findPrCreates, parseGhArgs, repoSlug, tokenize } from '../hooks/resolve-pr-target.mjs';
+import { awkRuns, findPrCreates, parseGhArgs, repoSlug, tokenize } from '../hooks/resolve-pr-target.mjs';
 
 const ENV = {}; // no inherited GH_REPO / CDPATH
 const hits = (cmd, cwd = '/session', env = ENV) => findPrCreates(cmd, cwd, env);
@@ -173,6 +173,13 @@ test('agy re-review: single-arg printf and echo -e into a shell; awk || is not e
   assert.equal(hits("awk '/gh pr create|gh pr view/ {n++}' log").opaque, undefined);
   assert.equal(hits(`awk '{print "gh pr create --fill" | "sh"}'`).opaque, 'awk');
   assert.equal(hits(`awk 'BEGIN{"gh pr create" | getline x}'`).opaque, 'awk');
+});
+
+test('awkRuns: execution forms vs data processing', () => {
+  for (const prog of ['BEGIN{system("x")}', 'BEGIN{("cd /u && gh pr create") | getline}', '{print "x" | "sh"}',
+    'BEGIN{"date" | getline d}', '{print |& "coproc"}']) assert.equal(awkRuns(prog), true, prog);
+  for (const prog of ['/gh pr create/ || count++', '/gh pr create|gh pr view/ {n++}',
+    '{\n  print "gh pr create"\n  fallback || "default"\n}', '{ s = "a|b" } END { print n }']) assert.equal(awkRuns(prog), false, prog);
 });
 
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {

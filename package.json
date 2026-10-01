@@ -7,7 +7,7 @@
   "bin": { "coderabbit-mcp": "./server.mjs" },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/*.test.mjs && bash test/gate.test.sh"
+    "test": "bash -n hooks/pre-pr-coderabbit-gate.sh && bash -n review-gate && node --test test/*.test.mjs && bash test/gate.test.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"

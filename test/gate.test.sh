@@ -211,5 +211,13 @@ expect "echo -e with a \\n escape piped to bash reaches the resolver and is gate
 run "$T/a" "printf 'cd $T/u && gh pr create --fill\n' | bash"
 expect "single-argument printf piped to bash is gated" 2 stderr "$T/u: missing/stale"
 
+mkdir -p "$T/a/sub"
+run "$T/a/sub" "gh pr create --fill"
+expect "a session in a subdirectory of the reviewed checkout gets no cross-repo note" 0
+[ -z "$out" ] || { fail=$((fail + 1)); echo "FAIL - subdir session printed: $out"; }
+mkdir -p "$T/space dir" && mkrepo "$T/space dir/r" acme/space
+run "$T/a" "cd '$T/space dir/r' && gh pr create --fill"
+expect "remediation quotes paths with spaces" 2 stderr 'space\ dir/r && coderabbit review'
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

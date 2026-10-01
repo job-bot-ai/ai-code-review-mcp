@@ -321,6 +321,16 @@ function pipedText(cmd) {
   return [words.replace(/\\n/g, '\n').replace(/\\t/g, '\t'), ...bodies].filter(Boolean).join('\n');
 }
 
+/**
+ * Does an awk program run commands? With string and regex literals blanked out, that is
+ * system(...), getline (`"cmd" | getline`, `("cmd") | getline`) or a lone `|` (not `||`),
+ * as in `print x | "sh"` or `|&`.
+ */
+export function awkRuns(program) {
+  const code = program.replace(/"(\\.|[^"\\])*"/g, '""').replace(/\/(\\.|[^/\\\n])+\//g, '//');
+  return /system\s*\(|getline|(^|[^|])\|(?!\|)/.test(code);
+}
+
 function isGhPrCreate(words) {
   return words.length >= 3 && !words[0].dynamic && words[0].value === 'gh' && words[1].value === 'pr' && words[2].value === 'create';
 }
@@ -581,10 +591,9 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     // sed/awk only run commands via awk system()/print|"cmd" or sed's e command/flag.
     if (c0 === 'awk' || c0 === 'gawk' || c0 === 'sed') {
-      const runs = c0 === 'sed'
-        ? /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/
-        : /system\s*\(|\bprintf?\b[^;}]*\|\s*"|"\s*\|\s*getline|\|&/; // not `||` or regex alternation
-      if (mentioned() && cmd.slice(1).some((w) => runs.test(w.value))) opaque(c0);
+      const sedRuns = /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/;
+      const runs = (v) => (c0 === 'sed' ? sedRuns.test(v) : awkRuns(v));
+      if (mentioned() && cmd.slice(1).some((w) => runs(w.value))) opaque(c0);
       return;
     }
     // Anything else that receives `gh pr create` as input might run it (ssh, python, ...).
