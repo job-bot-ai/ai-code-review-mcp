@@ -205,5 +205,11 @@ expect "command gh pr create is gated" 2 stderr "$T/u: missing/stale"
 run "$T/a" "gh pr create --fill && awk 'BEGIN{system(\"cd $T/u && gh pr create --fill\")}'"
 expect "an opaque gh pr create isn't masked by a resolvable one" 2 stderr "also passed to awk"
 
+# ── through the real hook (pre-filter included): escapes in piped text ──
+run "$T/a" "echo -e 'cd $T/u\ngh pr create --fill' | bash"
+expect "echo -e with a \\n escape piped to bash reaches the resolver and is gated" 2 stderr "$T/u: missing/stale"
+run "$T/a" "printf 'cd $T/u && gh pr create --fill\n' | bash"
+expect "single-argument printf piped to bash is gated" 2 stderr "$T/u: missing/stale"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

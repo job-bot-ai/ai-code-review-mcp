@@ -30,7 +30,8 @@ fi
 # (`timeout 60 gh pr create`), `GH_REPO=... gh pr create`, `bash -c`, `eval`, backticks
 # and pipes into shells, and lets mentions that are only data (commit messages, grep
 # patterns) through. Only the no-node fallback below keeps the command-position match.
-printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])gh[[:space:]]+pr[[:space:]]+create([^[:alnum:]_-]|$)' || exit 0
+# (`\n`/`\t` escapes count as separators: `printf 'cd x\ngh pr create' | bash`.)
+printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+create([^[:alnum:]_-]|$)' || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"

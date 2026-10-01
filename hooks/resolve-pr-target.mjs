@@ -305,7 +305,7 @@ const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep',
 // Script interpreters: a heredoc/stdin/file fed to them is nearly always a file edit, so a
 // mention there is treated as data; inline code (-c/-e) that mentions gh pr create is opaque.
 const INTERPRETERS = new Set(['python', 'python3', 'node', 'perl', 'ruby', 'php']);
-const MENTION = /(^|[^A-Za-z0-9_-])gh\s+pr\s+create\b/; // same boundary as the hook's pre-filter
+const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+create\b/; // same boundary as the hook's pre-filter
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
@@ -318,7 +318,7 @@ function pipedText(cmd) {
   if (c0 === 'echo') while (args.length && /^-[neE]+$/.test(args[0].value)) args = args.slice(1); // echo's own flags
   const words = c0 === 'printf' ? args.map((w) => w.value).join('\n') : args.map((w) => w.value).join(' ');
   const bodies = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
-  return [words.replace(/\\n/g, '\n'), ...bodies].filter(Boolean).join('\n');
+  return [words.replace(/\\n/g, '\n').replace(/\\t/g, '\t'), ...bodies].filter(Boolean).join('\n');
 }
 
 function isGhPrCreate(words) {
