@@ -493,6 +493,8 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       for (const w of cmd.slice(1)) if (ASSIGN.test(w.value)) note(w, true);
       return;
     }
+    // `command gh pr create` / `builtin cd x` run the same thing as without the prefix.
+    if ((cmd[0].value === 'command' || cmd[0].value === 'builtin') && !cmd[0].dynamic && cmd[1]) cmd = cmd.slice(1);
     if (assigns.some((w) => w.value.startsWith('CDPATH=')) && ['cd', 'pushd'].includes(cmd[0].value)) { s.dir = null; return; }
     if (isGhPrCreate(cmd)) {
       const prefixed = assigns.find((w) => w.value.startsWith('GH_REPO='));
@@ -509,8 +511,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const stdinCode = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
     const mentioned = () => cmd.some((w) => MENTION.test(w.heredoc ? w.heredoc.body ?? '' : w.value));
     if (cmd[0].dynamic) { if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`); return; }
-    let c0 = cmd[0].value;
-    if ((c0 === 'builtin' || c0 === 'command') && cmd[1]) { cmd = cmd.slice(1); c0 = cmd[0].value; }
+    const c0 = cmd[0].value;
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
     if (c0 === 'git') { recordPush(cmd); return; }
     if (c0 === 'eval') {
@@ -782,6 +783,14 @@ export function resolveTargets(command, cwd, env = process.env) {
     return { status: 'none' }; // only mentioned as data (a commit message, a file being written)
   }
   const targets = [];
+  if (hits.opaque) {
+    // Another `gh pr create` went somewhere the gate can't follow: same policy as an
+    // unparseable command, applied on top of the hits that could be resolved.
+    if (RISKY.test(command)) {
+      return { status: 'block', reason: `\`gh pr create\` is also passed to ${hits.opaque}, which the gate can't follow, and the command changes directory or names a repo/branch` };
+    }
+    targets.push({ dir: cwd, rev: null, note: `gh pr create is also passed to ${hits.opaque}; checked the session cwd for it` });
+  }
   let allHelp = true;
   for (const hit of hits) {
     const r = resolveOne(hit);
@@ -790,7 +799,7 @@ export function resolveTargets(command, cwd, env = process.env) {
     allHelp = false;
     if (!targets.some((t) => t.dir === r.target.dir && t.rev === r.target.rev)) targets.push(r.target);
   }
-  return allHelp ? { status: 'help' } : { status: 'ok', targets };
+  return allHelp && !targets.length ? { status: 'help' } : { status: 'ok', targets };
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

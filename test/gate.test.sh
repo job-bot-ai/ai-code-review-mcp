@@ -199,5 +199,11 @@ run "$T/u" "grep -rn 'gh pr create' . ; sed -n '/gh pr create/p' x 2>/dev/null"
 expect "grep/sed that only mention gh pr create still pass silently" 0
 [ -z "$out$err" ] || { fail=$((fail + 1)); echo "FAIL - mention printed: $out$err"; }
 
+# ── CodeRabbit on the agy fixes ──
+run "$T/u" "command gh pr create --fill"
+expect "command gh pr create is gated" 2 stderr "$T/u: missing/stale"
+run "$T/a" "gh pr create --fill && awk 'BEGIN{system(\"cd $T/u && gh pr create --fill\")}'"
+expect "an opaque gh pr create isn't masked by a resolvable one" 2 stderr "also passed to awk"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]
