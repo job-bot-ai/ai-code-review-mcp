@@ -620,9 +620,19 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       if (program && awkRuns(program.value)) opaque(c0);
       return;
     }
-    // Anything else that receives `gh pr create` (as arguments, a heredoc or on a pipe)
-    // might run it: ssh, xargs, ... Script interpreters were handled above as data.
-    if (!DATA_SINKS.has(c0) && (mentioned() || (fromPipe !== null && MENTION.test(fromPipe)))) opaque(c0);
+    if (DATA_SINKS.has(c0)) return;
+    // Any other command whose arguments contain `gh pr create` as words runs it like a
+    // runner would: `op run -- gh pr create`, `doppler run -- gh pr create`, `ssh host
+    // gh pr create` (gated against the local checkout, conservatively).
+    const k = cmd.findIndex((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
+    if (k > 0) {
+      found.push({ dir: funcDepth > 0 ? null : s.dir, args: cmd.slice(k + 3), ghRepo: s.ghRepo, pushes: [...pushes] });
+      return;
+    }
+    // Otherwise, anything that receives `gh pr create` (in one argument, split across
+    // arguments, a heredoc or a pipe) might run it. Script interpreters were handled above.
+    const joined = cmd.slice(1).filter((w) => !w.heredoc).map((w) => w.value).join(' ');
+    if (mentioned() || MENTION.test(joined) || (fromPipe !== null && MENTION.test(fromPipe))) opaque(c0);
   };
 
   const endList = (op) => {

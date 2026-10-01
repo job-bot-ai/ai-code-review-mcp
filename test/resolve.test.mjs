@@ -209,6 +209,14 @@ test('gh by path; pushes made in nested scripts reach the outer gh pr create', (
     [{ dir: '/session', src: 'HEAD', dst: 'x' }]);
 });
 
+test('gh pr create as split arguments of another command is gated like a runner', () => {
+  assert.deepEqual(hits('cd /u && op run -- gh pr create --fill').map((h) => h.dir), ['/u']);
+  assert.deepEqual(hits('doppler run -- gh pr new --fill').map((h) => h.dir), ['/session']);
+  assert.deepEqual(hits('ssh host gh pr create --fill').map((h) => h.dir), ['/session']);
+  assert.equal(hits('echo gh pr create | cat').length, 0); // a data sink just prints it
+  assert.equal(hits("ssh host 'cd /x && gh' 'pr create'").opaque, 'ssh'); // split, not a clean word run
+});
+
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {
   const commit = "cd /r && git commit -q -F - <<'EOF'\ndon't break\ncd /elsewhere\nEOF\ngh pr create --fill";
   assert.equal(dirOf(commit), '/r');

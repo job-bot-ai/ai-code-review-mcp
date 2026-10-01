@@ -249,5 +249,8 @@ payload="$(jq -cn --arg c "cd $T/u && gh pr create --fill" --arg d "$T/a" '{tool
 out="$(printf '%s' "$payload" | bash "$T/linked/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
 expect "a hook installed via a symlinked path still resolves the target" 2 stderr "$T/u: missing/stale"
 
+run "$T/u" "op run -- gh pr create --fill"
+expect "op run -- gh pr create (a wrapper that runs gh locally) is gated" 2 stderr "$T/u: missing/stale"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]
