@@ -161,7 +161,19 @@ one commit, with a reason:
 
 A skip is bound to HEAD like a pass, is printed by every `check` that relies on it
 (the hook surfaces it as a `systemMessage`), and never satisfies the gate alone: at
-least one required reviewer needs a real pass. Prefer this over
+least one real pass is required.
+
+**`agy` (Google Antigravity) as the fallback reviewer.** When CodeRabbit *and* Codex
+are both unavailable, record both as skips and run an agy review. `./review-gate record agy`
+then provides the real pass. agy is never required by default
+(`REVIEW_GATE_REQUIRED=coderabbit codex`). In headless mode agy refuses shell and file
+tools and still exits 0, so embed the diff in the prompt and treat a
+"no output produced" reply as no review:
+
+```bash
+agy -p "Review this diff ... If nothing material, write exactly: NO MATERIAL FINDINGS.
+$(git diff main...HEAD)" --mode plan --effort high --print-timeout 900s
+``` Prefer this over
 `REVIEW_GATE_REQUIRED`, which can only be set in the hook's environment and leaves no
 per-commit record.
 

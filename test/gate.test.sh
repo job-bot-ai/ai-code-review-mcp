@@ -66,6 +66,9 @@ mkrepo "$T/d" acme/delta
 (cd "$T/d" && bash "$gate" record-skip codex --reason "codex is down today" >/dev/null && bash "$gate" record-skip coderabbit --reason "coderabbit is down today" >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "skipping every reviewer is not enough" 2 stderr "at least one real review"
+(cd "$T/d" && bash "$gate" record agy >/dev/null)
+run "$T/a" "cd $T/d && gh pr create --fill"
+expect "both skipped plus an agy pass is enough, and is announced" 0 stdout "the agy review is the real pass"
 
 mkrepo "$T/e" acme/epsilon
 git -C "$T/e" worktree add -q -b feat/x "$T/e-wt" && green "$T/e-wt"
