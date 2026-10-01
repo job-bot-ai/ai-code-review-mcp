@@ -49,6 +49,15 @@ session_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)
 session_top="$(git -C "$session_cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$session_cwd")"
 
 block() { echo "BLOCKED by the AI code-review PR gate: $1" >&2; exit 2; }
+# Without a resolver result, falling back to the session cwd is only safe when nothing in
+# the command could move the PR elsewhere (same rule as the resolver's RISKY check).
+risky() {
+  printf '%s' "$cmd" | grep -Eq "(^|[[:space:];&|(){}'\"\`])(cd|pushd|popd)([[:space:]]|\$)|(^|[[:space:]])(--repo|--head)([[:space:]=]|\$)|(^|[[:space:]])-[A-Za-z]*[RH]|GH_REPO|CDPATH"
+}
+fallback_or_block() {
+  risky && block "couldn't run the target resolver ($1), and the command changes directory or names a repo/branch, so the session cwd may be the wrong repo."
+  notes="review-gate: $1; checked the session cwd"
+}
 targets=""; notes=""
 if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
   res="$(printf '%s' "$cmd" | node "$here/resolve-pr-target.mjs" "$session_cwd" 2>/dev/null || true)"
@@ -64,14 +73,14 @@ if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
         block "couldn't work out which repo this PR comes from ($reason), and the command changes directory or names a repo/branch. Simplify it, e.g. write the PR body to a file and use --body-file."
       fi
       notes="review-gate: checked the session cwd ($reason)" ;;
-    *) notes="review-gate: target resolver failed; checked the session cwd" ;;
+    *) fallback_or_block "target resolver failed" ;;
   esac
 else
   # Without the resolver: gate only `gh pr create` in command position (start of the
   # command or after ; | & ( { ), as before; env-prefixed and `bash -c` forms aren't seen.
   printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+create([[:space:];|&)}]|$)' || exit 0
   case "$cmd" in *--help*|*" -h"*) exit 0;; esac   # crude help check without the resolver
-  notes="review-gate: node unavailable; checked the session cwd"
+  fallback_or_block "node unavailable"
 fi
 [ -n "$targets" ] || targets="$(jq -cn --arg d "$session_cwd" '{dir: $d, rev: null, note: null}')"
 

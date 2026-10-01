@@ -222,5 +222,14 @@ expect "remediation quotes paths with spaces" 2 stderr 'space\ dir/r && coderabb
 run "$T/a" "B=feat/other; gh pr create --head \"\$B\" --fill"
 expect "a non-literal --head blocks (the PR's commit is unknown)" 2 stderr "--head is not a literal value"
 
+# Resolver unavailable: a broken resolver must not quietly gate a cd'd PR on the session cwd.
+cp -r "$root" "$T/broken" && printf 'process.exit(1)\n' > "$T/broken/hooks/resolve-pr-target.mjs"
+payload="$(jq -cn --arg c "cd $T/u && gh pr create --fill" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | bash "$T/broken/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "if the resolver fails, a risky command blocks instead of using the session cwd" 2 stderr "couldn't run the target resolver"
+payload="$(jq -cn --arg c "gh pr create --fill" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | bash "$T/broken/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "if the resolver fails, a plain command falls back to the session cwd with a note" 0 stdout "target resolver failed"
+
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]
