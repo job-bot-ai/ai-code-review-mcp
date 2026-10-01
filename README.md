@@ -80,29 +80,70 @@ Each reviewer exposes a `*_status` tool (CLI version + auth) and a `*_review` to
 
 `review-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "review before you open
 a PR". Wired as a Claude Code `PreToolUse` hook, it blocks `gh pr create` unless
-**every required reviewer** has a pass recorded for the **current HEAD commit** —
+**every required reviewer** has a pass recorded for the **commit the PR comes from** —
 a stale pass from before later commits does not count. Required reviewers default
 to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
 
-> The hook file is named `pre-pr-coderabbit-gate.sh` for back-compat with existing
-> `settings.json` entries; it gates on all configured reviewers, not just CodeRabbit.
+**Which repo is checked.** The PR's repo, not the session's working directory
+(`hooks/resolve-pr-target.mjs` reads the command the way bash would). Every
+`gh pr create` in the command is checked, each in its own repo:
 
-Wire the hook into `~/.claude/settings.json` (user-level → applies in every repo):
+- `cd`/`pushd`/`popd` before it are followed: literal paths, `~`, `$HOME`, `( ... )`
+  subshells, `builtin cd`/`command cd`. A `cd` in a pipeline or background job doesn't
+  move `gh`, just as in bash.
+- Code that runs is walked too, from the directory it runs in:
+  - `$(...)`, backticks and `<(...)` (e.g. `PR_URL=$(gh pr create ...)`), including
+    those in unquoted heredocs;
+  - `bash`/`sh -c` and `eval` scripts, even when part of the script is a variable;
+  - code fed to a shell or `source` on stdin: a heredoc, a here-string, or a pipe
+    (`cat <<'EOF' | bash`, `echo "..." | bash`);
+  - `timeout`/`env`/`sudo`-style runners (`env -C`/`GH_REPO=` operands included).
+- A mention fed to a command that never runs its input (`cat`, `tee`, `echo`, `git`,
+  `gh`, `grep`, `jq`, …) is data, e.g. a commit message or a script being written,
+  and isn't gated. Text fed to `python`/`node`/`perl`/`ruby` on a heredoc or stdin is
+  also treated as data, since it's nearly always a file edit.
+- A mention the gate can't follow (`ssh`, an `awk` script using `system(...)` or a `sed` `e` command,
+  `bash script.sh`, `bash <(...)`, `python3 -c "..."`) is treated like an unparseable
+  command.
+- When it can't know where `gh` runs, it **blocks** rather than guess:
+  - a non-literal `cd` (`cd $X`, `cd -`);
+  - a `cd` that may or may not run before `gh pr create`:
+    - after `||`;
+    - inside `if`/`case`/loops/functions;
+    - `x && cd dir` whose list ends before `gh pr create` (a trailing `&&`/`||`/`|`
+      continues the list onto the next line, as in bash);
+    - `x && { cd dir; }` followed by `gh pr create` outside the group. Inside the
+      group the `cd` holds, so `test -d d && { cd d; gh pr create; }` is fine;
+  - `eval cd …`, `eval`/`source` with a non-literal argument, or `CDPATH`;
+  - `gh pr create` inside a function, or with a non-literal argument such as `$ARGS`.
+- `-R/--repo [HOST/]OWNER/REPO` (or `GH_REPO`) must match one of that checkout's
+  remotes; otherwise it blocks and asks you to run `gh pr create` from the target checkout.
+- `-H/--head [OWNER:]BRANCH` (including clusters like `-dH`; a non-literal `--head "$B"`
+  blocks, since the PR's commit is unknown), resolved in this order:
+  - the owner, if given, must own one of the checkout's remotes;
+  - a branch checked out in another worktree is checked there;
+  - a `git push <remote> <src>:<branch>` earlier in the same command decides the commit
+    (it is what the PR will contain), checked in the checkout that pushed;
+  - otherwise the local branch's tip, or a fetched remote branch's tip, must have been
+    reviewed.
+- A `git commit`/`merge`/`rebase`/`pull`/`reset`/`cherry-pick`/`revert`/`am`, or a
+  `checkout`/`switch` to another commit, earlier in the same command and repo blocks: the
+  hook runs before that commit exists, so it can't have been reviewed. Creating a branch
+  at HEAD (`checkout -b x`) is fine.
+- A `--repo`/`--head` PR from a non-git directory is blocked. A plain `gh pr create`
+  outside git is not gated (gh fails there anyway); this is announced.
+- If the command can't be parsed, the gate falls back to the session's cwd and says so,
+  unless the command changes directory or names a repo/branch: then it blocks.
+- `gh pr create --help` isn't gated. A `-h` that is only part of an argument (for example
+  a PR body that says "use -h") no longer skips the gate.
+- `git -C <dir>` is ignored on purpose: it never changes where `gh` runs.
+- Out of scope: deliberately hiding a `cd` or `gh pr create` from the gate. Examples:
+  a command word built from an expansion (`$X /dir`, `$(echo cd) /dir`), or a script
+  interpreter told to run it (`python3 - <<EOF ... os.system(...)`). The gate is a
+  speed-bump against mistakes, not a sandbox.
 
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          { "type": "command", "command": "bash /absolute/path/to/ai-code-review-mcp/hooks/pre-pr-coderabbit-gate.sh" }
-        ]
-      }
-    ]
-  }
-}
-```
+When it gated on a different repo than the cwd, or relied on a skip, the hook says so
+(as a `systemMessage`).
 
 Workflow:
 
@@ -113,15 +154,43 @@ gh pr create ...                                                    # now allowe
 ```
 
 `./review-gate status` shows each reviewer's state vs HEAD; `clear [reviewer]`
-removes a pass.
+removes a pass (and any skip).
+
+**A reviewer that can't run** (quota exhausted, outage, no seat) can be skipped for
+one commit, with a reason:
+
+```bash
+./review-gate record-skip codex --reason "usage limit until 2026-10-03 13:32"
+```
+
+A skip is bound to HEAD like a pass, is printed by every `check` that relies on it
+(the hook surfaces it as a `systemMessage`), and never satisfies the gate alone: at
+least one real pass is required. Prefer this over `REVIEW_GATE_REQUIRED`, which can only
+be set in the hook's environment and leaves no per-commit record.
+
+**`agy` (Google Antigravity) as the fallback reviewer.** When CodeRabbit *and* Codex
+are both unavailable, record both as skips and run an agy review. `./review-gate record agy`
+then provides the real pass. agy is never required by default
+(`REVIEW_GATE_REQUIRED=coderabbit codex`). In headless mode agy refuses shell and file
+tools and still exits 0, so embed the diff in the prompt and treat a
+"no output produced" reply as no review:
+
+```bash
+agy -p "Review this diff ... If nothing material, write exactly: NO MATERIAL FINDINGS.
+$(git diff main...HEAD)" --mode plan --effort high --print-timeout 900s
+```
 
 Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
 clients). The hook requires `jq` (to extract the command from the payload) and
-matches `gh pr create` only in **command position** — so commands that merely
-mention the string (echo, grep, commit messages, heredocs) are not blocked. It is
+hands any command containing the words `gh pr create` to the resolver above, which
+gates real invocations wherever they run and lets data-only mentions (echo, grep,
+commit messages, heredocs) through. Without `node`, it falls back to gating only
+`gh pr create` in **command position** of the session cwd. It is
 **fail-open** — any internal error, or a missing `jq`, lets the command through
 rather than wedging your shell — so it is a strong speed-bump, not a hard security
 boundary.
+
+Tests: `npm test` (resolver unit tests + hook integration tests against throwaway repos).
 
 ## Env overrides
 
