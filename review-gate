@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# review-gate — record/verify per-reviewer "green light" passes bound to the current git HEAD.
+# Part of https://github.com/job-bot-ai/ai-code-review-mcp
+#
+# `check` passes only when EVERY required reviewer has a pass recorded for the current HEAD.
+# Required reviewers default to "coderabbit codex"; override via REVIEW_GATE_REQUIRED.
+# Markers live in $GIT_DIR/review-gate/<reviewer> and are bound to a HEAD commit, so adding
+# new commits invalidates them (re-review required).
+set -euo pipefail
+
+VALID="coderabbit codex"
+read -r -a REQUIRED <<<"${REVIEW_GATE_REQUIRED:-coderabbit codex}"
+
+gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || {
+  echo "review-gate: not inside a git repo" >&2; exit 3; }
+head="$(git rev-parse --verify -q HEAD 2>/dev/null || echo none)"
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo none)"
+if [ "$head" = "none" ]; then
+  echo "review-gate: no commits in repository (nothing to gate)" >&2; exit 3
+fi
+dir="$gitdir/review-gate"
+
+is_valid() { case " $VALID " in *" $1 "*) return 0;; *) return 1;; esac; }
+marker()   { printf '%s/%s' "$dir" "$1"; }
+recorded() { local m; m="$(marker "$1")"; [ -f "$m" ] && cut -d' ' -f1 <"$m" || true; }
+
+case "${1:-help}" in
+  record)
+    r="${2:-}"
+    is_valid "$r" || { echo "review-gate: unknown reviewer '$r' (valid: $VALID)" >&2; exit 2; }
+    mkdir -p "$dir"
+    printf '%s %s %s\n' "$head" "$branch" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$(marker "$r")"
+    echo "review-gate: recorded $r pass for $branch @ ${head:0:12}"
+    ;;
+  check)
+    missing=()
+    for r in "${REQUIRED[@]}"; do
+      [ "$(recorded "$r")" = "$head" ] || missing+=("$r")
+    done
+    [ "${#missing[@]}" -eq 0 ] && exit 0
+    echo "missing/stale review pass for HEAD ${head:0:12}: ${missing[*]}" >&2
+    exit 1
+    ;;
+  status)
+    printf 'HEAD: %s (%s)\n' "$head" "$branch"
+    for r in $VALID; do
+      rh="$(recorded "$r")"
+      if [ -z "$rh" ]; then s="(none)"; elif [ "$rh" = "$head" ]; then s="green @ ${rh:0:12}"; else s="STALE @ ${rh:0:12}"; fi
+      req=""; case " ${REQUIRED[*]} " in *" $r "*) req=" [required]";; esac
+      printf '  %-11s %s%s\n' "$r" "$s" "$req"
+    done
+    ;;
+  clear)
+    if [ -n "${2:-}" ]; then
+      is_valid "$2" || { echo "review-gate: unknown reviewer '$2' (valid: $VALID)" >&2; exit 2; }
+      rm -f "$(marker "$2")"; echo "review-gate: cleared $2"
+    else
+      rm -rf "$dir"; echo "review-gate: cleared all"
+    fi
+    ;;
+  *)
+    {
+      echo "usage: review-gate {record <reviewer>|check|status|clear [reviewer]}"
+      echo "  reviewers: $VALID"
+      echo "  required : ${REQUIRED[*]}  (override with REVIEW_GATE_REQUIRED=\"coderabbit codex\")"
+    } >&2
+    exit 2
+    ;;
+esac
