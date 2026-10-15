@@ -10,6 +10,6 @@
     "test": "bash -n hooks/pre-pr-coderabbit-gate.sh && bash -n review-gate && node --test test/*.test.mjs && bash test/gate.test.sh"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.31.0"
   }
 }
