@@ -94,6 +94,12 @@ case "$(kimi_state)" in "green @ "*) ;; *) fail=$((fail + 1)); echo "FAIL - kimi
 grep -qx 'base=develop' "$T/dispatch" || { fail=$((fail + 1)); echo "FAIL - --base not dispatched"; }
 grep -qx "head_sha=$(git -C "$T/w" rev-parse HEAD)" "$T/dispatch" || { fail=$((fail + 1)); echo "FAIL - wrong head_sha"; }
 
+FAKE_VERDICT='{"complete":true,"sha":"HEAD","high":2,"medium":0}' run
+expect "a failed re-review of the same commit fails" 1 "2 high"
+[ "$(kimi_state)" = "(none)" ] || { fail=$((fail + 1)); echo "FAIL - earlier kimi pass survived a failed re-review: $(kimi_state)"; }
+run
+expect "a clean re-review records kimi again" 0
+
 # The gate: both required reviewers skipped + kimi pass → allowed, and announced.
 (cd "$T/w" && bash "$gate" record-skip coderabbit --reason "free hourly allowance used up" >/dev/null \
   && bash "$gate" record-skip codex --reason "skipped until 2026-10-24" >/dev/null)

@@ -200,7 +200,8 @@ How it works, and why it doesn't need a PR (the chicken-and-egg problem):
 - **Pass** = the review completed, it reviewed exactly HEAD, and it has **no high finding**.
   Then `kimi-review` runs `review-gate record kimi`. Medium findings are printed: fix them,
   or say in the PR description why not. High findings, an incomplete run (secret missing,
-  model down, unparsable answer) or a moved HEAD record nothing and exit 1.
+  model down, unparsable answer) or a moved HEAD record nothing and exit 1; a completed
+  review that rejects also withdraws any earlier kimi pass.
 - When the PR is then opened at that same commit, the workflow posts this pre-PR review on
   the PR instead of running the model again. Pushes to an open PR are not re-reviewed
   automatically (cost). Comment `/review` (or `/review deep`) on the PR to re-review the

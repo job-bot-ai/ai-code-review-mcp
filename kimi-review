@@ -85,11 +85,17 @@ while :; do
   sleep 20
 done
 
+# The latest completed review decides: a rejection also withdraws an earlier kimi pass.
+reject() {
+  [ "$record" -eq 1 ] && bash "$gate" clear kimi >/dev/null
+  die "$1" 1
+}
+
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 gh run download "$run_id" -R "$repo" -n ollama-review -D "$tmp" >/dev/null 2>&1 || true
 [ -f "$tmp/review.md" ] && { echo; cat "$tmp/review.md"; echo; }
 if [ ! -f "$tmp/verdict.json" ]; then
-  die "no review came back (run $conclusion; secret missing or model down?): $run_url" 1
+  reject "no review came back (run $conclusion; secret missing or model down?): $run_url"
 fi
 
 complete="$(jq -r '.complete' "$tmp/verdict.json")"
@@ -97,13 +103,10 @@ sha="$(jq -r '.sha' "$tmp/verdict.json")"
 # Counts must be present non-negative integers; anything else is not a clean verdict.
 count() { jq -r --arg k "$1" '.[$k] | if type == "number" and . >= 0 and . == floor then . else "invalid" end' "$tmp/verdict.json"; }
 high="$(count high)"; medium="$(count medium)"
-[ "$complete" = "true" ] || die "the review did not complete: $(jq -r '.reason // "unknown"' "$tmp/verdict.json") ($run_url)" 1
+[ "$complete" = "true" ] || reject "the review did not complete: $(jq -r '.reason // "unknown"' "$tmp/verdict.json") ($run_url)"
 [ "$sha" = "$head" ] || die "the run reviewed ${sha:0:12}, not HEAD ${head:0:12}" 1
-[ "$high" != "invalid" ] && [ "$medium" != "invalid" ] || die "verdict.json has no valid high/medium counts ($run_url)" 1
-if [ "$high" != "0" ]; then
-  echo "kimi-review: $high high, $medium medium. Fix the high findings, commit, push, and run kimi-review again." >&2
-  exit 1
-fi
+[ "$high" != "invalid" ] && [ "$medium" != "invalid" ] || reject "verdict.json has no valid high/medium counts ($run_url)"
+[ "$high" = "0" ] || reject "$high high, $medium medium. Fix the high findings, commit, push, and run kimi-review again."
 [ "$medium" = "0" ] || echo "kimi-review: $medium medium finding(s): fix them, or say in the PR description why not."
 
 [ "$(git rev-parse HEAD)" = "$head" ] || die "HEAD moved during the review; run kimi-review again" 1
