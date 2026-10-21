@@ -179,9 +179,16 @@ tools and still exits 0, so embed the diff in the prompt and treat a
 "no output produced" reply as no review:
 
 ```bash
-agy -p "Review this diff ... If nothing material, write exactly: NO MATERIAL FINDINGS.
-$(git diff main...HEAD)" --mode plan --effort high --print-timeout 900s
+d="$(git diff main...HEAD)"; mkdir -p /tmp/agy-empty && cd /tmp/agy-empty   # nothing to explore
+agy -p "Do NOT use any tools; everything is in this message. Review this diff ...
+If nothing material, write exactly: NO MATERIAL FINDINGS.
+$d" --model gemini-3.8-flash-high --mode plan --print-timeout 900s
 ```
+
+Pass `--model` explicitly: the default model's quota can be exhausted ("Individual quota
+reached", printed as `AGY_ERROR` with exit 0) while `gemini-3.8-flash-high` still works
+(`agy models` lists them). Without the "no tools" line agy often tries a command, is denied,
+and prints "no output produced". Neither case is a review.
 
 **`kimi` (Kimi K2.7-code on Ollama Cloud), a required reviewer.** Record it with
 `kimi-review`, not by hand:
