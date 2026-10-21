@@ -19,7 +19,7 @@ cat >"$T/bin/gh" <<'EOF'
 state="$FAKE_STATE"
 case "$1 $2" in
   "repo view") echo main ;;
-  "workflow view") [ -z "${FAKE_NO_WORKFLOW:-}" ] ;;
+  "api repos/acme/alpha/contents/.github/workflows/ollama-review.yml?ref=main") [ -z "${FAKE_NO_WORKFLOW:-}" ] ;;
   "workflow run")
     printf '%s\n' "$@" >"$state/dispatch"
     grep -qx -- '--ref' "$state/dispatch" && grep -A1 -x -- '--ref' "$state/dispatch" | tail -1 | grep -qx main || exit 1 ;;
@@ -56,6 +56,11 @@ kimi_state() { (cd "$T/w" && bash "$gate" status) | sed -n 's/^  kimi *//p'; }
 export FAKE_VERDICT='{"complete":true,"sha":"HEAD","high":0,"medium":0}'
 run
 expect "unpushed HEAD is refused" 2 "Push first"
+
+git -C "$T/w" remote set-url origin "$T/nonexistent/acme/alpha.git"
+run
+expect "an unreachable origin is a setup error with a message" 2 "can't reach origin"
+git -C "$T/w" remote set-url origin "$T/remote/acme/alpha.git"
 
 git -C "$T/w" push -q origin feat/x
 FAKE_NO_WORKFLOW=1 run

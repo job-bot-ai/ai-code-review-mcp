@@ -43,23 +43,25 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 [ "$branch" != "HEAD" ] || die "detached HEAD: check out the branch the PR will come from"
 
 # GitHub reviews the commit it has, so HEAD must be pushed as this branch.
-remote_sha="$(git ls-remote origin "refs/heads/$branch" 2>/dev/null | cut -f1)"
+url="$(git remote get-url origin 2>/dev/null)" || die "no 'origin' remote"
+remote_sha="$(git ls-remote origin "refs/heads/$branch")" \
+  || die "can't reach origin (git ls-remote failed); check network and auth"
+remote_sha="${remote_sha%%[[:space:]]*}"
 [ "$remote_sha" = "$head" ] || die "origin/$branch is at ${remote_sha:-<not pushed>} but HEAD is ${head:0:12}. Push first: git push -u origin $branch"
 
-url="$(git remote get-url origin)"
 repo="$(printf '%s' "$url" | sed -E 's#\.git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#')"
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "can't tell the GitHub repo from origin ($url)"
 
 default="$(gh repo view "$repo" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null)" \
   || die "gh can't read $repo (gh auth status?)"
-gh workflow view "$workflow" -R "$repo" >/dev/null 2>&1 \
+gh api "repos/$repo/contents/.github/workflows/$workflow?ref=$default" >/dev/null 2>&1 \
   || die "$repo has no $workflow on $default yet; merge its chore/ollama-pr-review PR first"
 
 rid="kr-$(date +%s)-$$-$RANDOM"
 title="pre-PR review $head $rid"
 gh workflow run "$workflow" -R "$repo" --ref "$default" \
   -f head_sha="$head" -f base="$base" -f request_id="$rid" >/dev/null \
-  || die "could not dispatch $workflow on $repo"
+  || die "could not dispatch $workflow on $repo; is the $default copy the one with the head_sha/request_id inputs (chore/ollama-pr-review)?"
 
 run_id=""
 for _ in $(seq 1 40); do

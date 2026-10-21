@@ -182,7 +182,8 @@ $(git diff main...HEAD)" --mode plan --effort high --print-timeout 900s
 
 **`kimi` (Kimi K2.7-code on Ollama Cloud) as a fallback reviewer.** Like agy, kimi
 is never required by default, and its pass is the real pass when CodeRabbit and Codex
-are both recorded as skips. Record it with `kimi-review`, not by hand:
+are both recorded as skips. (In general, a pass from any reviewer that isn't in
+`REVIEW_GATE_REQUIRED` counts as the real pass.) Record it with `kimi-review`, not by hand:
 
 ```bash
 git push -u origin "$(git branch --show-current)"     # GitHub reviews the pushed commit

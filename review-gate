@@ -14,7 +14,8 @@
 # and never satisfies the gate on its own: at least one real pass is required.
 # `kimi` (Kimi K2.7-code on Ollama Cloud, recorded by `kimi-review`) and `agy` (Google
 # Antigravity) are optional fallback reviewers: never required by default, but a pass from
-# either counts as that real pass, e.g. when CodeRabbit AND Codex are both skipped.
+# either counts as that real pass, e.g. when CodeRabbit AND Codex are both skipped. (Any
+# reviewer left out of REVIEW_GATE_REQUIRED works the same way.)
 set -euo pipefail
 
 VALID="coderabbit codex agy kimi"
