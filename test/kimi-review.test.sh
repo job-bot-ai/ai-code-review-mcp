@@ -99,6 +99,13 @@ expect "a failed re-review of the same commit fails" 1 "2 high"
 [ "$(kimi_state)" = "(none)" ] || { fail=$((fail + 1)); echo "FAIL - earlier kimi pass survived a failed re-review: $(kimi_state)"; }
 run
 expect "a clean re-review records kimi again" 0
+FAKE_VERDICT='{not json' run
+expect "a malformed verdict fails" 1 "not a JSON object"
+[ "$(kimi_state)" = "(none)" ] || { fail=$((fail + 1)); echo "FAIL - kimi pass survived a malformed re-review"; }
+FAKE_VERDICT='[1]' run
+expect "a non-object verdict fails" 1 "not a JSON object"
+run
+expect "and a clean review records it again" 0
 
 # The gate: both required reviewers skipped + kimi pass → allowed, and announced.
 (cd "$T/w" && bash "$gate" record-skip coderabbit --reason "free hourly allowance used up" >/dev/null \

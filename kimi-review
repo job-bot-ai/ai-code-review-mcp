@@ -98,6 +98,8 @@ if [ ! -f "$tmp/verdict.json" ]; then
   reject "no review came back (run $conclusion; secret missing or model down?): $run_url"
 fi
 
+jq -e 'type == "object"' "$tmp/verdict.json" >/dev/null 2>&1 \
+  || reject "verdict.json is not a JSON object ($run_url)"
 complete="$(jq -r '.complete' "$tmp/verdict.json")"
 sha="$(jq -r '.sha' "$tmp/verdict.json")"
 # Counts must be present non-negative integers; anything else is not a clean verdict.
