@@ -51,7 +51,7 @@ expect() { # expect <name> <rc> [substring]
     pass=$((pass + 1)); echo "ok   - $1"
   else fail=$((fail + 1)); echo "FAIL - $1 (rc=$rc)"; echo "$out" | sed 's/^/       /'; fi
 }
-kimi_state() { (cd "$T/w" && bash "$gate" status) | sed -n 's/^  kimi *//p'; }
+kimi_state() { (cd "$T/w" && bash "$gate" status) | sed -n 's/^  kimi *//p' | sed 's/ \[required\]$//'; }
 
 export FAKE_VERDICT='{"complete":true,"sha":"HEAD","high":0,"medium":0}'
 run
@@ -131,7 +131,7 @@ git -C "$T/w" reset -q --hard "$old"
 (cd "$T/w" && bash "$gate" record-skip coderabbit --reason "free hourly allowance used up" >/dev/null \
   && bash "$gate" record-skip codex --reason "skipped until 2026-10-24" >/dev/null)
 out="$(cd "$T/w" && bash "$gate" check 2>&1)"; rc=$?
-expect "gate: skips + kimi pass is enough, and is announced" 0 "the kimi review is the real pass"
+expect "gate: kimi pass + codex skip is enough, and the skip is announced" 0 "codex was SKIPPED"
 git -C "$T/w" commit -q --allow-empty -m later
 out="$(cd "$T/w" && bash "$gate" check 2>&1)"; rc=$?
 expect "gate: a kimi pass is bound to its commit" 1 "missing/stale"

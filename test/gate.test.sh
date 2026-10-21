@@ -16,7 +16,7 @@ mkrepo() { # mkrepo <dir> <owner/repo>
   git init -q -b main "$1" && git -C "$1" remote add origin "https://github.com/$2.git"
   git -C "$1" commit -q --allow-empty -m init
 }
-green() { (cd "$1" && bash "$gate" record coderabbit >/dev/null && bash "$gate" record codex >/dev/null); }
+green() { (cd "$1" && bash "$gate" record kimi >/dev/null && bash "$gate" record codex >/dev/null); }
 run() { # run <cwd> <command> → sets rc, out, err
   local payload; payload="$(jq -cn --arg c "$2" --arg d "$1" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
   out="$(printf '%s' "$payload" | bash "$hook" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
@@ -51,7 +51,7 @@ expect "--repo matching the checkout passes quietly" 0
 [ -z "$out" ] || { fail=$((fail + 1)); echo "FAIL - quiet pass printed: $out"; }
 
 mkrepo "$T/c" acme/gamma
-(cd "$T/c" && bash "$gate" record coderabbit >/dev/null)
+(cd "$T/c" && bash "$gate" record kimi >/dev/null)
 (cd "$T/c" && bash "$gate" record-skip codex --reason "" >/dev/null 2>&1); rc=$?
 expect "record-skip without a reason is refused" 2
 (cd "$T/c" && bash "$gate" record-skip codex --reason "quota exhausted until Oct 3" >/dev/null)
@@ -63,12 +63,19 @@ run "$T/a" "cd $T/c && gh pr create --fill"
 expect "a skip is bound to its commit (new commit → blocked)" 2 stderr "missing/stale"
 
 mkrepo "$T/d" acme/delta
-(cd "$T/d" && bash "$gate" record-skip codex --reason "codex is down today" >/dev/null && bash "$gate" record-skip coderabbit --reason "coderabbit is down today" >/dev/null)
+(cd "$T/d" && bash "$gate" record-skip codex --reason "codex is down today" >/dev/null && bash "$gate" record-skip kimi --reason "no ollama-review workflow here" >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "skipping every reviewer is not enough" 2 stderr "at least one real review"
 (cd "$T/d" && bash "$gate" record agy >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "both skipped plus an agy pass is enough, and is announced" 0 stdout "the agy review is the real pass"
+(cd "$T/d" && bash "$gate" clear agy >/dev/null && bash "$gate" record coderabbit >/dev/null)
+run "$T/a" "cd $T/d && gh pr create --fill"
+expect "both skipped plus a coderabbit pass is enough (coderabbit is a fallback now)" 0 stdout "the coderabbit review is the real pass"
+mkrepo "$T/d2" acme/delta2
+(cd "$T/d2" && bash "$gate" record coderabbit >/dev/null && bash "$gate" record codex >/dev/null)
+run "$T/a" "cd $T/d2 && gh pr create --fill"
+expect "the old coderabbit+codex pair no longer satisfies the default gate" 2 stderr "missing/stale review pass for"
 
 mkrepo "$T/e" acme/epsilon
 git -C "$T/e" worktree add -q -b feat/x "$T/e-wt" && green "$T/e-wt"
@@ -224,7 +231,7 @@ expect "a session in a subdirectory of the reviewed checkout gets no cross-repo 
 [ -z "$out" ] || { fail=$((fail + 1)); echo "FAIL - subdir session printed: $out"; }
 mkdir -p "$T/space dir" && mkrepo "$T/space dir/r" acme/space
 run "$T/a" "cd '$T/space dir/r' && gh pr create --fill"
-expect "remediation quotes paths with spaces" 2 stderr 'space\ dir/r && coderabbit review'
+expect "remediation quotes paths with spaces" 2 stderr 'space\ dir/r && git push -u origin HEAD && bash'
 
 run "$T/a" "B=feat/other; gh pr create --head \"\$B\" --fill"
 expect "a non-literal --head blocks (the PR's commit is unknown)" 2 stderr "--head is not a literal value"
