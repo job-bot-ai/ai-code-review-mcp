@@ -24,7 +24,7 @@ while [ $# -gt 0 ]; do
     --base) base="${2:?--base needs a branch}"; shift 2 ;;
     --no-record) record=0; shift ;;
     --timeout) timeout_min="${2:?--timeout needs minutes}"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "kimi-review: unknown argument '$1' (see --help)" >&2; exit 2 ;;
   esac
 done
