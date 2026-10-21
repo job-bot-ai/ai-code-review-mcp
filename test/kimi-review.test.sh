@@ -26,7 +26,7 @@ case "$1 $2" in
   "run list")
     sha="$(sed -n 's/^head_sha=//p' "$state/dispatch")"; rid="$(sed -n 's/^request_id=//p' "$state/dispatch")"
     printf '[{"databaseId":7,"displayTitle":"pre-PR review other x"},{"databaseId":42,"displayTitle":"pre-PR review %s %s"}]\n' "$sha" "$rid" ;;
-  "run view") echo "completed ${FAKE_CONCLUSION:-success}" ;;
+  "run view") [ -z "${FAKE_ON_VIEW:-}" ] || bash -c "$FAKE_ON_VIEW" >/dev/null 2>&1; echo "completed ${FAKE_CONCLUSION:-success}" ;;
   "run download")
     [ -z "${FAKE_NO_ARTIFACT:-}" ] || exit 1
     while [ $# -gt 0 ]; do [ "$1" = "-D" ] && dir="$2"; shift; done
@@ -106,6 +106,17 @@ FAKE_VERDICT='[1]' run
 expect "a non-object verdict fails" 1 "not a JSON object"
 run
 expect "and a clean review records it again" 0
+
+# HEAD moves mid-review and the new commit gets its own pass: rejecting the old commit
+# must not withdraw it.
+git -C "$T/w" checkout -q -b feat/race && git -C "$T/w" push -q origin feat/race
+FAKE_ON_VIEW="cd '$T/w' && git commit -q --allow-empty -m newer && bash '$gate' record kimi" \
+  FAKE_VERDICT='{"complete":true,"sha":"HEAD","high":1,"medium":0}' run
+expect "a rejection of an older commit fails" 1 "1 high"
+case "$(kimi_state)" in "green @ "*) ;; *) fail=$((fail + 1)); echo "FAIL - newer kimi pass was withdrawn: $(kimi_state)";; esac
+git -C "$T/w" checkout -q feat/x
+run
+expect "back on feat/x, a clean review records kimi" 0
 
 # The gate: both required reviewers skipped + kimi pass → allowed, and announced.
 (cd "$T/w" && bash "$gate" record-skip coderabbit --reason "free hourly allowance used up" >/dev/null \

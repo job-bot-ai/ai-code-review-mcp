@@ -85,9 +85,13 @@ while :; do
   sleep 20
 done
 
-# The latest completed review decides: a rejection also withdraws an earlier kimi pass.
+# The latest completed review of a commit decides: a rejection also withdraws an earlier
+# kimi pass for that same commit (never one recorded for a newer HEAD meanwhile).
 reject() {
-  [ "$record" -eq 1 ] && bash "$gate" clear kimi >/dev/null
+  local m; m="$(git rev-parse --absolute-git-dir)/review-gate/kimi"
+  if [ "$record" -eq 1 ] && [ -f "$m" ] && [ "$(cut -d' ' -f1 <"$m")" = "$head" ]; then
+    rm -f "$m"
+  fi
   die "$1" 1
 }
 
