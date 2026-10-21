@@ -94,10 +94,12 @@ fi
 
 complete="$(jq -r '.complete' "$tmp/verdict.json")"
 sha="$(jq -r '.sha' "$tmp/verdict.json")"
-high="$(jq -r '.high // 0' "$tmp/verdict.json")"
-medium="$(jq -r '.medium // 0' "$tmp/verdict.json")"
+# Counts must be present non-negative integers; anything else is not a clean verdict.
+count() { jq -r --arg k "$1" '.[$k] | if type == "number" and . >= 0 and . == floor then . else "invalid" end' "$tmp/verdict.json"; }
+high="$(count high)"; medium="$(count medium)"
 [ "$complete" = "true" ] || die "the review did not complete: $(jq -r '.reason // "unknown"' "$tmp/verdict.json") ($run_url)" 1
 [ "$sha" = "$head" ] || die "the run reviewed ${sha:0:12}, not HEAD ${head:0:12}" 1
+[ "$high" != "invalid" ] && [ "$medium" != "invalid" ] || die "verdict.json has no valid high/medium counts ($run_url)" 1
 if [ "$high" != "0" ]; then
   echo "kimi-review: $high high, $medium medium. Fix the high findings, commit, push, and run kimi-review again." >&2
   exit 1

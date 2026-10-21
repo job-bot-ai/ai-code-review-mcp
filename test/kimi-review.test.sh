@@ -76,6 +76,11 @@ expect "an incomplete review fails" 1 "did not complete: model down"
 FAKE_VERDICT='{"complete":true,"sha":"0000000000000000000000000000000000000000","high":0,"medium":0}' run
 expect "a verdict for another commit fails" 1 "not HEAD"
 
+FAKE_VERDICT='{"complete":true,"sha":"HEAD","medium":0}' run
+expect "a verdict without a high count fails closed" 1 "no valid high/medium counts"
+FAKE_VERDICT='{"complete":true,"sha":"HEAD","high":null,"medium":0}' run
+expect "a null high count fails closed" 1 "no valid high/medium counts"
+
 FAKE_NO_ARTIFACT=1 FAKE_CONCLUSION=failure run
 expect "no artifact (secret missing / model down) fails" 1 "no review came back"
 
