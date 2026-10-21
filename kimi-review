@@ -117,7 +117,7 @@ high="$(count high)"; medium="$(count medium)"
 
 [ "$(git rev-parse HEAD)" = "$head" ] || die "HEAD moved during the review; run kimi-review again" 1
 if [ "$record" -eq 1 ]; then
-  bash "$gate" record kimi
+  bash "$gate" record kimi --rev "$head"   # the reviewed commit, even if HEAD moves now
 else
   echo "kimi-review: pass for ${head:0:12} (not recorded: --no-record)"
 fi

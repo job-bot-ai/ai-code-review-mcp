@@ -198,7 +198,8 @@ How it works, and why it doesn't need a PR (the chicken-and-egg problem):
   prompt) with `head_sha=<HEAD>`. It waits for the run, then reads the run's `ollama-review`
   artifact (`verdict.json`, `review.md`). No key on this host, nothing posted to GitHub.
 - **Pass** = the review completed, it reviewed exactly HEAD, and it has **no high finding**.
-  Then `kimi-review` runs `review-gate record kimi`. Medium findings are printed: fix them,
+  Then `kimi-review` runs `review-gate record kimi --rev <reviewed sha>`, so the pass is
+  bound to the commit that was reviewed even if HEAD moves. Medium findings are printed: fix them,
   or say in the PR description why not. High findings, an incomplete run (secret missing,
   model down, unparsable answer) or a moved HEAD record nothing and exit 1; a completed
   review that rejects also withdraws any earlier kimi pass.

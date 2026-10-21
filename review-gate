@@ -41,9 +41,14 @@ case "${1:-help}" in
   record)
     r="${2:-}"
     is_valid "$r" || { echo "review-gate: unknown reviewer '$r' (valid: $VALID)" >&2; exit 2; }
+    rev="$head"
+    if [ "${3:-}" = "--rev" ]; then   # the exact commit that was reviewed (kimi-review)
+      rev="$(git rev-parse --verify -q "${4:-}^{commit}" 2>/dev/null)" || {
+        echo "review-gate: --rev '${4:-}' is not a commit" >&2; exit 2; }
+    fi
     mkdir -p "$dir"
-    printf '%s %s %s\n' "$head" "$branch" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$(marker "$r")"
-    echo "review-gate: recorded $r pass for $branch @ ${head:0:12}"
+    printf '%s %s %s\n' "$rev" "$branch" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$(marker "$r")"
+    echo "review-gate: recorded $r pass for $branch @ ${rev:0:12}"
     ;;
   record-skip)
     r="${2:-}"
@@ -118,7 +123,7 @@ case "${1:-help}" in
     ;;
   *)
     {
-      echo "usage: review-gate {record <reviewer>|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer]}"
+      echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer]}"
       echo "  reviewers: $VALID"
       echo "  required : ${REQUIRED[*]-}  (override with REVIEW_GATE_REQUIRED=\"coderabbit codex\")"
     } >&2

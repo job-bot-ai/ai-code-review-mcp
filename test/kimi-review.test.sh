@@ -118,6 +118,15 @@ git -C "$T/w" checkout -q feat/x
 run
 expect "back on feat/x, a clean review records kimi" 0
 
+# record --rev binds the pass to the given commit, not to whatever HEAD is.
+old="$(git -C "$T/w" rev-parse HEAD)"
+git -C "$T/w" commit -q --allow-empty -m tmp
+out="$(cd "$T/w" && bash "$gate" record kimi --rev "$old" 2>&1)"; rc=$?
+expect "record --rev records the given commit" 0 "@ ${old:0:12}"
+out="$(cd "$T/w" && bash "$gate" check --rev "$old" 2>&1 >/dev/null; bash "$gate" record kimi --rev nosuch 2>&1)"; rc=$?
+expect "record --rev rejects a non-commit" 2 "is not a commit"
+git -C "$T/w" reset -q --hard "$old"
+
 # The gate: both required reviewers skipped + kimi pass → allowed, and announced.
 (cd "$T/w" && bash "$gate" record-skip coderabbit --reason "free hourly allowance used up" >/dev/null \
   && bash "$gate" record-skip codex --reason "skipped until 2026-10-24" >/dev/null)
