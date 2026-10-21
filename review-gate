@@ -12,11 +12,12 @@
 # `record-skip <reviewer> --reason "..."`. The skip is stored separately
 # ($GIT_DIR/review-gate/<reviewer>.skip), is announced by every `check` that relies on it,
 # and never satisfies the gate on its own: at least one real pass is required.
-# `agy` (Google Antigravity) is an optional fallback reviewer: never required by default,
-# but its pass counts as that real pass, e.g. when CodeRabbit AND Codex are both skipped.
+# `kimi` (Kimi K2.7-code on Ollama Cloud, recorded by `kimi-review`) and `agy` (Google
+# Antigravity) are optional fallback reviewers: never required by default, but a pass from
+# either counts as that real pass, e.g. when CodeRabbit AND Codex are both skipped.
 set -euo pipefail
 
-VALID="coderabbit codex agy"
+VALID="coderabbit codex agy kimi"
 read -r -a REQUIRED <<<"${REVIEW_GATE_REQUIRED:-coderabbit codex}"
 # NB: "${arr[@]+"${arr[@]}"}" keeps empty arrays safe under `set -u` on bash < 4.4 (macOS).
 
@@ -81,13 +82,14 @@ case "${1:-help}" in
       exit 1
     fi
     if [ "$passes" -eq 0 ]; then
-      case " ${REQUIRED[*]} " in *" agy "*) ;; *)
-        if [ "$(recorded agy)" = "$rev" ]; then
-          echo "review-gate: required reviewers were skipped for ${rev:0:12}; the agy review is the real pass" >&2
+      for r in $VALID; do   # a fallback (non-required) reviewer's pass is the real pass
+        case " ${REQUIRED[*]} " in *" $r "*) continue;; esac
+        if [ "$(recorded "$r")" = "$rev" ]; then
+          echo "review-gate: required reviewers were skipped for ${rev:0:12}; the $r review is the real pass" >&2
           exit 0
-        fi ;;
-      esac
-      echo "every required reviewer was skipped for ${rev:0:12}; at least one real review pass is required (coderabbit, codex or agy)" >&2
+        fi
+      done
+      echo "every required reviewer was skipped for ${rev:0:12}; at least one real review pass is required (coderabbit, codex, kimi or agy)" >&2
       exit 1
     fi
     exit 0

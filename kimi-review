@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# kimi-review — pre-PR review by Kimi K2.7-code (Ollama Cloud), recorded as the `kimi` pass
+# in review-gate when it finds no high-severity issue.
+# Part of https://github.com/job-bot-ai/ai-code-review-mcp
+#
+# The review runs in GitHub Actions, not here: this dispatches the repo's own
+# `ollama-review.yml` workflow (job-bot-ai repos, added by the chore/ollama-pr-review PRs)
+# on the default branch for the pushed HEAD commit, waits for it, downloads its
+# `ollama-review` artifact and reads verdict.json. The Ollama key stays a repo secret;
+# nothing is posted anywhere. When the PR is later opened at the same commit, the workflow
+# posts this review on it instead of running the model again.
+#
+# Usage: kimi-review [--base <branch>] [--no-record] [--timeout <minutes>]
+#   --base       branch the PR will target (default: main)
+#   --no-record  report only; don't record the pass
+#   --timeout    give up waiting after this many minutes (default: 30)
+# Exit: 0 = pass recorded (or would be, with --no-record), 1 = findings or the review
+# didn't complete, 2 = usage/setup problem (not pushed, workflow missing, ...).
+set -euo pipefail
+
+base="main"; record=1; timeout_min=30
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) base="${2:?--base needs a branch}"; shift 2 ;;
+    --no-record) record=0; shift ;;
+    --timeout) timeout_min="${2:?--timeout needs minutes}"; shift 2 ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "kimi-review: unknown argument '$1' (see --help)" >&2; exit 2 ;;
+  esac
+done
+case "$timeout_min" in ''|*[!0-9]*) echo "kimi-review: --timeout must be whole minutes" >&2; exit 2;; esac
+
+die() { echo "kimi-review: $1" >&2; exit "${2:-2}"; }
+for bin in git gh jq; do command -v "$bin" >/dev/null 2>&1 || die "$bin is required"; done
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+gate="$here/review-gate"
+workflow="ollama-review.yml"
+
+git rev-parse --show-toplevel >/dev/null 2>&1 || die "not inside a git repo"
+head="$(git rev-parse HEAD)"
+branch="$(git rev-parse --abbrev-ref HEAD)"
+[ "$branch" != "HEAD" ] || die "detached HEAD: check out the branch the PR will come from"
+
+# GitHub reviews the commit it has, so HEAD must be pushed as this branch.
+remote_sha="$(git ls-remote origin "refs/heads/$branch" 2>/dev/null | cut -f1)"
+[ "$remote_sha" = "$head" ] || die "origin/$branch is at ${remote_sha:-<not pushed>} but HEAD is ${head:0:12}. Push first: git push -u origin $branch"
+
+url="$(git remote get-url origin)"
+repo="$(printf '%s' "$url" | sed -E 's#\.git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#')"
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "can't tell the GitHub repo from origin ($url)"
+
+default="$(gh repo view "$repo" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null)" \
+  || die "gh can't read $repo (gh auth status?)"
+gh workflow view "$workflow" -R "$repo" >/dev/null 2>&1 \
+  || die "$repo has no $workflow on $default yet; merge its chore/ollama-pr-review PR first"
+
+rid="kr-$(date +%s)-$$-$RANDOM"
+title="pre-PR review $head $rid"
+gh workflow run "$workflow" -R "$repo" --ref "$default" \
+  -f head_sha="$head" -f base="$base" -f request_id="$rid" >/dev/null \
+  || die "could not dispatch $workflow on $repo"
+
+run_id=""
+for _ in $(seq 1 40); do
+  run_id="$(gh run list -R "$repo" --workflow "$workflow" --event workflow_dispatch --limit 30 \
+      --json databaseId,displayTitle \
+    | jq -r --arg t "$title" '[.[] | select(.displayTitle == $t)][0].databaseId // empty')" || run_id=""
+  [ -n "$run_id" ] && break
+  sleep 3
+done
+[ -n "$run_id" ] || die "dispatched, but the run didn't show up within 2 minutes; see https://github.com/$repo/actions/workflows/$workflow"
+run_url="https://github.com/$repo/actions/runs/$run_id"
+echo "kimi-review: reviewing $branch @ ${head:0:12} against $base: $run_url (usually 5-10 min)"
+
+deadline=$(( $(date +%s) + timeout_min * 60 ))
+status=""; conclusion=""
+while :; do
+  read -r status conclusion < <(gh run view "$run_id" -R "$repo" --json status,conclusion \
+    -q '"\(.status) \(.conclusion // "-")"' 2>/dev/null || echo "unknown -")
+  [ "$status" = "completed" ] && break
+  [ "$(date +%s)" -lt "$deadline" ] || die "gave up after $timeout_min min; the run is still going: $run_url" 1
+  sleep 20
+done
+
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+gh run download "$run_id" -R "$repo" -n ollama-review -D "$tmp" >/dev/null 2>&1 || true
+[ -f "$tmp/review.md" ] && { echo; cat "$tmp/review.md"; echo; }
+if [ ! -f "$tmp/verdict.json" ]; then
+  die "no review came back (run $conclusion; secret missing or model down?): $run_url" 1
+fi
+
+complete="$(jq -r '.complete' "$tmp/verdict.json")"
+sha="$(jq -r '.sha' "$tmp/verdict.json")"
+high="$(jq -r '.high // 0' "$tmp/verdict.json")"
+medium="$(jq -r '.medium // 0' "$tmp/verdict.json")"
+[ "$complete" = "true" ] || die "the review did not complete: $(jq -r '.reason // "unknown"' "$tmp/verdict.json") ($run_url)" 1
+[ "$sha" = "$head" ] || die "the run reviewed ${sha:0:12}, not HEAD ${head:0:12}" 1
+if [ "$high" != "0" ]; then
+  echo "kimi-review: $high high, $medium medium. Fix the high findings, commit, push, and run kimi-review again." >&2
+  exit 1
+fi
+[ "$medium" = "0" ] || echo "kimi-review: $medium medium finding(s): fix them, or say in the PR description why not."
+
+[ "$(git rev-parse HEAD)" = "$head" ] || die "HEAD moved during the review; run kimi-review again" 1
+if [ "$record" -eq 1 ]; then
+  bash "$gate" record kimi
+else
+  echo "kimi-review: pass for ${head:0:12} (not recorded: --no-record)"
+fi

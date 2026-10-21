@@ -180,6 +180,44 @@ agy -p "Review this diff ... If nothing material, write exactly: NO MATERIAL FIN
 $(git diff main...HEAD)" --mode plan --effort high --print-timeout 900s
 ```
 
+**`kimi` (Kimi K2.7-code on Ollama Cloud) as a fallback reviewer.** Like agy, kimi
+is never required by default, and its pass is the real pass when CodeRabbit and Codex
+are both recorded as skips. Record it with `kimi-review`, not by hand:
+
+```bash
+git push -u origin "$(git branch --show-current)"     # GitHub reviews the pushed commit
+/opt/CodeRabbit-Claude-MCP/kimi-review --base main     # ~5-10 min; records kimi on a pass
+```
+
+How it works, and why it doesn't need a PR (the chicken-and-egg problem):
+
+- The review runs in GitHub Actions. Each job-bot-ai repo has an `ollama-review.yml`
+  workflow, added by its `chore/ollama-pr-review` PR, with the `OLLAMA_API_KEY` repo secret.
+  `kimi-review` dispatches that workflow on the default branch (trusted workflow and
+  prompt) with `head_sha=<HEAD>`. It waits for the run, then reads the run's `ollama-review`
+  artifact (`verdict.json`, `review.md`). No key on this host, nothing posted to GitHub.
+- **Pass** = the review completed, it reviewed exactly HEAD, and it has **no high finding**.
+  Then `kimi-review` runs `review-gate record kimi`. Medium findings are printed: fix them,
+  or say in the PR description why not. High findings, an incomplete run (secret missing,
+  model down, unparsable answer) or a moved HEAD record nothing and exit 1.
+- When the PR is then opened at that same commit, the workflow posts this pre-PR review on
+  the PR instead of running the model again. Pushes to an open PR are not re-reviewed
+  automatically (cost). Comment `/review` (or `/review deep`) on the PR to re-review the
+  new head.
+- Exit codes: 0 pass, 1 findings or no review, 2 setup (branch not pushed, workflow not on
+  the default branch yet, gh not authenticated).
+
+Typical session while CodeRabbit's free allowance is used up and Codex is out:
+
+```bash
+G=/opt/CodeRabbit-Claude-MCP
+coderabbit review --base main   # free allowance only, never --use-credits; if it's used up:
+$G/review-gate record-skip coderabbit --reason "free hourly allowance used up (resets HH:MM)"
+$G/review-gate record-skip codex --reason "Codex skipped until 2026-10-24"
+git push -u origin "$(git branch --show-current)" && $G/kimi-review --base main
+gh pr create ...                # allowed: the kimi pass is the real pass, and the skips are announced
+```
+
 Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
 clients). The hook requires `jq` (to extract the command from the payload) and
 hands any command containing the words `gh pr create` to the resolver above, which
@@ -190,13 +228,15 @@ commit messages, heredocs) through. Without `node`, it falls back to gating only
 rather than wedging your shell — so it is a strong speed-bump, not a hard security
 boundary.
 
-Tests: `npm test` (resolver unit tests + hook integration tests against throwaway repos).
+Tests: `npm test` (resolver unit tests, hook integration tests against throwaway repos, and
+`kimi-review` tests against a fake `gh`).
 
 ## Env overrides
 
 - `CODERABBIT_BIN` / `CODEX_BIN` — explicit binary paths (if not on `PATH`)
 - `CODERABBIT_TIMEOUT_SECONDS` (default 600) / `CODEX_TIMEOUT_SECONDS` (default 900)
-- `REVIEW_GATE_REQUIRED` — space-separated reviewers the gate requires (default `coderabbit codex`)
+- `REVIEW_GATE_REQUIRED` — space-separated reviewers the gate requires (default `coderabbit codex`;
+  valid: `coderabbit codex agy kimi`)
 
 ## Headless / remote auth (CodeRabbit)
 

@@ -119,7 +119,8 @@ if [ -n "$blocked" ]; then
     echo "$blocked"
     echo "If a reviewer genuinely can't run (quota/outage), record an explicit, announced skip in that checkout:"
     echo "    bash $(printf '%q' "$gate") record-skip <reviewer> --reason \"why\""
-    echo "If CodeRabbit AND Codex are both unavailable, an agy (Google Antigravity) review is the real pass:"
+    echo "If CodeRabbit AND Codex are both unavailable, a Kimi (Ollama Cloud) or agy review is the real pass:"
+    echo "    git push -u origin <branch> && bash $(printf '%q' "$here/../kimi-review")   (records kimi when Kimi finds no high-severity issue)"
     echo "    bash $(printf '%q' "$gate") record agy   (after agy reports no material findings)"
     echo "then re-run \`gh pr create\`. (Standing rule: CodeRabbit + Codex green before any PR.)"
   } >&2
