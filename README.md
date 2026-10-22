@@ -3,7 +3,7 @@
 A thin [MCP](https://modelcontextprotocol.io) stdio server that wraps local
 AI **code-review CLIs** so any MCP client (Claude Code, etc.) can run reviews as
 tool calls — no PR required — plus a **PR gate** that blocks `gh pr create` until
-both reviewers are green.
+both required reviewers (Kimi + Codex) are green.
 
 Reviewers wrapped (each shells out to its CLI; no review logic reimplemented):
 
@@ -76,13 +76,14 @@ Each reviewer exposes a `*_status` tool (CLI version + auth) and a `*_review` to
   `instructions` (custom review prompt), `path`, `extra_args`, `timeout_seconds`
   (default 900).
 
-## PR gate — CodeRabbit + Codex green before any PR
+## PR gate — Kimi + Codex green before any PR
 
 `review-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "review before you open
 a PR". Wired as a Claude Code `PreToolUse` hook, it blocks `gh pr create` unless
 **every required reviewer** has a pass recorded for the **commit the PR comes from** —
 a stale pass from before later commits does not count. Required reviewers default
-to `coderabbit codex` (override with `REVIEW_GATE_REQUIRED`).
+to `kimi codex` (override with `REVIEW_GATE_REQUIRED`). CodeRabbit and agy are optional
+fallbacks (below).
 
 **Which repo is checked.** The PR's repo, not the session's working directory
 (`hooks/resolve-pr-target.mjs` reads the command the way bash would). Every
@@ -148,9 +149,9 @@ When it gated on a different repo than the cwd, or relied on a skip, the hook sa
 Workflow:
 
 ```bash
-coderabbit review --base main  && ./review-gate record coderabbit   # iterate until green
-codex review --base main       && ./review-gate record codex        # iterate until green
-gh pr create ...                                                    # now allowed
+git push -u origin HEAD && ./kimi-review --base main   # records kimi on a pass; iterate until green
+codex review --base main && ./review-gate record codex # iterate until green
+gh pr create ...                                       # now allowed
 ```
 
 `./review-gate status` shows each reviewer's state vs HEAD; `clear [reviewer]`
@@ -168,16 +169,68 @@ A skip is bound to HEAD like a pass, is printed by every `check` that relies on 
 least one real pass is required. Prefer this over `REVIEW_GATE_REQUIRED`, which can only
 be set in the hook's environment and leaves no per-commit record.
 
-**`agy` (Google Antigravity) as the fallback reviewer.** When CodeRabbit *and* Codex
-are both unavailable, record both as skips and run an agy review. `./review-gate record agy`
-then provides the real pass. agy is never required by default
-(`REVIEW_GATE_REQUIRED=coderabbit codex`). In headless mode agy refuses shell and file
+**CodeRabbit and `agy` (Google Antigravity) as fallback reviewers.** When Kimi *and*
+Codex are both unavailable, record both as skips and run CodeRabbit (free hourly allowance
+only, never `--use-credits`: `coderabbit review --base main && ./review-gate record coderabbit`)
+or agy. Either pass is then the real pass; neither is required by default
+(`REVIEW_GATE_REQUIRED=kimi codex`). In general, a pass from any reviewer that isn't in
+`REVIEW_GATE_REQUIRED` counts as the real pass. In headless mode agy refuses shell and file
 tools and still exits 0, so embed the diff in the prompt and treat a
 "no output produced" reply as no review:
 
 ```bash
-agy -p "Review this diff ... If nothing material, write exactly: NO MATERIAL FINDINGS.
-$(git diff main...HEAD)" --mode plan --effort high --print-timeout 900s
+d="$(git diff main...HEAD)"; mkdir -p /tmp/agy-empty && cd /tmp/agy-empty   # nothing to explore
+agy -p "Do NOT use any tools; everything is in this message. Review this diff ...
+If nothing material, write exactly: NO MATERIAL FINDINGS.
+$d" --model gemini-3.8-flash-high --mode plan --print-timeout 900s
+```
+
+Pass `--model` explicitly: the default model's quota can be exhausted ("Individual quota
+reached", printed as `AGY_ERROR` with exit 0) while `gemini-3.8-flash-high` still works
+(`agy models` lists them). Without the "no tools" line agy often tries a command, is denied,
+and prints "no output produced". Neither case is a review.
+
+**`kimi` (Kimi K2.7-code on Ollama Cloud), a required reviewer.** Record it with
+`kimi-review`, not by hand:
+
+```bash
+git push -u origin "$(git branch --show-current)"     # GitHub reviews the pushed commit
+/opt/CodeRabbit-Claude-MCP/kimi-review --base main     # ~5-10 min; records kimi on a pass
+```
+
+How it works, and why it doesn't need a PR (the chicken-and-egg problem):
+
+- The review runs in GitHub Actions. Each job-bot-ai repo has an `ollama-review.yml`
+  workflow, added by its `chore/ollama-pr-review` PR, with the `OLLAMA_API_KEY` repo secret.
+  `kimi-review` dispatches that workflow on the default branch (trusted workflow and
+  prompt) with `head_sha=<HEAD>`. It waits for the run, then reads the run's `ollama-review`
+  artifact (`verdict.json`, `review.md`). No key on this host, nothing posted to GitHub.
+- **Pass** = the review completed, it reviewed exactly HEAD, and it has **no high finding**.
+  Then `kimi-review` runs `review-gate record kimi --rev <reviewed sha>`, so the pass is
+  bound to the commit that was reviewed even if HEAD moves. Medium findings are printed: fix them,
+  or say in the PR description why not. High findings, an incomplete run (secret missing,
+  model down, unparsable answer) or a moved HEAD record nothing and exit 1; a completed
+  review that rejects also withdraws any earlier kimi pass.
+- When the PR is then opened at that same commit, the workflow posts this pre-PR review on
+  the PR instead of running the model again. Pushes to an open PR are not re-reviewed
+  automatically (cost). Comment `/review` (or `/review deep`) on the PR to re-review the
+  new head.
+- Exit codes: 0 pass, 1 findings or no review, 2 setup (branch not pushed, workflow not on
+  the default branch yet, gh not authenticated).
+- A repo without `ollama-review.yml` on its default branch (exit 2, "merge its
+  chore/ollama-pr-review PR first") can't give a kimi pass: record
+  `review-gate record-skip kimi --reason "no ollama-review workflow in <repo>"`, and the
+  Codex pass (or a fallback) is the real one.
+
+Typical session:
+
+```bash
+G=/opt/CodeRabbit-Claude-MCP
+git push -u origin "$(git branch --show-current)" && $G/kimi-review --base main
+codex review --base main && $G/review-gate record codex
+# if Codex is usage-limited instead:
+#   $G/review-gate record-skip codex --reason "usage limit until <time>"
+gh pr create ...                # allowed; any skip is announced
 ```
 
 Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
@@ -190,13 +243,15 @@ commit messages, heredocs) through. Without `node`, it falls back to gating only
 rather than wedging your shell — so it is a strong speed-bump, not a hard security
 boundary.
 
-Tests: `npm test` (resolver unit tests + hook integration tests against throwaway repos).
+Tests: `npm test` (resolver unit tests, hook integration tests against throwaway repos, and
+`kimi-review` tests against a fake `gh`).
 
 ## Env overrides
 
 - `CODERABBIT_BIN` / `CODEX_BIN` — explicit binary paths (if not on `PATH`)
 - `CODERABBIT_TIMEOUT_SECONDS` (default 600) / `CODEX_TIMEOUT_SECONDS` (default 900)
-- `REVIEW_GATE_REQUIRED` — space-separated reviewers the gate requires (default `coderabbit codex`)
+- `REVIEW_GATE_REQUIRED` — space-separated reviewers the gate requires (default `kimi codex`;
+  valid: `coderabbit codex agy kimi`)
 
 ## Headless / remote auth (CodeRabbit)
 

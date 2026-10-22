@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PreToolUse(Bash) hook: block `gh pr create` unless all required reviewer passes
-# (CodeRabbit + Codex) are recorded via `review-gate` for the commit the PR comes from,
+# (Kimi + Codex by default) are recorded via `review-gate` for the commit the PR comes from,
 # in the repo the PR comes from (followed from `cd`/`--repo`/`--head` by
 # resolve-pr-target.mjs; the session cwd is only the fallback).
 # Wire into ~/.claude/settings.json (matcher: "Bash"). Filename kept for back-compat
@@ -100,13 +100,13 @@ while IFS= read -r t; do
 }review-gate: gated on $where (not the session's checkout)"
       [ -n "$out" ] && msgs="${msgs:+$msgs
 }$out" ;;
-    1)  q="$(printf '%q' "$dir")"; gq="$(printf '%q' "$gate")"
+    1)  q="$(printf '%q' "$dir")"; gq="$(printf '%q' "$gate")"; kq="$(printf '%q' "$here/../kimi-review")"
         revnote=""
         [ -n "$rev" ] && revnote="
     (commit ${rev:0:12} is not checked out there: check out that branch in a worktree and review it)"
         blocked="${blocked:+$blocked
 }  $where: ${out:-no green light recorded}
-    review there:  cd $q && coderabbit review --base main && bash $gq record coderabbit
+    review there:  cd $q && git push -u origin HEAD && bash $kq --base main   (records kimi)
                    cd $q && codex review --base main && bash $gq record codex$revnote" ;;
     *)  [ -n "$note" ] || msgs="${msgs:+$msgs
 }review-gate: $dir is not a git repo with commits; not gated" ;;   # fail-open by design
@@ -119,9 +119,11 @@ if [ -n "$blocked" ]; then
     echo "$blocked"
     echo "If a reviewer genuinely can't run (quota/outage), record an explicit, announced skip in that checkout:"
     echo "    bash $(printf '%q' "$gate") record-skip <reviewer> --reason \"why\""
-    echo "If CodeRabbit AND Codex are both unavailable, an agy (Google Antigravity) review is the real pass:"
+    echo "(kimi can't run in a repo without the ollama-review workflow on its default branch: skip it there.)"
+    echo "If Kimi AND Codex are both unavailable, a CodeRabbit (free allowance only, never --use-credits) or agy review is the real pass:"
+    echo "    coderabbit review --base main && bash $(printf '%q' "$gate") record coderabbit"
     echo "    bash $(printf '%q' "$gate") record agy   (after agy reports no material findings)"
-    echo "then re-run \`gh pr create\`. (Standing rule: CodeRabbit + Codex green before any PR.)"
+    echo "then re-run \`gh pr create\`. (Standing rule: Kimi + Codex green before any PR.)"
   } >&2
   exit 2
 fi
