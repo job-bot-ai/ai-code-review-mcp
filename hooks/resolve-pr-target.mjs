@@ -795,6 +795,12 @@ function worktreeFor(dir, branch) {
 function resolveOne(hit) {
   const sub = hit.sub ?? 'create';
   const what = `\`gh pr ${sub}\``;
+  const { repo: flagRepo, head, help, draft, undo, selector, opaque } = parseGhArgs(hit.args, sub);
+  if (help) return { help: true };
+  if (opaque) return { block: `${what} has a non-literal argument (${opaque}) that could change which PR or repo it acts on; pass it literally` };
+  // Never gated, wherever they run: a draft PR is how the reviewers get to see it.
+  if (sub === 'create' && draft) return { help: true };
+  if (sub === 'ready' && undo) return { help: true }; // back to draft
   if (hit.dir === null) {
     return { block: `can't tell which repo a ${what} runs in: a \`cd\` before it isn't a literal path, or only runs conditionally. Use \`cd /literal/path && gh pr ${sub} ...\`` };
   }
@@ -802,11 +808,6 @@ function resolveOne(hit) {
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
     return { block: `${what} would run in ${dir}, which doesn't exist` };
   }
-  const { repo: flagRepo, head, help, draft, undo, selector, opaque } = parseGhArgs(hit.args, sub);
-  if (help) return { help: true };
-  if (opaque) return { block: `${what} has a non-literal argument (${opaque}) that could change which PR or repo it acts on; pass it literally` };
-  if (sub === 'create' && draft) return { help: true }; // a draft PR is how the reviewers get to see it
-  if (sub === 'ready' && undo) return { help: true }; // back to draft
   const repo = flagRepo !== undefined ? flagRepo : hit.ghRepo;
   const notes = [];
   const top = git(dir, 'rev-parse', '--show-toplevel');

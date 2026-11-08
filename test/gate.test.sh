@@ -113,6 +113,10 @@ run "$T/r" "gh pr create -d --fill"
 expect "gh pr create -d is allowed with no reviews" 0
 run "$T/r" "gh pr create -dt title -b body"
 expect "a clustered -dt is a draft" 0
+run "$T/a" "cd \$REPO && gh pr create --draft --fill"
+expect "a draft is allowed even when the directory is unknown" 0
+run "$T/a" "cd \$REPO && gh pr ready"
+expect "gh pr ready after a dynamic cd is still blocked" 2 stderr "isn't a literal path"
 run "$T/r" "gh pr create --draft=false --fill"
 expect "--draft=false is not a draft (gated)" 2 stderr "missing/stale"
 run "$T/r" "gh pr create --fill"
