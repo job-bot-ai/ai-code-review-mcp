@@ -350,13 +350,15 @@ export function awkRuns(program) {
 }
 
 // Runner options that take a separate value (so the value isn't read as the executable).
+// Per runner: short options that take a value (attached `-uroot` or as the next word) and
+// long options that take one as the next word (`--opt=value` is a single word anyway).
 const RUNNER_VALUE_OPTS = {
-  timeout: /^(-[A-Za-z]*[sk]|--signal|--kill-after)$/,
-  env: /^(-[A-Za-z]*[uC]|--unset|--chdir)$/,
-  sudo: /^(-[A-Za-z]*[ughpCDrtUT]|--user|--group|--host|--prompt|--close-from|--chdir|--role|--type|--other-user|--command-timeout)$/,
-  nice: /^(-n|--adjustment)$/,
-  exec: /^-a$/,
-  nohup: null,
+  timeout: { short: 'sk', long: ['--signal', '--kill-after'] },
+  env: { short: 'uCS', long: ['--unset', '--chdir', '--split-string'] },
+  sudo: { short: 'ughpCDrtUT', long: ['--user', '--group', '--host', '--prompt', '--close-from', '--chdir', '--role', '--type', '--other-user', '--command-timeout'] },
+  nice: { short: 'n', long: ['--adjustment'] },
+  exec: { short: 'a', long: [] },
+  nohup: { short: '', long: [] },
 };
 
 /**
@@ -371,19 +373,36 @@ export function runnerExec(cmd) {
   const assigns = [];
   let chdir = false;
   let i = 1;
+  const { short, long } = RUNNER_VALUE_OPTS[c0];
+  const chdirOpt = c0 === 'env' ? 'C' : c0 === 'sudo' ? 'D' : null;
+  let endOfOpts = false;
   for (; i < cmd.length; i++) {
     const w = cmd[i];
     const v = w.value;
     if (w.dynamic) return null;
-    if (v === '--') { i += 1; break; }
-    if (c0 === 'env' && ASSIGN.test(v)) { assigns.push(w); continue; }
+    if (c0 === 'env' && ASSIGN.test(v)) { assigns.push(w); continue; } // also after `--`
+    if (endOfOpts) break;
+    if (v === '--') { endOfOpts = true; continue; }
     if (c0 === 'env' && v === '-') continue; // `env -` is `env -i`
     if (!v.startsWith('-')) break;
-    if (c0 === 'env' && /^(-[A-Za-z]*S|--split-string)/.test(v)) return null; // runs a string
-    if (c0 === 'env' && /^(-[A-Za-z]*C|--chdir)/.test(v)) chdir = true;
-    if (c0 === 'sudo' && /^(-[A-Za-z]*D|--chdir)/.test(v)) chdir = true;
     if (c0 === 'nice' && /^-\d+$/.test(v)) continue;
-    if (RUNNER_VALUE_OPTS[c0]?.test(v)) i += 1;
+    if (v.startsWith('--')) {
+      const name = v.split('=')[0];
+      if (c0 === 'env' && name === '--split-string') return null; // runs a string
+      if (name === '--chdir') chdir = true;
+      if (long.includes(name) && !v.includes('=')) i += 1;
+      continue;
+    }
+    // A short-option cluster: a value-taking letter takes the rest of the word (`-uroot`,
+    // `-iCdir`) or, at the end of the word, the next word (`-u root`, `-iC dir`).
+    for (let j = 1; j < v.length; j++) {
+      const ch = v[j];
+      if (!short.includes(ch)) continue;
+      if (c0 === 'env' && ch === 'S') return null; // runs a string
+      if (ch === chdirOpt) chdir = true;
+      if (j === v.length - 1) i += 1;
+      break;
+    }
   }
   if (c0 === 'timeout') { // DURATION comes before the command
     if (i >= cmd.length || cmd[i].dynamic) return null;
@@ -591,11 +610,34 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // `env -C`/`sudo -D` run it elsewhere, so its directory is unknown.
     let wrapped = false;
     let runnerChdir = false;
+    const unwrapped = cmd;
     for (let r = runnerExec(cmd); r && !cmd[0].dynamic; r = runnerExec(cmd)) {
       wrapped = true;
       if (r.chdir) runnerChdir = true;
       assigns.push(...r.assigns);
       cmd = cmd.slice(r.k);
+    }
+    // Safety net: a runner parse can only add checks, never lose one. If the parsed program
+    // isn't the `gh pr` / `git` command the old argument scan would have found, gate that one
+    // too, the old way (directory unknown if any word looks like a chdir option; the last
+    // GH_REPO= among the words before it).
+    if (wrapped) {
+      const kPr = unwrapped.findIndex((w, idx) => idx > 0 && isGhPrCreate(unwrapped.slice(idx)));
+      if (kPr > 0 && unwrapped.length - kPr !== cmd.length) {
+        const pre = unwrapped.slice(1, kPr);
+        const anyChdir = runnerChdir || pre.some((w) => /^(--chdir|-[A-Za-z]*[CD])/.test(w.value));
+        const repoW = pre.filter((w) => w.value.startsWith('GH_REPO=')).pop() ?? assigns.filter((w) => w.value.startsWith('GH_REPO=')).pop();
+        found.push({
+          dir: anyChdir || funcDepth > 0 ? null : s.dir,
+          sub: subOf(unwrapped[kPr + 2]),
+          args: unwrapped.slice(kPr + 3),
+          ghRepo: repoW ? (repoW.dynamic ? null : repoW.value.slice('GH_REPO='.length)) : s.ghRepo,
+          pushes: [...pushes],
+          headMoves: [...headMoves],
+        });
+      }
+      const kGit = unwrapped.findIndex((w, idx) => idx > 0 && !w.dynamic && path.basename(w.value) === 'git');
+      if (kGit > 0 && unwrapped.length - kGit !== cmd.length) recordPush(unwrapped.slice(kGit), null);
     }
     // The context the command really runs in, used by every branch below: its directory, and
     // GH_REPO from prefix/env assignments (the last one wins, as in env and the shell).

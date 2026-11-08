@@ -128,7 +128,7 @@ if [ -n "$blocked" ]; then
     echo "$blocked"
     echo "1. Open the PR as a draft (allowed without reviews):  gh pr create --draft ..."
     echo "2. The primary reviewers review it: Kodus + CodeRabbit (until 2026-11-19), Kodus + Greptile (from 2026-11-19)."
-    echo "   Kodus starts by itself; CodeRabbit skips drafts, so comment \`@coderabbitai review\` (Greptile: \`@greptileai\`)."
+    echo "   Kodus starts by itself; CodeRabbit skips drafts, so comment \`@coderabbitai review\` (Greptile: \`@greptileai review\`)."
     echo "   Fix high findings, fix medium ones or say why not, push, request a re-review, then record each clean pass:"
     echo "       $g record kodus|coderabbit|greptile"
     echo "   Still findings after two review rounds? Don't push a third fix-by-fix round: first do a deep analysis of the"

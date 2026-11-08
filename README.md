@@ -178,7 +178,7 @@ Workflow:
 
 ```bash
 gh pr create --draft ...                 # always allowed; Kodus reviews it automatically
-# CodeRabbit skips drafts by default: comment `@coderabbitai review` (Greptile: `@greptileai`)
+# CodeRabbit skips drafts by default: comment `@coderabbitai review` (Greptile: `@greptileai review`)
 # fix high findings, fix medium ones or say why not, push, request a re-review; then for each clean pass:
 ./review-gate record kodus               # and: record coderabbit (until 2026-11-19) / record greptile (from then)
 gh pr ready                              # now allowed

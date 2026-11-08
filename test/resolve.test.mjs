@@ -289,6 +289,11 @@ test('runnerExec finds the program a runner launches', () => {
   assert.deepEqual(at('nice -n 5 bash -c x'), { k: 3, chdir: false });
   assert.deepEqual(at('nice -10 make'), { k: 2, chdir: false });
   assert.deepEqual(at('nohup gh pr ready'), { k: 1, chdir: false });
+  assert.deepEqual(at('sudo -uroot gh pr ready'), { k: 2, chdir: false });
+  assert.deepEqual(at('sudo -u root -iD /x gh pr ready'), { k: 5, chdir: true });
+  assert.deepEqual(at('env -iC/x gh pr ready'), { k: 2, chdir: true });
+  assert.deepEqual(at('env -- GH_REPO=o/r gh pr create'), { k: 3, chdir: false });
+  assert.deepEqual(at('timeout --signal KILL 5 gh pr ready'), { k: 4, chdir: false });
   assert.equal(at('env -S "gh pr ready"'), null);
   assert.equal(at('timeout $T gh pr ready'), null);
   assert.equal(at('xargs gh pr ready'), null);
