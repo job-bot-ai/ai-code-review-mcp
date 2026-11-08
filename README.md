@@ -89,8 +89,13 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
   passes for the PR's commit. For `gh pr ready` that is the PR's head on GitHub (looked up
   with `gh pr view`; if the lookup fails and no PR was named, local HEAD is checked and the
   hook says so). A stale pass from before later commits does not count.
-- Marking a PR ready through the GraphQL API (`markPullRequestReadyForReview` with
-  `gh api`/`curl`) is blocked outright.
+- `gh pr ready https://github.com/OWNER/REPO/pull/N` is checked against the checkout's
+  remotes like `--repo`; a `git push` in the same command as `gh pr ready` blocks (the PR's
+  head would change after the lookup).
+- Sending the GraphQL ready mutation (`markPullRequestReadyForReview`) with an API client
+  (`gh api`, `curl`, `wget`, httpie) is blocked wherever the resolver sees it run (directly,
+  through runners, `bash -c`, `eval`, a heredoc or pipe fed to a shell, or piped into the
+  client). A mention that is only data (`echo`, a heredoc written to a file) passes.
 
 `check` passes when:
 

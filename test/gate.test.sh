@@ -74,6 +74,10 @@ expect "a primary with neither a pass nor a skip blocks, even with two passes" 2
   && bash "$gate" record coderabbit >/dev/null && bash "$gate" record self >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "self only counts after codex passed or was skipped" 2 stderr "self review only counts after codex"
+mkrepo "$T/d3" acme/delta3
+(cd "$T/d3" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null && bash "$gate" record self >/dev/null)
+run "$T/a" "cd $T/d3 && gh pr create --fill"
+expect "an extra, ineligible self pass doesn't invalidate two primary passes" 0
 (cd "$T/d" && bash "$gate" record-skip codex --reason "codex quota exhausted today" >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "coderabbit + self with kodus and codex skipped passes" 0 stdout "codex was SKIPPED"
@@ -142,6 +146,10 @@ run "$T/r" "gh pr ready --undo"
 expect "gh pr ready --undo (back to draft) is not gated" 0
 run "$T/r" "gh pr ready 12"
 expect "gh pr ready <number> whose head can't be looked up is blocked" 2 stderr "couldn't look up PR 12"
+run "$T/r" "gh pr ready https://github.com/someone/fork/pull/3"
+expect "gh pr ready <url> of another repo is blocked before any lookup" 2 stderr "the PR targets someone/fork"
+run "$T/r" "gh pr ready -R acme/ready https://github.com/someone/fork/pull/3"
+expect "a URL selector wins over --repo (still checked)" 2 stderr "the PR targets someone/fork"
 MUT="markPullRequest""ReadyForReview"
 run "$T/r" "gh api graphql -f query='mutation { $MUT(input:{pullRequestId:\"x\"}) { clientMutationId } }'"
 expect "marking ready through the GraphQL API is blocked" 2 stderr "not through the GraphQL API"
@@ -153,6 +161,20 @@ run "$T/r" "bash -c 'gh api graphql -f query=mutation{$MUT}'"
 expect "the mutation inside bash -c is blocked" 2 stderr "not through the GraphQL API"
 run "$T/r" "GH_HOST=github.com gh api graphql -f query='mutation{$MUT}'"
 expect "an env-prefixed API call with the mutation is blocked" 2 stderr "not through the GraphQL API"
+run "$T/r" "cat > example.sh <<'EOF'
+gh api graphql -f query='mutation{$MUT}'
+EOF"
+expect "a heredoc written to a file that contains the mutation is data, not blocked" 0
+run "$T/r" "bash <<'EOF'
+gh api graphql -f query='mutation{$MUT}'
+EOF"
+expect "the mutation in a heredoc fed to bash is blocked" 2 stderr "not through the GraphQL API"
+run "$T/r" "timeout 30 curl -s https://api.github.com/graphql -d '{\"query\":\"mutation{$MUT}\"}'"
+expect "curl through a runner with the mutation is blocked" 2 stderr "not through the GraphQL API"
+run "$T/r" "echo 'mutation{$MUT}' | gh api graphql --input -"
+expect "the mutation piped into gh api is blocked" 2 stderr "not through the GraphQL API"
+run "$T/r" "ssh host 'gh api graphql -f query=mutation{$MUT}'"
+expect "the mutation passed somewhere the gate can't follow is blocked" 2 stderr "can't follow"
 green "$T/r"
 run "$T/r" "gh pr ready"
 expect "gh pr ready after two passes is allowed (falls back to local HEAD when gh can't look it up)" 0 stdout "checked local HEAD"

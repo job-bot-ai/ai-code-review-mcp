@@ -28,24 +28,16 @@ else
 fi
 [ -n "$cmd" ] || exit 0
 
-# `gh pr ready` is the only way the gate lets a PR out of draft. Block the GraphQL mutation
-# when an API client runs in command position, or when the command hands code to a shell
-# (`bash -c`, `eval`, `| sh`), where the gate can't tell data from code. A mention in
-# `echo`/`printf`/a heredoc written to a file is data and passes.
-api_runs='(^|[;&|({]|&&|\|\|)[[:space:]]*(command[[:space:]]+|timeout[[:space:]]+[0-9]+[[:space:]]+|env[[:space:]]+|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(gh[[:space:]]+api|curl|wget|http|https)([[:space:]]|$)'
-shell_runs='(^|[^[:alnum:]_-])((ba|z|da)?sh[[:space:]]+(-[[:alnum:]]*c|-s)|eval)([[:space:]]|$)|\|[[:space:]]*(ba|z|da)?sh([[:space:]]|$)'
-if printf '%s' "$cmd" | grep -q 'markPullRequestReadyForReview' &&
-   printf '%s' "$cmd" | grep -Eq "$api_runs|$shell_runs"; then
-  echo "BLOCKED by the AI code-review PR gate: mark a PR ready with \`gh pr ready\` (gated on the recorded reviews), not through the GraphQL API." >&2
-  exit 2
-fi
+# `gh pr ready` is the only way the gate lets a PR out of draft: the resolver also blocks the
+# GraphQL ready mutation sent by an API client (gh api, curl, ...) wherever it runs, and lets
+# mentions that are only data (echo, a heredoc written to a file) through.
 
 # Any `gh pr create` words anywhere go to the resolver, which follows runners
 # (`timeout 60 gh pr create`), `GH_REPO=... gh pr create`, `bash -c`, `eval`, backticks
 # and pipes into shells, and lets mentions that are only data (commit messages, grep
 # patterns) through. Only the no-node fallback below keeps the command-position match.
 # (`\n`/`\t` escapes count as separators: `printf 'cd x\ngh pr create' | bash`.)
-printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new|ready)([^[:alnum:]_-]|$)' || exit 0
+printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new|ready)([^[:alnum:]_-]|$)|markPullRequestReadyForReview' || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"
@@ -92,6 +84,9 @@ if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
 else
   # Without the resolver: gate only `gh pr create` in command position (start of the
   # command or after ; | & ( { ), as before; env-prefixed and `bash -c` forms aren't seen.
+  if printf '%s' "$cmd" | grep -q 'markPullRequestReadyForReview'; then   # can't tell data from code here
+    block "the command mentions the GraphQL ready mutation and the target resolver (node) isn't available. Use \`gh pr ready\`."
+  fi
   printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+(create|new|ready)([[:space:];|&)}]|$)' || exit 0
   case "$cmd" in *--help*|*" -h"*|*--draft*|*--undo*) exit 0;; esac   # crude help/draft check without the resolver
   fallback_or_block "node unavailable"

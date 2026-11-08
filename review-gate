@@ -90,10 +90,11 @@ case "${1:-help}" in
       echo "review-gate: $r was SKIPPED for ${rev:0:12} — reason: $(skip_reason "$r")" >&2
     done
     # A self-review is the last resort: it only counts once Codex passed or was skipped.
-    counted=()
+    # An ineligible self pass is simply not counted; it is only reported when the gate fails.
+    counted=(); self_ignored=0
     for r in ${passes[@]+"${passes[@]}"}; do
       if [ "$r" = self ] && ! has codex ${passes[@]+"${passes[@]}"} ${skips[@]+"${skips[@]}"}; then
-        problems+=("a self review only counts after codex has a pass or a skip (record-skip codex --reason ...)")
+        self_ignored=1
         continue
       fi
       counted+=("$r")
@@ -104,6 +105,8 @@ case "${1:-help}" in
     done
     if [ "${#counted[@]}" -lt "$MIN" ]; then
       problems+=("${#counted[@]} of $MIN review passes (${counted[*]:-none})")
+      [ "$self_ignored" = 1 ] &&
+        problems+=("a self review only counts after codex has a pass or a skip (record-skip codex --reason ...)")
     fi
     if [ "${#problems[@]}" -gt 0 ]; then
       echo "missing/stale review pass for ${rev:0:12}: $(IFS=';'; printf '%s' "${problems[*]}" | sed 's/;/; /g')" >&2

@@ -314,7 +314,15 @@ const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep',
 // Script interpreters: a heredoc/stdin/file fed to them is nearly always a file edit, so a
 // mention there is treated as data; inline code (-c/-e) that mentions gh pr create is opaque.
 const INTERPRETERS = new Set(['python', 'python3', 'node', 'perl', 'ruby', 'php']);
-const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+(create|new|ready)\b/; // same boundary as the hook's pre-filter
+const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+(create|new|ready)\b|markPullRequestReadyForReview/; // same boundary as the hook's pre-filter
+// The GraphQL mutation that takes a PR out of draft: only `gh pr ready` may do that.
+const READY_MUTATION = /markPullRequestReadyForReview/;
+const API_CLIENTS = new Set(['curl', 'wget', 'http', 'https', 'xh']);
+/** Index of an API client (`gh api`, curl, wget, httpie) in a command's words, or -1. */
+function apiClientAt(words, from = 0) {
+  return words.findIndex((w, i) => i >= from && !w.dynamic &&
+    ((path.basename(w.value) === 'gh' && words[i + 1]?.value === 'api') || API_CLIENTS.has(path.basename(w.value))));
+}
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
@@ -391,6 +399,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes, headMoves });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
+    if (inner.readyMutation) found.readyMutation = true;
   };
   const opaque = (why) => { found.opaque ??= why; };
 
@@ -555,6 +564,15 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const c0 = cmd[0].value;
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
     if (c0 === 'git') { recordPush(cmd); return; }
+    // An API client run directly or through a runner (`timeout 30 gh api ...`, `env X=y curl`)
+    // that sends the ready mutation in its arguments, a heredoc, a here-string or a pipe.
+    const client = API_CLIENTS.has(path.basename(c0)) || (path.basename(c0) === 'gh' && cmd[1]?.value === 'api') ? 0
+      : RUNNERS.has(c0) ? apiClientAt(cmd, 1) : -1;
+    if (client >= 0) {
+      if (cmd.slice(client + 1).some((w) => READY_MUTATION.test(w.heredoc ? w.heredoc.body ?? '' : w.value)) ||
+        (fromPipe !== null && READY_MUTATION.test(fromPipe))) found.readyMutation = true;
+      return;
+    }
     if (c0 === 'eval') {
       // eval runs in this shell. Walk its script even when part of it is an expansion ($X
       // stays a dynamic word); a cd in it isn't modelled, so the directory becomes unknown.
@@ -813,7 +831,11 @@ function resolveOne(hit) {
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
     return { block: `${what} would run in ${dir}, which doesn't exist` };
   }
-  const repo = flagRepo !== undefined ? flagRepo : hit.ghRepo;
+  let repo = flagRepo !== undefined ? flagRepo : hit.ghRepo;
+  // `gh pr ready https://github.com/OWNER/REPO/pull/N` acts on the URL's repo, whatever
+  // --repo/GH_REPO say: check that repo against the checkout like --repo.
+  const urlRepo = sub === 'ready' && typeof selector === 'string' ? selector.match(/^https?:\/\/[^/]+\/([^/]+\/[^/]+)\/pull\/\d+/)?.[1] : undefined;
+  if (urlRepo) repo = urlRepo;
   const notes = [];
   const top = git(dir, 'rev-parse', '--show-toplevel');
   if (top === null) {
@@ -923,6 +945,12 @@ export function resolveTargets(command, cwd, env = process.env) {
     hits = findPrCreates(command, cwd, env);
   } catch (err) {
     return { status: 'error', reason: String(err?.message ?? err), risky: RISKY.test(command) };
+  }
+  if (hits.readyMutation) {
+    return { status: 'block', reason: 'mark a PR ready with `gh pr ready` (gated on the recorded reviews), not through the GraphQL API.' };
+  }
+  if (hits.opaque && READY_MUTATION.test(command)) {
+    return { status: 'block', reason: `the GraphQL ready mutation is passed to ${hits.opaque}, which the gate can't follow. Use \`gh pr ready\`.` };
   }
   if (!hits.length) {
     if (hits.opaque) {
