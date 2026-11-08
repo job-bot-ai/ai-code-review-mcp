@@ -28,9 +28,14 @@ else
 fi
 [ -n "$cmd" ] || exit 0
 
-# `gh pr ready` is the only way the gate lets a PR out of draft.
+# `gh pr ready` is the only way the gate lets a PR out of draft. Block the GraphQL mutation
+# when an API client runs in command position, or when the command hands code to a shell
+# (`bash -c`, `eval`, `| sh`), where the gate can't tell data from code. A mention in
+# `echo`/`printf`/a heredoc written to a file is data and passes.
+api_runs='(^|[;&|({]|&&|\|\|)[[:space:]]*(command[[:space:]]+|timeout[[:space:]]+[0-9]+[[:space:]]+|env[[:space:]]+|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*(gh[[:space:]]+api|curl|wget|http|https)([[:space:]]|$)'
+shell_runs='(^|[^[:alnum:]_-])((ba|z|da)?sh[[:space:]]+(-[[:alnum:]]*c|-s)|eval)([[:space:]]|$)|\|[[:space:]]*(ba|z|da)?sh([[:space:]]|$)'
 if printf '%s' "$cmd" | grep -q 'markPullRequestReadyForReview' &&
-   printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])(gh[[:space:]]+api|curl|wget|http)([[:space:]]|$)'; then
+   printf '%s' "$cmd" | grep -Eq "$api_runs|$shell_runs"; then
   echo "BLOCKED by the AI code-review PR gate: mark a PR ready with \`gh pr ready\` (gated on the recorded reviews), not through the GraphQL API." >&2
   exit 2
 fi

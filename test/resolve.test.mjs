@@ -221,7 +221,8 @@ test('git commands that move HEAD earlier in the command are recorded', () => {
   assert.deepEqual(hits('git commit -m x && gh pr create')[0].headMoves, [{ dir: '/session', sub: 'commit' }]);
   assert.deepEqual(hits('git pull --rebase; git -C /r merge main; gh pr create')[0].headMoves.map((m) => m.sub), ['pull', 'merge']);
   assert.deepEqual(hits('git checkout -b feat && git switch -c x && git checkout -- f && gh pr create')[0].headMoves, []);
-  assert.deepEqual(hits('git add . && git push && gh pr create')[0].headMoves, []);
+  // A push doesn't move HEAD; it is recorded push-only (it moves the PR head, which matters for gh pr ready).
+  assert.deepEqual(hits('git add . && git push && gh pr create')[0].headMoves, [{ dir: '/session', sub: 'push', pushOnly: true }]);
 });
 
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {

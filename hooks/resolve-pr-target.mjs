@@ -452,6 +452,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       return;
     }
     if (sub !== 'push') return;
+    headMoves.push({ dir: gdir, sub, pushOnly: true }); // moves the PR's head, not local HEAD
     const positional = [];
     const rest = cmd.slice(k + 1);
     let remoteGiven = false; // `--repo <remote>` means every positional is a refspec
@@ -734,7 +735,11 @@ export function parseGhArgs(args, sub = 'create') {
       for (let j = 1; j < v.length; j++) {
         const ch = v[j];
         if (ch === 'h') { out.help = true; continue; }
-        if (ch === 'd' && sub === 'create') { out.draft = true; continue; }
+        if (ch === 'd' && sub === 'create') {
+          if (v[j + 1] === '=') { out.draft = !BOOL_FALSE.test(v.slice(j + 2)); break; } // -d=false
+          out.draft = true;
+          continue;
+        }
         if (!valueShort.has(ch)) continue; // boolean shorthand like -f / -w
         let rest = v.slice(j + 1);
         if (rest.startsWith('=')) rest = rest.slice(1);
@@ -839,7 +844,11 @@ function resolveOne(hit) {
   // A commit made earlier in this same command (git commit/merge/rebase/pull...) is what
   // the PR will contain, but the hook runs before it exists, so it can't have been reviewed.
   const repoOf = (d) => (d ? git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel') : null);
-  const moved = (hit.headMoves ?? []).find((m) => m.dir === null || repoOf(m.dir) === repoOf(dir));
+  const moved = (hit.headMoves ?? []).find((m) => (!m.pushOnly || sub === 'ready') &&
+    (m.dir === null || repoOf(m.dir) === repoOf(dir)));
+  if (moved?.pushOnly) {
+    return { block: `\`git push\` runs before \`gh pr ready\` in the same command, so the PR's head would be a commit the gate can't look up yet. Push first, make sure the reviews cover the pushed commit, then run gh pr ready on its own.` };
+  }
   if (moved) {
     return { block: `\`git ${moved.sub}\` runs before ${what} in the same command, so the PR would contain a commit that doesn't exist yet and can't have been reviewed. Commit first, review it, then run gh pr ${sub}.` };
   }
