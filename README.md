@@ -2,8 +2,9 @@
 
 A thin [MCP](https://modelcontextprotocol.io) stdio server that wraps local
 AI **code-review CLIs** so any MCP client (Claude Code, etc.) can run reviews as
-tool calls — no PR required — plus a **PR gate** that blocks `gh pr create` until
-both required reviewers (Kimi + Codex) are green.
+tool calls — no PR required — plus a **PR gate**: open the PR as a draft, let the PR
+reviewers (Kodus + CodeRabbit, then Kodus + Greptile from 2026-11-19) review it, and
+`gh pr ready` is blocked until two reviews are green on the PR's final commit.
 
 Reviewers wrapped (each shells out to its CLI; no review logic reimplemented):
 
@@ -76,14 +77,33 @@ Each reviewer exposes a `*_status` tool (CLI version + auth) and a `*_review` to
   `instructions` (custom review prompt), `path`, `extra_args`, `timeout_seconds`
   (default 900).
 
-## PR gate — Kimi + Codex green before any PR
+## PR gate — draft first, two green reviews before ready
 
-`review-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "review before you open
-a PR". Wired as a Claude Code `PreToolUse` hook, it blocks `gh pr create` unless
-**every required reviewer** has a pass recorded for the **commit the PR comes from** —
-a stale pass from before later commits does not count. Required reviewers default
-to `kimi codex` (override with `REVIEW_GATE_REQUIRED`). CodeRabbit and agy are optional
-fallbacks (below).
+`review-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "two independent reviews
+before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
+
+- `gh pr create --draft` (or `-d`) is **always allowed**: Kodus, the CodeRabbit app and
+  Greptile only review a PR that exists, so the draft is how they get to see it.
+  `gh pr ready --undo` is not gated either.
+- `gh pr ready` and a **non-draft** `gh pr create` are blocked until `review-gate check`
+  passes for the PR's commit. For `gh pr ready` that is the PR's head on GitHub (looked up
+  with `gh pr view`; if the lookup fails and no PR was named, local HEAD is checked and the
+  hook says so). A stale pass from before later commits does not count.
+- Marking a PR ready through the GraphQL API (`markPullRequestReadyForReview` with
+  `gh api`/`curl`) is blocked outright.
+
+`check` passes when:
+
+1. at least **two different reviewers** have a pass recorded for the commit
+   (`REVIEW_GATE_MIN`, default 2);
+2. every **primary** reviewer has a pass **or** an announced skip. Primaries are
+   `kodus coderabbit` until 2026-11-19 and `kodus greptile` from then (UTC);
+   override with `REVIEW_GATE_PRIMARY` (`REVIEW_GATE_REQUIRED` is read as a legacy alias);
+3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback).
+
+Reviewers: `kodus`, `coderabbit`, `greptile` (primaries), `codex` (fallback), `self`
+(the agent's own thorough review, last resort). `agy` and `kimi` stay valid so old records
+and `kimi-review` keep working.
 
 **Which repo is checked.** The PR's repo, not the session's working directory
 (`hooks/resolve-pr-target.mjs` reads the command the way bash would). Every
@@ -119,7 +139,7 @@ fallbacks (below).
   - `gh pr create` inside a function, or with a non-literal argument such as `$ARGS`.
 - `-R/--repo [HOST/]OWNER/REPO` (or `GH_REPO`) must match one of that checkout's
   remotes; otherwise it blocks and asks you to run `gh pr create` from the target checkout.
-- `-H/--head [OWNER:]BRANCH` (including clusters like `-dH`; a non-literal `--head "$B"`
+- `-H/--head [OWNER:]BRANCH` (including clusters like `-fH`; a non-literal `--head "$B"`
   blocks, since the PR's commit is unknown), resolved in this order:
   - the owner, if given, must own one of the checkout's remotes;
   - a branch checked out in another worktree is checked there;
@@ -149,32 +169,38 @@ When it gated on a different repo than the cwd, or relied on a skip, the hook sa
 Workflow:
 
 ```bash
-git push -u origin HEAD && ./kimi-review --base main   # records kimi on a pass; iterate until green
-codex review --base main && ./review-gate record codex # iterate until green
-gh pr create ...                                       # now allowed
+gh pr create --draft ...                 # always allowed; Kodus + CodeRabbit/Greptile review it
+# fix high findings, fix medium ones or say why not, push, request a re-review; then for each clean pass:
+./review-gate record kodus               # and: record coderabbit (until 2026-11-19) / record greptile (from then)
+gh pr ready                              # now allowed
 ```
 
-`./review-gate status` shows each reviewer's state vs HEAD; `clear [reviewer]`
-removes a pass (and any skip).
+If findings remain after two review rounds, don't start a third fix-by-fix round: do a
+deep analysis of the whole change first (the root cause the findings share, the same bug
+class elsewhere in the diff, tests), fix that, and say in the PR body what kept coming
+up before asking for the third review.
 
-**A reviewer that can't run** (quota exhausted, outage, no seat) can be skipped for
-one commit, with a reason:
+`./review-gate status` shows each reviewer's state vs HEAD; `clear [reviewer]`
+removes a pass (and any skip). A pass for a commit other than HEAD:
+`./review-gate record <reviewer> --rev <commit>`.
+
+**A reviewer that can't run** (not installed on the repo, errored, quota exhausted, no
+review within 30 min) is skipped for one commit, with a reason, and replaced by Codex,
+then by your own review:
 
 ```bash
-./review-gate record-skip codex --reason "usage limit until 2026-10-03 13:32"
+./review-gate record-skip kodus --reason "no review within 30 min"
+codex review --base main && ./review-gate record codex
+# if Codex can't run either:
+./review-gate record-skip codex --reason "usage limit until 2026-11-09 13:32"
+./review-gate record self                # after a thorough review of your own
 ```
 
 A skip is bound to HEAD like a pass, is printed by every `check` that relies on it
-(the hook surfaces it as a `systemMessage`), and never satisfies the gate alone: at
-least one real pass is required. Prefer this over `REVIEW_GATE_REQUIRED`, which can only
-be set in the hook's environment and leaves no per-commit record.
+(the hook surfaces it as a `systemMessage`), and never counts as a pass.
+CodeRabbit may only use its free hourly allowance: never `--use-credits`.
 
-**CodeRabbit and `agy` (Google Antigravity) as fallback reviewers.** When Kimi *and*
-Codex are both unavailable, record both as skips and run CodeRabbit (free hourly allowance
-only, never `--use-credits`: `coderabbit review --base main && ./review-gate record coderabbit`)
-or agy. Either pass is then the real pass; neither is required by default
-(`REVIEW_GATE_REQUIRED=kimi codex`). In general, a pass from any reviewer that isn't in
-`REVIEW_GATE_REQUIRED` counts as the real pass. In headless mode agy refuses shell and file
+**`agy` (legacy).** Still a valid reviewer name. In headless mode agy refuses shell and file
 tools and still exits 0, so embed the diff in the prompt and treat a
 "no output produced" reply as no review:
 
@@ -190,15 +216,15 @@ reached", printed as `AGY_ERROR` with exit 0) while `gemini-3.8-flash-high` stil
 (`agy models` lists them). Without the "no tools" line agy often tries a command, is denied,
 and prints "no output produced". Neither case is a review.
 
-**`kimi` (Kimi K2.7-code on Ollama Cloud), a required reviewer.** Record it with
-`kimi-review`, not by hand:
+**`kimi` (legacy; Kodus now runs DeepSeek on every PR).** `kimi-review` still works and
+records a `kimi` pass, which counts as one review but not as a primary:
 
 ```bash
 git push -u origin "$(git branch --show-current)"     # GitHub reviews the pushed commit
 /opt/CodeRabbit-Claude-MCP/kimi-review --base main     # ~5-10 min; records kimi on a pass
 ```
 
-How it works, and why it doesn't need a PR (the chicken-and-egg problem):
+How it works:
 
 - The review runs in GitHub Actions. Each job-bot-ai repo has an `ollama-review.yml`
   workflow, added by its `chore/ollama-pr-review` PR, with the `OLLAMA_API_KEY` repo secret.
@@ -217,24 +243,9 @@ How it works, and why it doesn't need a PR (the chicken-and-egg problem):
   new head.
 - Exit codes: 0 pass, 1 findings or no review, 2 setup (branch not pushed, workflow not on
   the default branch yet, gh not authenticated).
-- A repo without `ollama-review.yml` on its default branch (exit 2, "merge its
-  chore/ollama-pr-review PR first") can't give a kimi pass: record
-  `review-gate record-skip kimi --reason "no ollama-review workflow in <repo>"`, and the
-  Codex pass (or a fallback) is the real one.
 
-Typical session:
-
-```bash
-G=/opt/CodeRabbit-Claude-MCP
-git push -u origin "$(git branch --show-current)" && $G/kimi-review --base main
-codex review --base main && $G/review-gate record codex
-# if Codex is usage-limited instead:
-#   $G/review-gate record-skip codex --reason "usage limit until <time>"
-gh pr create ...                # allowed; any skip is announced
-```
-
-Scope/safety: only `gh pr create` is gated (not `gh api` PR creation or other
-clients). The hook requires `jq` (to extract the command from the payload) and
+Scope/safety: only `gh pr create`, `gh pr ready` and the GraphQL ready mutation are
+gated (not other clients or the web UI). The hook requires `jq` (to extract the command from the payload) and
 hands any command containing the words `gh pr create` to the resolver above, which
 gates real invocations wherever they run and lets data-only mentions (echo, grep,
 commit messages, heredocs) through. Without `node`, it falls back to gating only
@@ -250,8 +261,9 @@ Tests: `npm test` (resolver unit tests, hook integration tests against throwaway
 
 - `CODERABBIT_BIN` / `CODEX_BIN` — explicit binary paths (if not on `PATH`)
 - `CODERABBIT_TIMEOUT_SECONDS` (default 600) / `CODEX_TIMEOUT_SECONDS` (default 900)
-- `REVIEW_GATE_REQUIRED` — space-separated reviewers the gate requires (default `kimi codex`;
-  valid: `coderabbit codex agy kimi`)
+- `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus coderabbit`
+  until 2026-11-19, `kodus greptile` from then; valid: `kodus coderabbit greptile codex self agy kimi`)
+- `REVIEW_GATE_MIN` — how many different reviewers must pass (default 2)
 
 ## Headless / remote auth (CodeRabbit)
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# PreToolUse(Bash) hook: block `gh pr create` unless all required reviewer passes
-# (Kimi + Codex by default) are recorded via `review-gate` for the commit the PR comes from,
-# in the repo the PR comes from (followed from `cd`/`--repo`/`--head` by
-# resolve-pr-target.mjs; the session cwd is only the fallback).
+# PreToolUse(Bash) hook: `gh pr create --draft` is always allowed (the PR reviewers —
+# Kodus, CodeRabbit/Greptile — only review a PR that exists). `gh pr ready` and a non-draft
+# `gh pr create` are blocked until `review-gate check` passes (two different reviewers'
+# passes, primaries passed or skipped) for the PR's commit, in the repo the PR comes from
+# (followed from `cd`/`--repo`/`--head` by resolve-pr-target.mjs; the session cwd is only
+# the fallback). Marking a PR ready through the GraphQL API is blocked outright.
 # Wire into ~/.claude/settings.json (matcher: "Bash"). Filename kept for back-compat
 # with existing settings.json entries.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
@@ -13,7 +15,7 @@
 input="$(cat)"
 
 # Fast path: if the payload can't possibly contain `gh ... pr ... create`, allow now.
-printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new)' || exit 0   # `gh pr new` is an alias
+printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview' || exit 0   # `gh pr new` is an alias
 
 # Pull the actual command string out of tool_input.command. jq is required to isolate the
 # command from surrounding JSON reliably; without it, warn (not silent) and fail open
@@ -26,12 +28,19 @@ else
 fi
 [ -n "$cmd" ] || exit 0
 
+# `gh pr ready` is the only way the gate lets a PR out of draft.
+if printf '%s' "$cmd" | grep -q 'markPullRequestReadyForReview' &&
+   printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])(gh[[:space:]]+api|curl|wget|http)([[:space:]]|$)'; then
+  echo "BLOCKED by the AI code-review PR gate: mark a PR ready with \`gh pr ready\` (gated on the recorded reviews), not through the GraphQL API." >&2
+  exit 2
+fi
+
 # Any `gh pr create` words anywhere go to the resolver, which follows runners
 # (`timeout 60 gh pr create`), `GH_REPO=... gh pr create`, `bash -c`, `eval`, backticks
 # and pipes into shells, and lets mentions that are only data (commit messages, grep
 # patterns) through. Only the no-node fallback below keeps the command-position match.
 # (`\n`/`\t` escapes count as separators: `printf 'cd x\ngh pr create' | bash`.)
-printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new)([^[:alnum:]_-]|$)' || exit 0
+printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new|ready)([^[:alnum:]_-]|$)' || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"
@@ -78,8 +87,8 @@ if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
 else
   # Without the resolver: gate only `gh pr create` in command position (start of the
   # command or after ; | & ( { ), as before; env-prefixed and `bash -c` forms aren't seen.
-  printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+(create|new)([[:space:];|&)}]|$)' || exit 0
-  case "$cmd" in *--help*|*" -h"*) exit 0;; esac   # crude help check without the resolver
+  printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+(create|new|ready)([[:space:];|&)}]|$)' || exit 0
+  case "$cmd" in *--help*|*" -h"*|*--draft*|*--undo*) exit 0;; esac   # crude help/draft check without the resolver
   fallback_or_block "node unavailable"
 fi
 [ -n "$targets" ] || targets="$(jq -cn --arg d "$session_cwd" '{dir: $d, rev: null, note: null}')"
@@ -100,14 +109,13 @@ while IFS= read -r t; do
 }review-gate: gated on $where (not the session's checkout)"
       [ -n "$out" ] && msgs="${msgs:+$msgs
 }$out" ;;
-    1)  q="$(printf '%q' "$dir")"; gq="$(printf '%q' "$gate")"; kq="$(printf '%q' "$here/../kimi-review")"
+    1)  q="$(printf '%q' "$dir")"
         revnote=""
         [ -n "$rev" ] && revnote="
-    (commit ${rev:0:12} is not checked out there: check out that branch in a worktree and review it)"
+    (reviews must be recorded for commit ${rev:0:12}: \`review-gate record <reviewer> --rev ${rev:0:12}\` in $q)"
         blocked="${blocked:+$blocked
 }  $where: ${out:-no green light recorded}
-    review there:  cd $q && git push -u origin HEAD && bash $kq --base main   (records kimi)
-                   cd $q && codex review --base main && bash $gq record codex$revnote" ;;
+    status there:  cd $q && bash $(printf '%q' "$gate") status$revnote" ;;
     *)  [ -n "$note" ] || msgs="${msgs:+$msgs
 }review-gate: $dir is not a git repo with commits; not gated" ;;   # fail-open by design
   esac
@@ -115,15 +123,22 @@ done <<<"$targets"
 
 if [ -n "$blocked" ]; then
   {
-    echo "BLOCKED by the AI code-review PR gate (run BOTH reviews, iterate until green, record each pass):"
+    g="bash $(printf '%q' "$gate")"
+    echo "BLOCKED by the AI code-review PR gate: two independent reviews must be green on the PR's final commit first."
     echo "$blocked"
-    echo "If a reviewer genuinely can't run (quota/outage), record an explicit, announced skip in that checkout:"
-    echo "    bash $(printf '%q' "$gate") record-skip <reviewer> --reason \"why\""
-    echo "(kimi can't run in a repo without the ollama-review workflow on its default branch: skip it there.)"
-    echo "If Kimi AND Codex are both unavailable, a CodeRabbit (free allowance only, never --use-credits) or agy review is the real pass:"
-    echo "    coderabbit review --base main && bash $(printf '%q' "$gate") record coderabbit"
-    echo "    bash $(printf '%q' "$gate") record agy   (after agy reports no material findings)"
-    echo "then re-run \`gh pr create\`. (Standing rule: Kimi + Codex green before any PR.)"
+    echo "1. Open the PR as a draft (allowed without reviews):  gh pr create --draft ..."
+    echo "2. The primary reviewers review it: Kodus + CodeRabbit (until 2026-11-19), Kodus + Greptile (from 2026-11-19)."
+    echo "   Fix high findings, fix medium ones or say why not, push, request a re-review, then record each clean pass:"
+    echo "       $g record kodus|coderabbit|greptile"
+    echo "   Still findings after two review rounds? Don't push a third fix-by-fix round: first do a deep analysis of the"
+    echo "   whole change (root cause shared by the findings, the same bug class elsewhere in the diff, tests), fix that,"
+    echo "   and say in the PR body what kept coming up and why before asking for the third review."
+    echo "3. A primary that can't review (not installed, errored, quota, no review within 30 min): record the skip and use Codex,"
+    echo "   and if Codex can't run either, do a thorough review yourself:"
+    echo "       $g record-skip <reviewer> --reason \"why\""
+    echo "       codex review --base main && $g record codex      |      $g record self"
+    echo "4. List every reviewer, skip and reason in the PR body, then \`gh pr ready\`."
+    echo "Never falsify or work around the gate. CodeRabbit: free hourly allowance only, never --use-credits."
   } >&2
   exit 2
 fi

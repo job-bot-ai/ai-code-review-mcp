@@ -127,13 +127,16 @@ out="$(cd "$T/w" && bash "$gate" check --rev "$old" 2>&1 >/dev/null; bash "$gate
 expect "record --rev rejects a non-commit" 2 "is not a commit"
 git -C "$T/w" reset -q --hard "$old"
 
-# The gate: both required reviewers skipped + kimi pass → allowed, and announced.
-(cd "$T/w" && bash "$gate" record-skip coderabbit --reason "free hourly allowance used up" >/dev/null \
-  && bash "$gate" record-skip codex --reason "skipped until 2026-10-24" >/dev/null)
-out="$(cd "$T/w" && bash "$gate" check 2>&1)"; rc=$?
-expect "gate: kimi pass + codex skip is enough, and the skip is announced" 0 "codex was SKIPPED"
+# The gate: a kimi pass (legacy) counts as one review; with kodus passed and coderabbit
+# skipped it makes the second one, and the skip is announced.
+(cd "$T/w" && bash "$gate" record-skip coderabbit --reason "free hourly allowance used up" >/dev/null)
+out="$(cd "$T/w" && REVIEW_GATE_PRIMARY="kodus coderabbit" bash "$gate" check 2>&1)"; rc=$?
+expect "gate: kimi alone is one review, not two" 1 "1 of 2 review passes"
+(cd "$T/w" && bash "$gate" record kodus >/dev/null)
+out="$(cd "$T/w" && REVIEW_GATE_PRIMARY="kodus coderabbit" bash "$gate" check 2>&1)"; rc=$?
+expect "gate: kodus + kimi with coderabbit skipped is enough, and the skip is announced" 0 "coderabbit was SKIPPED"
 git -C "$T/w" commit -q --allow-empty -m later
-out="$(cd "$T/w" && bash "$gate" check 2>&1)"; rc=$?
+out="$(cd "$T/w" && REVIEW_GATE_PRIMARY="kodus coderabbit" bash "$gate" check 2>&1)"; rc=$?
 expect "gate: a kimi pass is bound to its commit" 1 "missing/stale"
 
 echo "kimi-review: $pass passed, $fail failed"

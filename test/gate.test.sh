@@ -8,7 +8,8 @@ hook="$root/hooks/pre-pr-coderabbit-gate.sh"
 gate="$root/review-gate"
 T="$(cd "$(mktemp -d)" && pwd -P)"   # physical path: macOS /var is a symlink to /private/var
 trap 'rm -rf "$T"' EXIT
-unset REVIEW_GATE_REQUIRED
+unset REVIEW_GATE_REQUIRED REVIEW_GATE_MIN
+export REVIEW_GATE_PRIMARY="kodus coderabbit"   # the date-based default is tested separately
 export GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
 pass=0; fail=0
@@ -16,7 +17,7 @@ mkrepo() { # mkrepo <dir> <owner/repo>
   git init -q -b main "$1" && git -C "$1" remote add origin "https://github.com/$2.git"
   git -C "$1" commit -q --allow-empty -m init
 }
-green() { (cd "$1" && bash "$gate" record kimi >/dev/null && bash "$gate" record codex >/dev/null); }
+green() { (cd "$1" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null); }
 run() { # run <cwd> <command> → sets rc, out, err
   local payload; payload="$(jq -cn --arg c "$2" --arg d "$1" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
   out="$(printf '%s' "$payload" | bash "$hook" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
@@ -51,31 +52,112 @@ expect "--repo matching the checkout passes quietly" 0
 [ -z "$out" ] || { fail=$((fail + 1)); echo "FAIL - quiet pass printed: $out"; }
 
 mkrepo "$T/c" acme/gamma
-(cd "$T/c" && bash "$gate" record kimi >/dev/null)
-(cd "$T/c" && bash "$gate" record-skip codex --reason "" >/dev/null 2>&1); rc=$?
+(cd "$T/c" && bash "$gate" record kodus >/dev/null)
+(cd "$T/c" && bash "$gate" record-skip coderabbit --reason "" >/dev/null 2>&1); rc=$?
 expect "record-skip without a reason is refused" 2
-(cd "$T/c" && bash "$gate" record-skip codex --reason "quota exhausted until Oct 3" >/dev/null)
+(cd "$T/c" && bash "$gate" record-skip coderabbit --reason "not installed on this repo" >/dev/null)
 run "$T/a" "cd $T/c && gh pr create --fill"
-expect "a recorded skip passes but is announced" 0 stdout "codex was SKIPPED"
+expect "a skipped primary without a replacement pass is not enough" 2 stderr "1 of 2 review passes"
+(cd "$T/c" && bash "$gate" record codex >/dev/null)
+run "$T/a" "cd $T/c && gh pr create --fill"
+expect "a skipped primary replaced by codex passes, and the skip is announced" 0 stdout "coderabbit was SKIPPED"
 
 git -C "$T/c" commit -q --allow-empty -m more
 run "$T/a" "cd $T/c && gh pr create --fill"
-expect "a skip is bound to its commit (new commit → blocked)" 2 stderr "missing/stale"
+expect "passes and skips are bound to their commit (new commit → blocked)" 2 stderr "missing/stale"
 
 mkrepo "$T/d" acme/delta
-(cd "$T/d" && bash "$gate" record-skip codex --reason "codex is down today" >/dev/null && bash "$gate" record-skip kimi --reason "no ollama-review workflow here" >/dev/null)
+(cd "$T/d" && bash "$gate" record kodus >/dev/null && bash "$gate" record codex >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
-expect "skipping every reviewer is not enough" 2 stderr "at least one real review"
-(cd "$T/d" && bash "$gate" record agy >/dev/null)
+expect "a primary with neither a pass nor a skip blocks, even with two passes" 2 stderr "primary reviewer coderabbit has no pass or skip"
+(cd "$T/d" && bash "$gate" clear >/dev/null && bash "$gate" record-skip kodus --reason "kodus errored on this PR" >/dev/null \
+  && bash "$gate" record coderabbit >/dev/null && bash "$gate" record self >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
-expect "both skipped plus an agy pass is enough, and is announced" 0 stdout "the agy review is the real pass"
-(cd "$T/d" && bash "$gate" clear agy >/dev/null && bash "$gate" record coderabbit >/dev/null)
+expect "self only counts after codex passed or was skipped" 2 stderr "self review only counts after codex"
+(cd "$T/d" && bash "$gate" record-skip codex --reason "codex quota exhausted today" >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
-expect "both skipped plus a coderabbit pass is enough (coderabbit is a fallback now)" 0 stdout "the coderabbit review is the real pass"
+expect "coderabbit + self with kodus and codex skipped passes" 0 stdout "codex was SKIPPED"
+(cd "$T/d" && bash "$gate" clear >/dev/null && bash "$gate" record-skip kodus --reason "kodus errored on this PR" >/dev/null \
+  && bash "$gate" record-skip coderabbit --reason "no review within 30 minutes" >/dev/null && bash "$gate" record codex >/dev/null)
+run "$T/a" "cd $T/d && gh pr create --fill"
+expect "skips never count as passes (codex alone is one review)" 2 stderr "1 of 2 review passes"
+(cd "$T/d" && bash "$gate" record self >/dev/null)
+run "$T/a" "cd $T/d && gh pr create --fill"
+expect "both primaries skipped: codex + self is two reviews" 0
 mkrepo "$T/d2" acme/delta2
-(cd "$T/d2" && bash "$gate" record coderabbit >/dev/null && bash "$gate" record codex >/dev/null)
+(cd "$T/d2" && bash "$gate" record kimi >/dev/null && bash "$gate" record codex >/dev/null)
 run "$T/a" "cd $T/d2 && gh pr create --fill"
-expect "the old coderabbit+codex pair no longer satisfies the default gate" 2 stderr "missing/stale review pass for"
+expect "the old kimi+codex pair no longer satisfies the default gate" 2 stderr "primary reviewer kodus has no pass or skip"
+(cd "$T/d2" && bash "$gate" record greptile >/dev/null 2>&1 && REVIEW_GATE_PRIMARY="kodus greptile" bash "$gate" check >/dev/null 2>"$T/e2"); rc=$?; err="$(cat "$T/e2")"
+expect "greptile is a valid reviewer (kodus still has to pass or be skipped)" 1 stderr "primary reviewer kodus"
+(cd "$T/d2" && bash "$gate" record agy >/dev/null 2>&1); rc=$?
+expect "agy stays a valid reviewer for old records" 0
+(cd "$T/d2" && bash "$gate" record bogus >/dev/null 2>&1); rc=$?
+expect "an unknown reviewer is refused" 2
+
+# Date-based primaries: CodeRabbit until 2026-11-19, Greptile from then.
+mkdir -p "$T/fakebin"
+printf '#!/bin/sh\ncase "$*" in *+%%Y%%m%%d*) echo "${FAKE_DAY}";; *) exec /bin/date "$@";; esac\n' >"$T/fakebin/date"; chmod +x "$T/fakebin/date"
+(cd "$T/d2" && FAKE_DAY=20261118 PATH="$T/fakebin:$PATH" REVIEW_GATE_PRIMARY= bash "$gate" status) >"$T/st" 2>&1
+grep -q 'coderabbit .*\[primary\]' "$T/st" && ! grep -q 'greptile .*\[primary\]' "$T/st"; rc=$?
+expect "before 2026-11-19 the primaries are kodus + coderabbit" 0
+(cd "$T/d2" && FAKE_DAY=20261119 PATH="$T/fakebin:$PATH" REVIEW_GATE_PRIMARY= bash "$gate" status) >"$T/st" 2>&1
+grep -q 'greptile .*\[primary\]' "$T/st" && ! grep -q 'coderabbit .*\[primary\]' "$T/st"; rc=$?
+expect "from 2026-11-19 the primaries are kodus + greptile" 0
+
+# ── Draft PRs and gh pr ready ──
+mkrepo "$T/r" acme/ready
+run "$T/r" "gh pr create --draft --fill"
+expect "gh pr create --draft is allowed with no reviews" 0
+run "$T/r" "gh pr create -d --fill"
+expect "gh pr create -d is allowed with no reviews" 0
+run "$T/r" "gh pr create -dt title -b body"
+expect "a clustered -dt is a draft" 0
+run "$T/r" "gh pr create --draft=false --fill"
+expect "--draft=false is not a draft (gated)" 2 stderr "missing/stale"
+run "$T/r" "gh pr create --fill"
+expect "a non-draft gh pr create without reviews is blocked" 2 stderr "gh pr create --draft"
+run "$T/r" "bash -c 'gh pr create --fill'"
+expect "a non-draft gh pr create inside bash -c is still blocked" 2 stderr "missing/stale"
+run "$T/r" "GH_REPO=acme/ready gh pr create --fill"
+expect "an env-prefixed non-draft gh pr create is still blocked" 2 stderr "missing/stale"
+export REVIEW_GATE_GH="$T/nogh"; printf '#!/bin/sh\nexit 1\n' >"$T/nogh"; chmod +x "$T/nogh"
+run "$T/r" "gh pr ready"
+expect "gh pr ready before any reviews is blocked" 2 stderr "0 of 2 review passes"
+run "$T/r" "eval 'gh pr ready'"
+expect "gh pr ready through eval is blocked" 2 stderr "missing/stale"
+run "$T/r" "bash -c 'gh pr ready'"
+expect "gh pr ready through bash -c is blocked" 2 stderr "missing/stale"
+run "$T/r" "timeout 30 gh pr ready"
+expect "gh pr ready through a runner is blocked" 2 stderr "missing/stale"
+run "$T/r" "gh pr ready --undo"
+expect "gh pr ready --undo (back to draft) is not gated" 0
+run "$T/r" "gh pr ready 12"
+expect "gh pr ready <number> whose head can't be looked up is blocked" 2 stderr "couldn't look up PR 12"
+MUT="markPullRequest""ReadyForReview"
+run "$T/r" "gh api graphql -f query='mutation { $MUT(input:{pullRequestId:\"x\"}) { clientMutationId } }'"
+expect "marking ready through the GraphQL API is blocked" 2 stderr "not through the GraphQL API"
+run "$T/r" "grep -rn $MUT docs/"
+expect "only mentioning the mutation (no API call) is not blocked" 0
+green "$T/r"
+run "$T/r" "gh pr ready"
+expect "gh pr ready after two passes is allowed (falls back to local HEAD when gh can't look it up)" 0 stdout "checked local HEAD"
+# With a (fake) gh that reports the PR's head: the gate checks THAT commit.
+fakegh() { printf '#!/bin/sh\necho "{\\"headRefOid\\":\\"%s\\",\\"headRefName\\":\\"main\\"}"\n' "$1" >"$T/fakegh"; chmod +x "$T/fakegh"; }
+fakegh "$(git -C "$T/r" rev-parse HEAD)"
+export REVIEW_GATE_GH="$T/fakegh"
+run "$T/r" "gh pr ready 7"
+expect "gh pr ready <number> checks the PR's head commit (reviewed → allowed)" 0
+git -C "$T/r" commit -q --allow-empty -m "local follow-up"
+run "$T/r" "gh pr ready"
+expect "the PR's pushed head is what's checked, not a newer local HEAD" 0
+fakegh "$(git -C "$T/r" rev-parse HEAD)"
+run "$T/r" "gh pr ready"
+expect "a new commit on the PR makes the reviews stale (blocked)" 2 stderr "missing/stale"
+fakegh 0123456789abcdef0123456789abcdef01234567
+run "$T/r" "gh pr ready"
+expect "a PR head that isn't in the checkout is blocked" 2 stderr "isn't in"
+unset REVIEW_GATE_GH
 
 mkrepo "$T/e" acme/epsilon
 git -C "$T/e" worktree add -q -b feat/x "$T/e-wt" && green "$T/e-wt"
@@ -125,8 +207,8 @@ run "$T/a" "gh pr create --fill && cd $T/u && gh pr create --fill"
 expect "every gh pr create is gated, not just the first" 2 stderr "$T/u"
 git -C "$T/a" branch -q feat/unrev-branch "$(git -C "$T/u" rev-parse HEAD 2>/dev/null || echo HEAD)" 2>/dev/null || git -C "$T/a" branch -q feat/unrev-branch
 git -C "$T/a" commit -q --allow-empty -m newer && git -C "$T/a" branch -qf feat/unrev-branch HEAD && git -C "$T/a" reset -q --hard HEAD~1
-run "$T/a" "gh pr create -dH feat/unrev-branch --fill"
-expect "clustered -dH is parsed (unreviewed branch tip is blocked)" 2 stderr "missing/stale"
+run "$T/a" "gh pr create -fH feat/unrev-branch"
+expect "clustered -fH is parsed (unreviewed branch tip is blocked)" 2 stderr "missing/stale"
 run "$T/a" "cd $T/plain && gh pr create -R acme/unrev -H main --title t --body b"
 expect "--repo/--head from a non-git directory is blocked" 2 stderr "isn't a git checkout"
 run "$T/u" "gh pr create --fill --body 'use -h for help'"
@@ -144,8 +226,8 @@ run "$T/a" "cd $T/u | gh pr create --fill"
 expect "a cd in a pipeline does not move gh (gated on the session repo)" 0
 run "$T/u" "cd $T/a || cd $T/u && gh pr create --fill"
 expect "a cd after || makes the directory unknown (blocked)" 2 stderr "isn't a literal path, or only runs conditionally"
-(cd "$T/a" && REVIEW_GATE_REQUIRED=" " bash "$gate" check >/dev/null 2>"$T/e2"); rc=$?; err="$(cat "$T/e2")"
-expect "an empty REVIEW_GATE_REQUIRED says so" 1 stderr "names no reviewers"
+(cd "$T/a" && REVIEW_GATE_PRIMARY="kodus nobody" bash "$gate" check >/dev/null 2>"$T/e2"); rc=$?; err="$(cat "$T/e2")"
+expect "an unknown reviewer in REVIEW_GATE_PRIMARY says so" 1 stderr "unknown primary reviewer 'nobody'"
 
 # ── Round 2 ──
 run "$T/u" "git commit -q --allow-empty -m \"\$(cat <<'EOF'
@@ -231,7 +313,7 @@ expect "a session in a subdirectory of the reviewed checkout gets no cross-repo 
 [ -z "$out" ] || { fail=$((fail + 1)); echo "FAIL - subdir session printed: $out"; }
 mkdir -p "$T/space dir" && mkrepo "$T/space dir/r" acme/space
 run "$T/a" "cd '$T/space dir/r' && gh pr create --fill"
-expect "remediation quotes paths with spaces" 2 stderr 'space\ dir/r && git push -u origin HEAD && bash'
+expect "remediation quotes paths with spaces" 2 stderr 'space\ dir/r && bash'
 
 run "$T/a" "B=feat/other; gh pr create --head \"\$B\" --fill"
 expect "a non-literal --head blocks (the PR's commit is unknown)" 2 stderr "--head is not a literal value"
