@@ -349,6 +349,50 @@ export function awkRuns(program) {
   return /system\s*\(|(^|[^|])\|(?!\|)/.test(code); // piped getline has a lone | too; bare getline reads input
 }
 
+// Runner options that take a separate value (so the value isn't read as the executable).
+const RUNNER_VALUE_OPTS = {
+  timeout: /^(-[A-Za-z]*[sk]|--signal|--kill-after)$/,
+  env: /^(-[A-Za-z]*[uC]|--unset|--chdir)$/,
+  sudo: /^(-[A-Za-z]*[ughpCDrtUT]|--user|--group|--host|--prompt|--close-from|--chdir|--role|--type|--other-user|--command-timeout)$/,
+  nice: /^(-n|--adjustment)$/,
+  exec: /^-a$/,
+  nohup: null,
+};
+
+/**
+ * Where does a runner (`timeout 60`, `env -C d X=y`, `sudo -u u`, `nice -n 5`, `nohup`,
+ * `exec`) put the program it launches? Returns { k, chdir, assigns } with k the index of the
+ * executable, or null when that can't be told (a dynamic word, `env -S`, xargs): callers then
+ * fall back to scanning every argument.
+ */
+export function runnerExec(cmd) {
+  const c0 = cmd[0]?.value;
+  if (!(c0 in RUNNER_VALUE_OPTS)) return null;
+  const assigns = [];
+  let chdir = false;
+  let i = 1;
+  for (; i < cmd.length; i++) {
+    const w = cmd[i];
+    const v = w.value;
+    if (w.dynamic) return null;
+    if (v === '--') { i += 1; break; }
+    if (c0 === 'env' && ASSIGN.test(v)) { assigns.push(w); continue; }
+    if (c0 === 'env' && v === '-') continue; // `env -` is `env -i`
+    if (!v.startsWith('-')) break;
+    if (c0 === 'env' && /^(-[A-Za-z]*S|--split-string)/.test(v)) return null; // runs a string
+    if (c0 === 'env' && /^(-[A-Za-z]*C|--chdir)/.test(v)) chdir = true;
+    if (c0 === 'sudo' && /^(-[A-Za-z]*D|--chdir)/.test(v)) chdir = true;
+    if (c0 === 'nice' && /^-\d+$/.test(v)) continue;
+    if (RUNNER_VALUE_OPTS[c0]?.test(v)) i += 1;
+  }
+  if (c0 === 'timeout') { // DURATION comes before the command
+    if (i >= cmd.length || cmd[i].dynamic) return null;
+    i += 1;
+  }
+  if (i >= cmd.length) return null;
+  return { k: i, chdir, assigns };
+}
+
 function isGhPrCreate(words) {
   // `gh pr new` is gh's built-in alias of `gh pr create`; `gh pr ready` marks a draft ready.
   // ...and gh may be invoked by path (/usr/bin/gh, ./bin/gh).
@@ -434,12 +478,11 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     s.dir = s.dirStack.length ? s.dirStack.pop() : null;
   };
 
-  const recordPush = (cmd) => {
+  const recordPush = (cmd, base = scope().dir) => {
     // `git [-C dir] push [opts] <remote> <src>:<dst> ...` — lets `--head <dst>` be checked at
     // <src> even though the push (and its remote-tracking ref) hasn't happened yet.
-    const s = scope();
     let k = 1;
-    let gdir = s.dir;
+    let gdir = base;
     while (k < cmd.length && cmd[k].value.startsWith('-')) {
       const v = cmd[k].value;
       if (v === '-C') {
@@ -543,11 +586,24 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     // `command gh pr create` / `builtin cd x` run the same thing as without the prefix.
     if ((cmd[0].value === 'command' || cmd[0].value === 'builtin') && !cmd[0].dynamic && cmd[1]) cmd = cmd.slice(1);
+    // Runners launch another program: unwrap them (`timeout 60 git push`, `env -C d X=y gh pr
+    // ready`, `sudo -u u bash -c ...`) so the program they run is classified like any other.
+    // `env -C`/`sudo -D` run it elsewhere, so its directory is unknown.
+    let wrapped = false;
+    let runnerChdir = false;
+    for (let r = runnerExec(cmd); r && !cmd[0].dynamic; r = runnerExec(cmd)) {
+      wrapped = true;
+      if (r.chdir) runnerChdir = true;
+      assigns.push(...r.assigns);
+      cmd = cmd.slice(r.k);
+    }
+    const here = runnerChdir || funcDepth > 0 ? null : s.dir; // a function body runs later, from wherever it's called
+    if (wrapped && ['cd', 'pushd', 'popd'].includes(cmd[0].value)) return; // not a builtin there: can't move us
     if (assigns.some((w) => w.value.startsWith('CDPATH=')) && ['cd', 'pushd'].includes(cmd[0].value)) { s.dir = null; return; }
     if (isGhPrCreate(cmd)) {
       const prefixed = assigns.find((w) => w.value.startsWith('GH_REPO='));
       found.push({
-        dir: funcDepth > 0 ? null : s.dir, // a function body runs later, from wherever it's called
+        dir: here,
         sub: subOf(cmd[2]),
         args: cmd.slice(3),
         ghRepo: prefixed ? (prefixed.dynamic ? null : prefixed.value.slice('GH_REPO='.length)) : s.ghRepo,
@@ -563,11 +619,11 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     if (cmd[0].dynamic) { if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`); return; }
     const c0 = cmd[0].value;
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
-    if (c0 === 'git') { recordPush(cmd); return; }
-    // An API client run directly or through a runner (`timeout 30 gh api ...`, `env X=y curl`)
-    // that sends the ready mutation in its arguments, a heredoc, a here-string or a pipe.
-    // Through a runner, a `gh pr create|ready` among its words wins (the RUNNERS branch below
-    // gates it), so a word like `--title curl` can never turn a PR command into "an API call".
+    if (c0 === 'git') { recordPush(cmd, here); return; }
+    // An API client (runners already unwrapped above) that sends the ready mutation in its
+    // arguments, a heredoc, a here-string or a pipe. Only for a runner whose arguments can't be
+    // parsed is every argument scanned for a client, and then a `gh pr create|ready` among its
+    // words wins (the RUNNERS branch below gates it).
     const runnerRunsPr = RUNNERS.has(c0) && cmd.some((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
     const client = API_CLIENTS.has(path.basename(c0)) || (path.basename(c0) === 'gh' && cmd[1]?.value === 'api') ? 0
       : RUNNERS.has(c0) && !runnerRunsPr ? apiClientAt(cmd, 1) : -1;
@@ -601,7 +657,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       // A child shell can't move us, but a gh pr create in its script still runs: walk a
       // -c script (even a partly dynamic one) or code on stdin (heredoc, here-string, pipe).
       const ci = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*c$/.test(w.value));
-      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, s.dir); return; }
+      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, here); return; }
       let file = null;
       const rest = cmd.slice(1);
       for (let j = 0; j < rest.length; j++) {
@@ -615,7 +671,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         break;
       }
       if (file) { if (mentioned() || substMention()) opaque(`${c0} ${file.value}`); return; } // a script we can't read
-      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, s.dir);
+      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, here);
       return;
     }
     if (INTERPRETERS.has(c0)) {

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { homedir } from 'node:os';
-import { awkRuns, findPrCreates, parseGhArgs, repoSlug, tokenize } from '../hooks/resolve-pr-target.mjs';
+import { awkRuns, findPrCreates, parseGhArgs, repoSlug, runnerExec, tokenize } from '../hooks/resolve-pr-target.mjs';
 
 const ENV = {}; // no inherited GH_REPO / CDPATH
 const hits = (cmd, cwd = '/session', env = ENV) => findPrCreates(cmd, cwd, env);
@@ -276,4 +276,20 @@ test('tokenizer: operators split commands, quotes and escapes join words, errors
   assert.deepEqual(tokenize('a#b # comment').map((x) => x.value), ['a#b']);
   assert.throws(() => tokenize("echo 'unterminated"));
   assert.throws(() => tokenize('echo "$(unterminated'));
+});
+
+test('runnerExec finds the program a runner launches', () => {
+  const at = (cmd) => { const r = runnerExec(tokenize(cmd).filter((t) => t.type === 'word')); return r && { k: r.k, chdir: r.chdir }; };
+  assert.deepEqual(at('timeout 60 gh pr ready'), { k: 2, chdir: false });
+  assert.deepEqual(at('timeout -s KILL -k 5 60 git push'), { k: 6, chdir: false });
+  assert.deepEqual(at('env X=1 GH_REPO=o/r gh pr create'), { k: 3, chdir: false });
+  assert.deepEqual(at('env -C /x gh pr ready'), { k: 3, chdir: true });
+  assert.deepEqual(at('env -i -u FOO echo curl'), { k: 4, chdir: false });
+  assert.deepEqual(at('sudo -u bob -E git push'), { k: 4, chdir: false });
+  assert.deepEqual(at('nice -n 5 bash -c x'), { k: 3, chdir: false });
+  assert.deepEqual(at('nice -10 make'), { k: 2, chdir: false });
+  assert.deepEqual(at('nohup gh pr ready'), { k: 1, chdir: false });
+  assert.equal(at('env -S "gh pr ready"'), null);
+  assert.equal(at('timeout $T gh pr ready'), null);
+  assert.equal(at('xargs gh pr ready'), null);
 });

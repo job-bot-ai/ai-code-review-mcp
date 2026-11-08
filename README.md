@@ -123,7 +123,10 @@ and `kimi-review` keep working.
   - `bash`/`sh -c` and `eval` scripts, even when part of the script is a variable;
   - code fed to a shell or `source` on stdin: a heredoc, a here-string, or a pipe
     (`cat <<'EOF' | bash`, `echo "..." | bash`);
-  - `timeout`/`env`/`sudo`-style runners (`env -C`/`GH_REPO=` operands included).
+  - `timeout`/`env`/`sudo`/`nice`/`nohup`/`exec` runners are unwrapped to the program they
+    launch, so a wrapped `git push`/`git commit`, `bash -c`, API client or `gh pr` command is
+    handled like an unwrapped one (`env -C`/`sudo -D` make the directory unknown; `env -S` and
+    `xargs` fall back to scanning every argument).
 - A mention fed to a command that never runs its input (`cat`, `tee`, `echo`, `git`,
   `gh`, `grep`, `jq`, …) is data, e.g. a commit message or a script being written,
   and isn't gated. Text fed to `python`/`node`/`perl`/`ruby` on a heredoc or stdin is
