@@ -858,6 +858,7 @@ export function parseGhArgs(args, sub = 'create') {
         const ch = v[j];
         if (ch === 'h') { out.help = true; continue; }
         if (ch === 'd' && sub === 'create') {
+          if (w.dynamic) { out.opaque ??= v; break; } // -fd=$DRAFT: can't tell if it's a draft
           if (v[j + 1] === '=') { out.draft = !BOOL_FALSE.test(v.slice(j + 2)); break; } // -d=false
           out.draft = true;
           continue;
