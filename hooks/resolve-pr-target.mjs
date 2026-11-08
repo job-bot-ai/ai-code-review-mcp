@@ -566,8 +566,11 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     if (c0 === 'git') { recordPush(cmd); return; }
     // An API client run directly or through a runner (`timeout 30 gh api ...`, `env X=y curl`)
     // that sends the ready mutation in its arguments, a heredoc, a here-string or a pipe.
+    // Through a runner, a `gh pr create|ready` among its words wins (the RUNNERS branch below
+    // gates it), so a word like `--title curl` can never turn a PR command into "an API call".
+    const runnerRunsPr = RUNNERS.has(c0) && cmd.some((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
     const client = API_CLIENTS.has(path.basename(c0)) || (path.basename(c0) === 'gh' && cmd[1]?.value === 'api') ? 0
-      : RUNNERS.has(c0) ? apiClientAt(cmd, 1) : -1;
+      : RUNNERS.has(c0) && !runnerRunsPr ? apiClientAt(cmd, 1) : -1;
     if (client >= 0) {
       if (cmd.slice(client + 1).some((w) => READY_MUTATION.test(w.heredoc ? w.heredoc.body ?? '' : w.value)) ||
         (fromPipe !== null && READY_MUTATION.test(fromPipe))) found.readyMutation = true;
