@@ -438,9 +438,9 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
 
   // Code that runs in a subshell ($(...), `...`, <(...), bash -c, eval): gate any
   // gh pr create inside it, starting from the current directory.
-  const nested = (script, dir) => {
+  const nested = (script, dir, ghRepo = scope().ghRepo) => {
     const s = scope();
-    const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes, headMoves });
+    const inner = findPrCreates(script, dir, env, { ghRepo, cdpath: s.cdpath, pushes, headMoves });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
     if (inner.readyMutation) found.readyMutation = true;
@@ -597,16 +597,19 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       assigns.push(...r.assigns);
       cmd = cmd.slice(r.k);
     }
+    // The context the command really runs in, used by every branch below: its directory, and
+    // GH_REPO from prefix/env assignments (the last one wins, as in env and the shell).
     const here = runnerChdir || funcDepth > 0 ? null : s.dir; // a function body runs later, from wherever it's called
+    const repoAssign = assigns.filter((w) => w.value.startsWith('GH_REPO=')).pop();
+    const ghRepoHere = repoAssign ? (repoAssign.dynamic ? null : repoAssign.value.slice('GH_REPO='.length)) : s.ghRepo;
     if (wrapped && ['cd', 'pushd', 'popd'].includes(cmd[0].value)) return; // not a builtin there: can't move us
     if (assigns.some((w) => w.value.startsWith('CDPATH=')) && ['cd', 'pushd'].includes(cmd[0].value)) { s.dir = null; return; }
     if (isGhPrCreate(cmd)) {
-      const prefixed = assigns.find((w) => w.value.startsWith('GH_REPO='));
       found.push({
         dir: here,
         sub: subOf(cmd[2]),
         args: cmd.slice(3),
-        ghRepo: prefixed ? (prefixed.dynamic ? null : prefixed.value.slice('GH_REPO='.length)) : s.ghRepo,
+        ghRepo: ghRepoHere,
         pushes: [...pushes],
         headMoves: [...headMoves],
       });
@@ -637,7 +640,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       // stays a dynamic word); a cd in it isn't modelled, so the directory becomes unknown.
       const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring);
       const script = args.map((w) => w.value).join(' ');
-      nested(script, s.dir);
+      nested(script, here, ghRepoHere);
       if (!pipelined && (args.some((w) => w.dynamic) || DIR_WORD.test(script))) s.dir = null;
       return;
     }
@@ -648,7 +651,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       const isRedirect = (w) => /^\d*[<>]/.test(w.value) && !/^[<>]\(/.test(w.value); // not <(...)
       const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !isRedirect(w));
       const code = [...stdinCode, ...(fromPipe !== null && (!args.length || ['/dev/stdin', '-'].includes(args[0].value)) ? [fromPipe] : [])];
-      for (const body of code) nested(body, s.dir);
+      for (const body of code) nested(body, here, ghRepoHere);
       if (substMention()) opaque(`${c0} <(...)`);
       if (!pipelined && (args.some((w) => w.dynamic) || code.some((b) => DIR_WORD.test(b)))) s.dir = null;
       return;
@@ -657,7 +660,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       // A child shell can't move us, but a gh pr create in its script still runs: walk a
       // -c script (even a partly dynamic one) or code on stdin (heredoc, here-string, pipe).
       const ci = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*c$/.test(w.value));
-      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, here); return; }
+      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, here, ghRepoHere); return; }
       let file = null;
       const rest = cmd.slice(1);
       for (let j = 0; j < rest.length; j++) {
@@ -671,7 +674,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         break;
       }
       if (file) { if (mentioned() || substMention()) opaque(`${c0} ${file.value}`); return; } // a script we can't read
-      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, here);
+      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, here, ghRepoHere);
       return;
     }
     if (INTERPRETERS.has(c0)) {
@@ -687,10 +690,10 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         const chdir = c0 === 'env' && pre.some((w) => /^(--chdir|-[A-Za-z]*C)/.test(w.value));
         const repoArg = c0 === 'env' ? pre.filter((w) => w.value.startsWith('GH_REPO=')).pop() : undefined;
         found.push({
-          dir: chdir || funcDepth > 0 ? null : s.dir,
+          dir: chdir ? null : here,
           sub: subOf(cmd[k + 2]),
           args: cmd.slice(k + 3),
-          ghRepo: repoArg ? (repoArg.dynamic ? null : repoArg.value.slice('GH_REPO='.length)) : s.ghRepo,
+          ghRepo: repoArg ? (repoArg.dynamic ? null : repoArg.value.slice('GH_REPO='.length)) : ghRepoHere,
           pushes: [...pushes],
         headMoves: [...headMoves],
         });
@@ -723,7 +726,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // gh pr create` (gated against the local checkout, conservatively).
     const k = cmd.findIndex((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
     if (k > 0) {
-      found.push({ dir: funcDepth > 0 ? null : s.dir, sub: subOf(cmd[k + 2]), args: cmd.slice(k + 3), ghRepo: s.ghRepo, pushes: [...pushes], headMoves: [...headMoves] });
+      found.push({ dir: here, sub: subOf(cmd[k + 2]), args: cmd.slice(k + 3), ghRepo: ghRepoHere, pushes: [...pushes], headMoves: [...headMoves] });
       return;
     }
     // Otherwise, anything that receives `gh pr create` (in one argument, split across
