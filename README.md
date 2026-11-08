@@ -169,7 +169,8 @@ When it gated on a different repo than the cwd, or relied on a skip, the hook sa
 Workflow:
 
 ```bash
-gh pr create --draft ...                 # always allowed; Kodus + CodeRabbit/Greptile review it
+gh pr create --draft ...                 # always allowed; Kodus reviews it automatically
+# CodeRabbit skips drafts by default: comment `@coderabbitai review` (Greptile: `@greptileai`)
 # fix high findings, fix medium ones or say why not, push, request a re-review; then for each clean pass:
 ./review-gate record kodus               # and: record coderabbit (until 2026-11-19) / record greptile (from then)
 gh pr ready                              # now allowed
