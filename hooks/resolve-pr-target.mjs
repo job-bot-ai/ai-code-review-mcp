@@ -368,7 +368,7 @@ const RUNNER_VALUE_OPTS = {
  * fall back to scanning every argument.
  */
 export function runnerExec(cmd) {
-  const c0 = cmd[0]?.value;
+  const c0 = progName(cmd[0]);
   if (!(c0 in RUNNER_VALUE_OPTS)) return null;
   const assigns = [];
   let chdir = false;
@@ -410,6 +410,16 @@ export function runnerExec(cmd) {
   }
   if (i >= cmd.length) return null;
   return { k: i, chdir, assigns };
+}
+
+// Shell builtins keep their exact name (`/usr/bin/cd` doesn't move the shell); any other
+// program is classified by its basename, so `/usr/bin/git`, `/bin/bash -c`,
+// `/usr/bin/timeout` are handled like `git`, `bash -c`, `timeout`.
+const BUILTINS = new Set(['cd', 'pushd', 'popd', 'eval', 'source', '.', 'export', 'declare', 'local', 'command', 'builtin', 'exec']);
+export function progName(word) {
+  const v = word?.value ?? '';
+  const base = path.basename(v);
+  return v.includes('/') && BUILTINS.has(base) ? v : base;
 }
 
 function isGhPrCreate(words) {
@@ -636,7 +646,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
           headMoves: [...headMoves],
         });
       }
-      const kGit = unwrapped.findIndex((w, idx) => idx > 0 && !w.dynamic && path.basename(w.value) === 'git');
+      const kGit = unwrapped.findIndex((w, idx) => idx > 0 && !w.dynamic && progName(w) === 'git');
       if (kGit > 0 && unwrapped.length - kGit !== cmd.length) recordPush(unwrapped.slice(kGit), null);
     }
     // The context the command really runs in, used by every branch below: its directory, and
@@ -662,7 +672,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const stdinCode = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
     const mentioned = () => cmd.some((w) => MENTION.test(w.heredoc ? w.heredoc.body ?? '' : w.value));
     if (cmd[0].dynamic) { if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`); return; }
-    const c0 = cmd[0].value;
+    const c0 = progName(cmd[0]);
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
     if (c0 === 'git') { recordPush(cmd, here); return; }
     // An API client (runners already unwrapped above) that sends the ready mutation in its
