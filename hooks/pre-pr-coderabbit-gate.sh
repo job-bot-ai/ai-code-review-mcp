@@ -111,7 +111,7 @@ while IFS= read -r t; do
 }$out" ;;
     1)  q="$(printf '%q' "$dir")"
         revnote=""
-        [ -n "$rev" ] && revnote="
+        [ -n "$rev" ] && [ "$rev" != "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" ] && revnote="
     (reviews must be recorded for commit ${rev:0:12}: \`review-gate record <reviewer> --rev ${rev:0:12}\` in $q)"
         blocked="${blocked:+$blocked
 }  $where: ${out:-no green light recorded}
