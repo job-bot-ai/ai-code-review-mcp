@@ -127,10 +127,11 @@ if [ -n "$blocked" ]; then
     echo "BLOCKED by the AI code-review PR gate: two independent reviews must be green on the PR's final commit first."
     echo "$blocked"
     echo "1. Open the PR as a draft (allowed without reviews):  gh pr create --draft ..."
-    echo "2. The primary reviewers review it: Kodus + CodeRabbit (until 2026-11-19), Kodus + Greptile (from 2026-11-19)."
+    echo "2. The primary reviewers review it: Kodus + CodeRabbit through 2026-11-18, Kodus + Greptile from 2026-11-19 (UTC)."
     echo "   Kodus starts by itself; CodeRabbit skips drafts, so comment \`@coderabbitai review\` (Greptile: \`@greptileai review\`)."
     echo "   Fix high findings, fix medium ones or say why not, push, request a re-review, then record each clean pass:"
-    echo "       $g record kodus|coderabbit|greptile"
+    echo "       $g record kodus"
+    echo "       $g record coderabbit      (through 2026-11-18; from 2026-11-19: $g record greptile)"
     echo "   Still findings after two review rounds? Don't push a third fix-by-fix round: first do a deep analysis of the"
     echo "   whole change (root cause shared by the findings, the same bug class elsewhere in the diff, tests), fix that,"
     echo "   and say in the PR body what kept coming up and why before asking for the third review."
@@ -140,7 +141,7 @@ if [ -n "$blocked" ]; then
     echo "     if Codex is out too ($g record-skip codex --reason ...): the other primary + your own review ($g record self)"
     echo "   - both primaries out: Codex + your own thorough review ($g record codex, then $g record self)"
     echo "   - both primaries and Codex out: the gate can't pass. Leave the PR as a draft, list the skips, ask Tim."
-    echo "4. List every reviewer, skip and reason in the PR body, then \`gh pr ready\`."
+    echo "4. Once \`$g check\` passes, list every reviewer, skip and reason in the PR body, then \`gh pr ready\`."
     echo "Never falsify or work around the gate. CodeRabbit: free hourly allowance only, never --use-credits."
   } >&2
   exit 2
