@@ -89,7 +89,20 @@ expect "skips never count as passes (codex alone is one review)" 2 stderr "1 of 
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "both primaries skipped: codex + self is two reviews" 0
 mkrepo "$T/d2" acme/delta2
-(cd "$T/d2" && bash "$gate" record kimi >/dev/null && bash "$gate" record codex >/dev/null)
+(cd "$T/d2" && bash "$gate" record kimi >/dev/null 2>&1); rc=$?
+expect "kimi is no longer a valid reviewer" 2
+# A kimi marker left over from the retired kimi-review tool: status/check must not crash, and it never counts.
+h2="$(git -C "$T/d2" rev-parse HEAD)"; mkdir -p "$T/d2/.git/review-gate"
+printf '%s main 2026-11-01T00:00:00Z\n' "$h2" >"$T/d2/.git/review-gate/kimi"
+printf '%s main 2026-11-01T00:00:00Z legacy kimi skip\n' "$h2" >"$T/d2/.git/review-gate/kimi.skip"
+(cd "$T/d2" && bash "$gate" status >"$T/st2" 2>&1); rc=$?; out="$(cat "$T/st2")"
+expect "status works with a leftover kimi marker and doesn't list kimi" 0
+case "$out" in *kimi*) fail=$((fail + 1)); echo "FAIL - status lists kimi: $out";; esac
+(cd "$T/d2" && bash "$gate" record kodus >/dev/null)
+(cd "$T/d2" && bash "$gate" check >/dev/null 2>"$T/e2"); rc=$?; err="$(cat "$T/e2")"
+expect "kodus + a leftover kimi pass is one review, not two" 1 stderr "1 of 2 review passes (kodus)"
+case "$err" in *kimi*) fail=$((fail + 1)); echo "FAIL - check mentions kimi: $err";; esac
+(cd "$T/d2" && bash "$gate" clear kodus >/dev/null && bash "$gate" record codex >/dev/null)
 run "$T/a" "cd $T/d2 && gh pr create --fill"
 expect "the old kimi+codex pair no longer satisfies the default gate" 2 stderr "primary reviewer kodus has no pass or skip"
 (cd "$T/d2" && bash "$gate" record greptile >/dev/null 2>&1 && REVIEW_GATE_PRIMARY="kodus greptile" bash "$gate" check >/dev/null 2>"$T/e2"); rc=$?; err="$(cat "$T/e2")"

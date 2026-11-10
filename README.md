@@ -107,8 +107,9 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
 3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback).
 
 Reviewers: `kodus`, `coderabbit`, `greptile` (primaries), `codex` (fallback), `self`
-(the agent's own thorough review, last resort). `agy` and `kimi` stay valid so old records
-and `kimi-review` keep working.
+(the agent's own thorough review, last resort). `agy` stays valid for old records. `kimi`
+(the retired `kimi-review` pass) is no longer a reviewer: a leftover kimi marker is ignored
+and never counts.
 
 **Which repo is checked.** The PR's repo, not the session's working directory
 (`hooks/resolve-pr-target.mjs` reads the command the way bash would). Every
@@ -225,33 +226,8 @@ reached", printed as `AGY_ERROR` with exit 0) while `gemini-3.8-flash-high` stil
 (`agy models` lists them). Without the "no tools" line agy often tries a command, is denied,
 and prints "no output produced". Neither case is a review.
 
-**`kimi` (legacy; Kodus now runs DeepSeek on every PR).** `kimi-review` still works and
-records a `kimi` pass, which counts as one review but not as a primary:
-
-```bash
-git push -u origin "$(git branch --show-current)"     # GitHub reviews the pushed commit
-/opt/CodeRabbit-Claude-MCP/kimi-review --base main     # ~5-10 min; records kimi on a pass
-```
-
-How it works:
-
-- The review runs in GitHub Actions. Each job-bot-ai repo has an `ollama-review.yml`
-  workflow, added by its `chore/ollama-pr-review` PR, with the `OLLAMA_API_KEY` repo secret.
-  `kimi-review` dispatches that workflow on the default branch (trusted workflow and
-  prompt) with `head_sha=<HEAD>`. It waits for the run, then reads the run's `ollama-review`
-  artifact (`verdict.json`, `review.md`). No key on this host, nothing posted to GitHub.
-- **Pass** = the review completed, it reviewed exactly HEAD, and it has **no high finding**.
-  Then `kimi-review` runs `review-gate record kimi --rev <reviewed sha>`, so the pass is
-  bound to the commit that was reviewed even if HEAD moves. Medium findings are printed: fix them,
-  or say in the PR description why not. High findings, an incomplete run (secret missing,
-  model down, unparsable answer) or a moved HEAD record nothing and exit 1; a completed
-  review that rejects also withdraws any earlier kimi pass.
-- When the PR is then opened at that same commit, the workflow posts this pre-PR review on
-  the PR instead of running the model again. Pushes to an open PR are not re-reviewed
-  automatically (cost). Comment `/review` (or `/review deep`) on the PR to re-review the
-  new head.
-- Exit codes: 0 pass, 1 findings or no review, 2 setup (branch not pushed, workflow not on
-  the default branch yet, gh not authenticated).
+**`kimi` (retired).** The `kimi-review` helper and its `kimi` pass were removed with the
+in-repo `ollama-review` workflow (job_bot_ai#228); Kodus runs DeepSeek on every PR instead.
 
 Scope/safety: only `gh pr create`, `gh pr ready` and the GraphQL ready mutation are
 gated (not other clients or the web UI). The hook requires `jq` (to extract the command from the payload) and
@@ -263,15 +239,14 @@ commit messages, heredocs) through. Without `node`, it falls back to gating only
 rather than wedging your shell — so it is a strong speed-bump, not a hard security
 boundary.
 
-Tests: `npm test` (resolver unit tests, hook integration tests against throwaway repos, and
-`kimi-review` tests against a fake `gh`).
+Tests: `npm test` (resolver unit tests and hook integration tests against throwaway repos).
 
 ## Env overrides
 
 - `CODERABBIT_BIN` / `CODEX_BIN` — explicit binary paths (if not on `PATH`)
 - `CODERABBIT_TIMEOUT_SECONDS` (default 600) / `CODEX_TIMEOUT_SECONDS` (default 900)
 - `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus coderabbit`
-  until 2026-11-19, `kodus greptile` from then; valid: `kodus coderabbit greptile codex self agy kimi`)
+  until 2026-11-19, `kodus greptile` from then; valid: `kodus coderabbit greptile codex self agy`)
 - `REVIEW_GATE_MIN` — how many different reviewers must pass (default 2)
 
 ## Headless / remote auth (CodeRabbit)

@@ -20,10 +20,11 @@
 # The skip is stored separately ($GIT_DIR/review-gate/<reviewer>.skip), is announced by
 # every `check` that relies on it, and never counts as a pass.
 # Reviewers: kodus, coderabbit, greptile (primaries), codex (fallback), self (last resort).
-# `agy` and `kimi` stay valid so old records and `kimi-review` keep working.
+# `agy` stays valid for old records. `kimi` (the retired DeepSeek/kimi-review pass) is no longer a
+# reviewer: a leftover kimi marker is ignored by `check`/`status` and never counts as a pass.
 set -euo pipefail
 
-VALID="kodus coderabbit greptile codex self agy kimi"
+VALID="kodus coderabbit greptile codex self agy"
 MIN="${REVIEW_GATE_MIN:-2}"
 case "$MIN" in ''|*[!0-9]*) echo "review-gate: REVIEW_GATE_MIN must be a number" >&2; exit 2;; esac
 [ "$MIN" -ge 1 ] || MIN=1
