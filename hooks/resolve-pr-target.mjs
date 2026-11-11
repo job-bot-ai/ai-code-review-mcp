@@ -328,6 +328,9 @@ function apiClientAt(words, from = 0) {
 }
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+// Environment that makes git act on another repository or with injected config (which can change what a bare
+// `git push` publishes): a push under it can't be checked against the directory's own HEAD.
+const GIT_ENV = /^GIT_(DIR|WORK_TREE|CONFIG_COUNT|CONFIG_PARAMETERS|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)=/;
 
 /** Roughly what a pipeline element writes to stdout, over-approximated so nothing is
  * hidden: echo's words joined by spaces; printf's format text and then each argument on
@@ -444,6 +447,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     dirStack: [...from.dirStack],
     ghRepo: from.ghRepo,
     cdpath: from.cdpath,
+    gitEnv: from.gitEnv, // GIT_DIR/GIT_WORK_TREE/GIT_CONFIG_* set in this shell: git may act on another repo/config
     pendingCond: false, // a `&& cd` ran in the current and-or list
     listStart: { dir: from.dir, dirStack: [...from.dirStack] },
   });
@@ -452,6 +456,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     dirStack: [],
     ghRepo: inherit.ghRepo !== undefined ? inherit.ghRepo : (env.GH_REPO || undefined),
     cdpath: inherit.cdpath ?? Boolean(env.CDPATH),
+    gitEnv: inherit.gitEnv ?? Object.keys(env).some((k) => GIT_ENV.test(`${k}=`)),
   })];
   // A push changes the remote, not the shell, so it isn't scoped to a subshell.
   const pushes = inherit.pushes ?? []; // shared with nested scripts, so their pushes count too
@@ -479,7 +484,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   const nested = (script, dir, ghRepo = scope().ghRepo) => {
     const s = scope();
     // A function body runs later, from wherever it's called: everything in it has an unknown directory.
-    const inner = findPrCreates(script, funcDepth > 0 ? null : dir, env, { ghRepo, cdpath: s.cdpath, pushes, headMoves, gitPushes });
+    const inner = findPrCreates(script, funcDepth > 0 ? null : dir, env, { ghRepo, cdpath: s.cdpath, gitEnv: s.gitEnv, pushes, headMoves, gitPushes });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
     if (inner.opaquePush) found.opaquePush ??= inner.opaquePush;
@@ -523,7 +528,8 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // <src> even though the push (and its remote-tracking ref) hasn't happened yet.
     let k = 1;
     let gdir = base;
-    let otherRepo = envRepo; // GIT_DIR=/--git-dir/--work-tree: the repo isn't the directory's
+    let otherRepo = envRepo || scope().gitEnv; // GIT_DIR=/--git-dir/--work-tree: the repo isn't the directory's
+    const config = []; // `-c key=value` overrides: they can change what a bare `git push` publishes
     while (k < cmd.length && cmd[k].value.startsWith('-')) {
       const v = cmd[k].value;
       if (v === '-C') {
@@ -533,7 +539,9 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         continue;
       }
       if (/^--(git-dir|work-tree)(=|$)/.test(v)) otherRepo = true;
-      k += ['-c', '--git-dir', '--work-tree', '--namespace'].includes(v) ? 2 : 1;
+      if (v === '-c') config.push(cmd[k + 1] ?? { value: '', dynamic: true });
+      if (v.startsWith('--config-env')) config.push({ value: 'config-env', dynamic: true });
+      k += ['-c', '--git-dir', '--work-tree', '--namespace', '--config-env'].includes(v) ? 2 : 1;
     }
     const sub = cmd[k]?.dynamic ? null : cmd[k]?.value;
     if (cmd[k]?.dynamic) { // `git $SUB ...` may be a push: never let it through unchecked
@@ -550,8 +558,8 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       return;
     }
     if (sub !== 'push') return;
-    gitPushes.push({ dir: otherRepo ? null : gdir, args: cmd.slice(k + 1), moves: headMoves.filter((m) => !m.pushOnly),
-      why: otherRepo ? '`git push` names another repository (GIT_DIR, --git-dir or --work-tree), so the gate can\'t tell which commit it pushes. Run it from the checkout: `cd /path/to/checkout && git push ...`' : null });
+    gitPushes.push({ dir: otherRepo ? null : gdir, args: cmd.slice(k + 1), moves: headMoves.filter((m) => !m.pushOnly), config,
+      why: otherRepo ? '`git push` names another repository or injects git config (GIT_DIR, GIT_CONFIG_*, --git-dir or --work-tree), so the gate can\'t tell which commit it pushes. Run it from the checkout: `cd /path/to/checkout && git push ...`' : null });
     headMoves.push({ dir: gdir, sub, pushOnly: true }); // moves the PR's head, not local HEAD
     const positional = [];
     const rest = cmd.slice(k + 1);
@@ -624,6 +632,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const note = (w, bare) => {
       const [, name, value] = w.value.match(ASSIGN);
       if (name === 'CDPATH' && bare) s.cdpath = true;
+      if (bare && GIT_ENV.test(w.value)) s.gitEnv = true; // `export GIT_DIR=...` / `GIT_DIR=...; git push`
       if (name === 'GH_REPO' && bare) s.ghRepo = w.dynamic ? null : value;
     };
     for (const w of assigns) note(w, cmd.length === 0);
@@ -700,7 +709,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     const c0 = progName(cmd[0]);
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
-    if (c0 === 'git') { recordPush(cmd, here, assigns.some((w) => /^GIT_(DIR|WORK_TREE)=/.test(w.value))); return; }
+    if (c0 === 'git') { recordPush(cmd, here, assigns.some((w) => GIT_ENV.test(w.value))); return; }
     // An API client (runners already unwrapped above) that sends the ready mutation in its
     // arguments, a heredoc, a here-string or a pipe. Only for a runner whose arguments can't be
     // parsed is every argument scanned for a client, and then a `gh pr create|ready` among its
@@ -1140,6 +1149,8 @@ const PUSH_RISKY = /(^|[\s;&|(){}'"`])(cd|pushd|popd)(\s|$)|(^|\s)(-C|--git-dir|
 // `git push` options that take a separate value, and the short ones that take one (attached or next word).
 const PUSH_VALUE_LONG = new Set(['--repo', '--push-option', '--receive-pack', '--exec']);
 const PUSH_VALUE_SHORT = new Set(['o']);
+// Config that decides what a push without refspecs publishes (`remote.<name>.push`, push.default=matching).
+const PUSH_CONFIG = /^(remote\..+\.push|remote\..+\.mirror|push\.default)=/i;
 
 /**
  * Which commits does one `git push` publish? Returns { skip } (nothing to gate: help, dry run, deletes, tags only),
@@ -1200,6 +1211,15 @@ function resolvePush(p) {
   const headRev = () => git(top, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}');
   if (!specs.length) {
     if (tags) return { skip: true }; // `git push --tags [remote]`: tags only
+    // Without refspecs git publishes what its config says: only the current branch is checkable. Configured push
+    // refspecs, mirror remotes or push.default=matching (in the repo's config or a `-c` override) may publish
+    // other branches, so spell the refspec out instead.
+    const cfgOverride = (p.config ?? []).find((w) => w.dynamic || PUSH_CONFIG.test(w.value));
+    const pd = git(top, 'config', '--get', 'push.default');
+    const refspecCfg = git(top, 'config', '--get-regexp', '^remote\\..*\\.(push|mirror)$');
+    if (cfgOverride || pd === 'matching' || refspecCfg) {
+      return { block: `a \`git push\` without a refspec publishes what ${cfgOverride ? `\`-c ${cfgOverride.value}\`` : pd === 'matching' ? 'push.default=matching' : 'the configured remote push refspecs'} say${cfgOverride ? 's' : ''}, which may be more than the current branch. Name it: \`git push origin HEAD\`` };
+    }
     const rev = headRev(); // the current branch (push.default)
     return rev ? { targets: [{ dir: top, rev }] } : { skip: true, note: `${top} has no commits; push not gated` };
   }
@@ -1215,9 +1235,12 @@ function resolvePush(p) {
     const src = colon >= 0 ? r.slice(0, colon) : r;
     const dst = colon >= 0 ? r.slice(colon + 1) : r;
     if (!src) continue; // `:branch` deletes it
-    if (src.startsWith('refs/tags/') || dst.startsWith('refs/tags/')) continue;
-    const isBranch = src === 'HEAD' || src.startsWith('refs/') || git(top, 'rev-parse', '--verify', '--quiet', `refs/heads/${src}`) !== null;
-    if (!isBranch && git(top, 'rev-parse', '--verify', '--quiet', `refs/tags/${src}`) !== null) continue; // a tag by name
+    if (dst.startsWith('refs/tags/')) continue; // publishes a tag, not a branch
+    if (colon < 0) { // `git push origin v1`: a tag pushed as itself. A tag pushed to a branch (`v1:main`) is checked.
+      if (src.startsWith('refs/tags/')) continue;
+      const isBranch = src === 'HEAD' || src.startsWith('refs/') || git(top, 'rev-parse', '--verify', '--quiet', `refs/heads/${src}`) !== null;
+      if (!isBranch && git(top, 'rev-parse', '--verify', '--quiet', `refs/tags/${src}`) !== null) continue;
+    }
     const rev = git(top, 'rev-parse', '--verify', '--quiet', `${src}^{commit}`);
     if (!rev) return { block: `can't resolve \`${src}\` (pushed by \`git push\`) to a commit in ${top}, so its pre-push review can't be checked` };
     let dir = top;

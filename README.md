@@ -272,13 +272,16 @@ A run only counts as **completed** when the reviewer exited 0 (Claude: `is_error
 line, one tag per line, optionally after `- `) or a final `No findings.` with no P0-P3 mention.
 Anything else (an error, the usage-limit text, an empty or cut-off answer, a `**[P1]**` or two
 tags on a line) is **FAILED**: nothing is recorded, the reason is printed and it exits 4. A failed
-run can't be accepted either. Findings Codex printed before it failed still count.
+run can't be accepted either. Findings Codex printed before it failed still count, and a failed
+Codex run that printed a tagged line in the wrong format fails the review whatever the fallback says.
 
 - No P0-P2 findings: a `prepush` marker is recorded for HEAD (bound to the commit like every other
   marker; a new commit needs a new review), exit 0.
 - P0-P2 findings: nothing is recorded, exit 1. Fix them, or decline them explicitly with
   `prepush-accept --reason "..."` (it needs a completed review of HEAD with findings; the marker
   keeps the reason, and `check`, `check-prepush` and the hook announce it with the findings file).
+- Running `prepush` again on the same commit first withdraws that commit's earlier pass or
+  acceptance: only the newest review of a commit stands.
 - The full output of every run is kept in `$GIT_DIR/review-gate/prepush-<sha>.txt`.
 
 **The hook blocks `git push`** until each commit it publishes to a branch has a `prepush` marker.
@@ -289,7 +292,11 @@ It checks the commit actually pushed (`git push origin feat/other` checks `feat/
 worktree that has it checked out). Not gated: `--delete`/`-d`/`:branch`, tags only (`--tags`,
 `tag v1`, `refs/tags/...`), `--dry-run`, `--help`, and outside a git repo. Blocked outright:
 `--all`/`--mirror`/wildcard refspecs, non-literal refspecs or `cd`/`-C` targets, `GIT_DIR`/
-`--git-dir`, and a commit made in the same command as the push. A push handed to something the
+`GIT_CONFIG_*`/`--git-dir` (as a prefix or exported earlier in the command), a commit made in
+the same command as the push, and a push without a refspec when config may make it publish more
+than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`, or a `-c`
+override of those): name the refspec (`git push origin HEAD`). A tag pushed to a branch
+(`v1:release`) is checked like a branch push. A push handed to something the
 gate can't follow (`ssh host 'git push'`, `python -c`) is checked against HEAD of the directory it
 runs from. Git aliases (`git -c alias.p=push p`) are not followed.
 

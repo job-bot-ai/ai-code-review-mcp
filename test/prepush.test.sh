@@ -210,6 +210,25 @@ prep
 expect "findings Codex printed before failing still block, even when the fallback is clean" 1 stdout "[P1] Seen before the error"
 no_marker "no marker when a failed codex run had findings"
 
+# A later review of the same commit replaces the earlier one (its findings can't hide behind an old pass).
+reset_marker; codex_says 0 "No findings."; prep >/dev/null
+codex_says 0 "- [P1] found on the second look — a.sh:1"; prep
+expect "a re-review with blockers fails" 1 stdout "found on the second look"
+no_marker "a re-review with blockers removes the earlier pass of the same commit"
+(cd "$R" && bash "$gate" check-prepush) 2>/dev/null; rc=$?
+[ "$rc" -eq 1 ] && ok "check-prepush fails after the re-review found blockers" || bad "old pass still counts rc=$rc"
+
+# A failed Codex run with a good finding and a malformed tagged line: no fallback can clear it.
+reset_marker
+codex_says 1 "- [P1] a good finding — a.sh:1
+**[P2]** malformed — b.sh:2" "$LIMIT"
+claude_says 0 "$(claude_json "No findings.")"
+prep
+expect "a failed codex run with an unreadable [Pn] line is FAILED even when claude is clean" 4 stderr "not in the finding format"
+has "$err" "[P1] a good finding" && ok "its readable findings are still printed" || bad "good finding not printed" "$err"
+no_marker "no marker when failed codex output had an unreadable finding"
+claude_says 1 ""
+
 # ── the verdict must be readable ──
 for v in "**[P1]** bold tag — a.sh:1" "1. [P1] numbered — a.sh:1" "- [P1] two — a.sh:1 [P2] tags on one line" "- [p1] lower case tag — a.sh:1"; do
   reset_marker; codex_says 0 "$v"
@@ -339,6 +358,23 @@ for c in "git push --delete origin feat/old" "git push -d origin feat/old" "git 
   expect "not a branch push, allowed without a review: $c" 0
 done
 git -C "$H" reset -q --hard HEAD~1
+
+# Config and environment that change what a push publishes or which repo it acts on.
+run "$H" "export GIT_DIR=$H/.git; git push origin HEAD"
+expect "an exported GIT_DIR before the push is blocked" 2 stderr "names another repository"
+run "$H" "git -c push.default=matching push"
+expect "a bare push under -c push.default=matching is blocked" 2 stderr "push.default=matching"
+git -C "$H" config remote.origin.push 'refs/heads/feat/other:refs/heads/feat/other'
+run "$H" "git push"
+expect "a bare push with configured remote push refspecs is blocked" 2 stderr "configured remote push refspecs"
+run "$H" "git push origin HEAD"
+expect "naming the refspec checks just that commit (reviewed → allowed)" 0
+git -C "$H" config --unset remote.origin.push
+git -C "$H" tag v0 HEAD~1
+run "$H" "git push origin refs/tags/v0:refs/heads/release"
+expect "a tag pushed to a branch is checked like a branch push" 2 stderr "@ $(git -C "$H" rev-parse --short=12 HEAD~1)"
+run "$H" "git push origin v0:release"
+expect "a short tag name pushed to a branch is checked too" 2 stderr "BLOCKED by the pre-push review gate"
 
 # A branch checked out in another worktree: its markers live there.
 git -C "$H" worktree add -q -b feat/wt "$T/h-wt" HEAD

@@ -273,6 +273,10 @@ case "${1:-help}" in
     command -v jq >/dev/null 2>&1 || { echo "review-gate: jq is required for prepush" >&2; exit 2; }
     mkdir -p "$dir"
     out="$dir/prepush-$head.txt"; res="$dir/prepush-$head.result"
+    # A new review of this commit replaces the old one: its pass (or acceptance) no longer stands until this run
+    # completes clean, so a later run's findings can't hide behind an earlier pass.
+    [ "$(prepush_rev)" = "$head" ] && rm -f "$(marker prepush)"
+    printf 'failed review in progress (started %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$res"
     work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
     # The reviewed commit is fixed now: a commit made while the review runs doesn't get this review.
     git diff "$mb" "$head" >"$work/diff"
@@ -315,9 +319,12 @@ case "${1:-help}" in
     elif ! grep -q '[^[:space:]]' "$work/cv"; then why="codex printed no final message"
     fi
     # Findings Codex did print stay findings even when the run failed: an error never hides a blocker.
-    codex_partial=""
+    codex_partial=""; codex_unread=""
     if [ -n "$why" ]; then
-      codex_partial="$(parse_verdict "$work/cv" | awk 'NR == 1 && $1 != "findings" { exit } NR > 1')"
+      # Every well-formed finding line, whatever else the answer holds (a truncated or malformed line after a
+      # good finding must not discard it); a tagged line we can't read means a finding could be lost.
+      codex_partial="$(awk '{ t = $0; n = gsub(/\[[Pp][0-3]\]/, "", t) } n == 1 && /^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/' "$work/cv")"
+      codex_unread="$(awk '{ t = $0; n = gsub(/\[[Pp][0-3]\]/, "", t) } n > 1 || (n == 1 && !/^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/)' "$work/cv" | head -n 1 | cut -c1-160)"
       echo "review-gate: Codex can't review ($why); falling back to a read-only Claude review..." >&2
       if ! command -v claude >/dev/null 2>&1; then
         verdict="unreadable"; why="$why; claude is not installed"
@@ -336,6 +343,8 @@ case "${1:-help}" in
     else
       reviewer=codex
     fi
+    # Codex failed after printing a [Pn] line we can't read: a finding may be lost, so no fallback can clear it.
+    [ -z "$why" ] && [ -n "$codex_unread" ] && why="Codex failed after printing a [Pn] line not in the finding format: $codex_unread"
     if [ -n "$why" ]; then
       {
         echo "review-gate: pre-push review FAILED for ${head:0:12}: $why"
