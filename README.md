@@ -281,7 +281,8 @@ Codex run that printed a tagged line in the wrong format fails the review whatev
   `prepush-accept --reason "..."` (it needs a completed review of HEAD with findings; the marker
   keeps the reason, and `check`, `check-prepush` and the hook announce it with the findings file).
 - Running `prepush` again on the same commit first withdraws that commit's earlier pass or
-  acceptance: only the newest review of a commit stands.
+  acceptance: only the newest review of a commit stands. One `prepush`/`prepush-accept` runs at a
+  time per worktree (a second one exits 5; a lock left by a dead process is taken over).
 - The full output of every run is kept in `$GIT_DIR/review-gate/prepush-<sha>.txt`.
 
 **The hook blocks `git push`** until each commit it publishes to a branch has a `prepush` marker.

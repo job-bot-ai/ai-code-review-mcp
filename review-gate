@@ -118,6 +118,26 @@ parse_verdict() {
     }' "$1"
 }
 
+# One prepush/prepush-accept at a time per worktree: an older run must never publish a pass after a newer run of
+# the same commit started (or finished with findings). The lock is a directory (atomic mkdir) holding the pid;
+# a lock whose process is gone is taken over.
+take_lock() {
+  local l="$dir/prepush.lock" pid
+  mkdir -p "$dir"
+  if ! mkdir "$l" 2>/dev/null; then
+    pid="$(cat "$l/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "review-gate: another prepush/prepush-accept (pid $pid) is running in this worktree; wait for it" >&2; exit 5
+    fi
+    rm -rf "$l"; mkdir "$l" 2>/dev/null || { echo "review-gate: couldn't take $l; retry" >&2; exit 5; }
+  fi
+  echo "$$" >"$l/pid"
+  LOCK="$l"
+}
+LOCK=""; WORK=""
+cleanup() { [ -z "$WORK" ] || rm -rf "$WORK"; [ -z "$LOCK" ] || rm -rf "$LOCK"; }
+trap cleanup EXIT
+
 # The base to review against: the PR base if gh can tell, else origin/main.
 default_base() {
   local b
@@ -271,13 +291,13 @@ case "${1:-help}" in
       echo "review-gate: $base and HEAD have no common history" >&2; exit 2; }
     [ -r "$PROMPT_FILE" ] || { echo "review-gate: prompt file $PROMPT_FILE is missing" >&2; exit 2; }
     command -v jq >/dev/null 2>&1 || { echo "review-gate: jq is required for prepush" >&2; exit 2; }
-    mkdir -p "$dir"
+    take_lock
     out="$dir/prepush-$head.txt"; res="$dir/prepush-$head.result"
     # A new review of this commit replaces the old one: its pass (or acceptance) no longer stands until this run
     # completes clean, so a later run's findings can't hide behind an earlier pass.
     [ "$(prepush_rev)" = "$head" ] && rm -f "$(marker prepush)"
     printf 'failed review in progress (started %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$res"
-    work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+    work="$(mktemp -d)"; WORK="$work"
     # The reviewed commit is fixed now: a commit made while the review runs doesn't get this review.
     git diff "$mb" "$head" >"$work/diff"
     if [ ! -s "$work/diff" ]; then
@@ -403,6 +423,7 @@ case "${1:-help}" in
     [ "${2:-}" = "--reason" ] || { echo "review-gate: usage: prepush-accept --reason \"why the P0-P2 findings are not being fixed\"" >&2; exit 2; }
     reason="$(printf '%s' "${3:-}" | tr '\n\r' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     [ "${#reason}" -ge 10 ] || { echo "review-gate: --reason must say why each finding is not being fixed (10+ characters)" >&2; exit 2; }
+    take_lock
     res="$dir/prepush-$head.result"
     [ -f "$res" ] || { echo "review-gate: no pre-push review of ${head:0:12} to accept; run \`review-gate prepush\` first" >&2; exit 2; }
     read -r rs rb rt rr rbase _ <"$res" || true

@@ -255,6 +255,19 @@ out="$(cd "$R" && REVIEW_GATE_PREPUSH_TIMEOUT=1 STUB_SLEEP=5 bash "$gate" prepus
 expect "a codex run past the time limit is not a pass (claude fallback unavailable here)" 4 stderr "codex exited 124"
 no_marker "no marker after a timed-out codex"
 
+# One prepush at a time per worktree; a lock left by a dead process is taken over.
+reset_marker; codex_says 0 "No findings."
+gd="$(git -C "$R" rev-parse --absolute-git-dir)"; mkdir -p "$gd/review-gate/prepush.lock"; echo $$ >"$gd/review-gate/prepush.lock/pid"
+prep
+expect "a prepush while another runs in the worktree is refused" 5 stderr "another prepush"
+[ ! -e "$S/codex.called" ] && ok "the refused run reviews nothing" || bad "codex ran despite the lock"
+(cd "$R" && bash "$gate" prepush-accept --reason "racing an ongoing review here") >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 5 ] && ok "prepush-accept waits for the lock too" || bad "accept during lock rc=$rc"
+echo 999999 >"$gd/review-gate/prepush.lock/pid"
+prep
+expect "a stale lock (dead pid) is taken over" 0 stdout "No findings."
+[ ! -e "$gd/review-gate/prepush.lock" ] && ok "the lock is released after the run" || bad "lock left behind"
+
 # ── base, empty diff, record ──
 reset_marker; codex_says 0 "No findings."
 git -C "$R" update-ref refs/remotes/origin/feat/base "$(git -C "$R" rev-parse HEAD~1)"
@@ -357,6 +370,10 @@ for c in "git push --delete origin feat/old" "git push -d origin feat/old" "git 
   run "$H" "$c"
   expect "not a branch push, allowed without a review: $c" 0
 done
+run "$H" "git push -n --no-dry-run origin HEAD"
+expect "--no-dry-run after -n publishes (gated)" 2 stderr "BLOCKED by the pre-push review gate"
+run "$H" "git push --delete --no-delete origin HEAD"
+expect "--no-delete after --delete publishes (gated)" 2 stderr "BLOCKED by the pre-push review gate"
 git -C "$H" reset -q --hard HEAD~1
 
 # Config and environment that change what a push publishes or which repo it acts on.
@@ -364,6 +381,13 @@ run "$H" "export GIT_DIR=$H/.git; git push origin HEAD"
 expect "an exported GIT_DIR before the push is blocked" 2 stderr "names another repository"
 run "$H" "git -c push.default=matching push"
 expect "a bare push under -c push.default=matching is blocked" 2 stderr "push.default=matching"
+run "$H" "GIT_DIR=$H/.git bash -c 'git push origin HEAD'"
+expect "a prefix GIT_DIR reaches a git push inside bash -c" 2 stderr "names another repository"
+run "$H" "env GIT_DIR=$H/.git bash -c 'git push origin HEAD'"
+expect "an env-runner GIT_DIR reaches a git push inside bash -c" 2 stderr "names another repository"
+mkrepo "$T/o"
+run "$H" "python3 -c 'import os; os.system(\"git push\")'; cd $T/o && python3 -c 'import os; os.system(\"git push\")'"
+expect "every opaque push is checked, not just the first" 2 stderr "$T/o @"
 git -C "$H" config remote.origin.push 'refs/heads/feat/other:refs/heads/feat/other'
 run "$H" "git push"
 expect "a bare push with configured remote push refspecs is blocked" 2 stderr "configured remote push refspecs"

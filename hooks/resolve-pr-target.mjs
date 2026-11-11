@@ -477,17 +477,20 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   found.gitPushes = gitPushes;
   const scope = () => scopes[scopes.length - 1];
   // A `git push` passed to something the gate can't follow (ssh, awk system(), python -c): gated in `dir`.
-  const opaquePush = (what, dir) => { found.opaquePush ??= { what, dir: funcDepth > 0 ? null : dir }; };
+  // Recorded with the other pushes (shared with nested scripts), so every one of them is checked.
+  const opaquePush = (what, dir) => {
+    gitPushes.push({ opaque: what, dir: funcDepth > 0 || scope().gitEnv ? null : dir, args: [], moves: [] });
+  };
 
   // Code that runs in a subshell ($(...), `...`, <(...), bash -c, eval): gate any
   // gh pr create inside it, starting from the current directory.
-  const nested = (script, dir, ghRepo = scope().ghRepo) => {
+  // gitEnv: GIT_DIR/GIT_CONFIG_* the nested script runs under (this shell's, or the command's own prefix).
+  const nested = (script, dir, ghRepo = scope().ghRepo, gitEnv = scope().gitEnv) => {
     const s = scope();
     // A function body runs later, from wherever it's called: everything in it has an unknown directory.
-    const inner = findPrCreates(script, funcDepth > 0 ? null : dir, env, { ghRepo, cdpath: s.cdpath, gitEnv: s.gitEnv, pushes, headMoves, gitPushes });
+    const inner = findPrCreates(script, funcDepth > 0 ? null : dir, env, { ghRepo, cdpath: s.cdpath, gitEnv, pushes, headMoves, gitPushes });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
-    if (inner.opaquePush) found.opaquePush ??= inner.opaquePush;
     if (inner.readyMutation) found.readyMutation = true;
   };
   const opaque = (why) => { found.opaque ??= why; };
@@ -682,6 +685,8 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const here = runnerChdir || funcDepth > 0 ? null : s.dir; // a function body runs later, from wherever it's called
     const repoAssign = assigns.filter((w) => w.value.startsWith('GH_REPO=')).pop();
     const ghRepoHere = repoAssign ? (repoAssign.dynamic ? null : repoAssign.value.slice('GH_REPO='.length)) : s.ghRepo;
+    // Git environment this command (and anything it launches) runs under: this shell's, or its own prefix/env ones.
+    const gitEnvHere = s.gitEnv || assigns.some((w) => GIT_ENV.test(w.value));
     if (wrapped && ['cd', 'pushd', 'popd'].includes(cmd[0].value)) return; // not a builtin there: can't move us
     if (assigns.some((w) => w.value.startsWith('CDPATH=')) && ['cd', 'pushd'].includes(cmd[0].value)) { s.dir = null; return; }
     if (isGhPrCreate(cmd)) {
@@ -704,12 +709,12 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       (fromPipe !== null && PUSH_MENTION.test(fromPipe));
     if (cmd[0].dynamic) {
       if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`);
-      if (pushMentioned()) opaquePush(`\`${cmd[0].value}\` (a non-literal command)`, here);
+      if (pushMentioned()) opaquePush(`\`${cmd[0].value}\` (a non-literal command)`, gitEnvHere ? null : here);
       return;
     }
     const c0 = progName(cmd[0]);
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
-    if (c0 === 'git') { recordPush(cmd, here, assigns.some((w) => GIT_ENV.test(w.value))); return; }
+    if (c0 === 'git') { recordPush(cmd, here, gitEnvHere); return; }
     // An API client (runners already unwrapped above) that sends the ready mutation in its
     // arguments, a heredoc, a here-string or a pipe. Only for a runner whose arguments can't be
     // parsed is every argument scanned for a client, and then a `gh pr create|ready` among its
@@ -727,7 +732,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       // stays a dynamic word); a cd in it isn't modelled, so the directory becomes unknown.
       const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring);
       const script = args.map((w) => w.value).join(' ');
-      nested(script, here, ghRepoHere);
+      nested(script, here, ghRepoHere, gitEnvHere);
       if (!pipelined && (args.some((w) => w.dynamic) || DIR_WORD.test(script))) s.dir = null;
       return;
     }
@@ -738,7 +743,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       const isRedirect = (w) => /^\d*[<>]/.test(w.value) && !/^[<>]\(/.test(w.value); // not <(...)
       const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !isRedirect(w));
       const code = [...stdinCode, ...(fromPipe !== null && (!args.length || ['/dev/stdin', '-'].includes(args[0].value)) ? [fromPipe] : [])];
-      for (const body of code) nested(body, here, ghRepoHere);
+      for (const body of code) nested(body, here, ghRepoHere, gitEnvHere);
       if (substMention()) opaque(`${c0} <(...)`);
       if (!pipelined && (args.some((w) => w.dynamic) || code.some((b) => DIR_WORD.test(b)))) s.dir = null;
       return;
@@ -747,7 +752,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       // A child shell can't move us, but a gh pr create in its script still runs: walk a
       // -c script (even a partly dynamic one) or code on stdin (heredoc, here-string, pipe).
       const ci = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*c$/.test(w.value));
-      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, here, ghRepoHere); return; }
+      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, here, ghRepoHere, gitEnvHere); return; }
       let file = null;
       const rest = cmd.slice(1);
       for (let j = 0; j < rest.length; j++) {
@@ -761,13 +766,13 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         break;
       }
       if (file) { if (mentioned() || substMention()) opaque(`${c0} ${file.value}`); return; } // a script we can't read
-      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, here, ghRepoHere);
+      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, here, ghRepoHere, gitEnvHere);
       return;
     }
     if (INTERPRETERS.has(c0)) {
       const inline = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*[ce]$/.test(w.value));
       if (inline > 0 && MENTION.test(cmd[inline + 1]?.value ?? '')) opaque(`${c0} ${cmd[inline].value}`);
-      if (inline > 0 && PUSH_MENTION.test(cmd[inline + 1]?.value ?? '')) opaquePush(`${c0} ${cmd[inline].value}`, here);
+      if (inline > 0 && PUSH_MENTION.test(cmd[inline + 1]?.value ?? '')) opaquePush(`${c0} ${cmd[inline].value}`, gitEnvHere ? null : here);
       return;
     }
     // A program that launches `git ...` from its arguments (`xargs git push`, `op run -- git push`, `ssh host git
@@ -776,7 +781,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       : cmd.findIndex((w, idx) => idx > 0 && !w.dynamic && progName(w) === 'git');
     if (kGitArg > 0) {
       const chdir = RUNNERS.has(c0) && cmd.slice(1, kGitArg).some((w) => /^(--chdir|-[A-Za-z]*[CD])/.test(w.value));
-      recordPush(cmd.slice(kGitArg), chdir ? null : here);
+      recordPush(cmd.slice(kGitArg), chdir ? null : here, gitEnvHere);
     }
     if (RUNNERS.has(c0)) {
       // `timeout 60 gh pr create ...`, `env -C dir GH_REPO=o/r gh pr create ...`
@@ -801,7 +806,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       const sedRuns = /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/;
       if (pushMentioned()) { // conservative: any awk/sed text that mentions git push may run it
         const runs = c0 === 'sed' ? cmd.slice(1).some((w) => sedRuns.test(w.value)) : cmd.slice(1).some((w) => awkRuns(w.value));
-        if (runs) opaquePush(c0, here);
+        if (runs) opaquePush(c0, gitEnvHere ? null : here);
       }
       if (!mentioned()) return;
       if (c0 === 'sed') { if (cmd.slice(1).some((w) => sedRuns.test(w.value))) opaque(c0); return; }
@@ -833,7 +838,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // arguments, a heredoc or a pipe) might run it. Script interpreters were handled above.
     const joined = cmd.slice(1).filter((w) => !w.heredoc).map((w) => w.value).join(' ');
     if (mentioned() || MENTION.test(joined) || (fromPipe !== null && MENTION.test(fromPipe))) opaque(c0);
-    if (kGitArg < 0 && pushMentioned()) opaquePush(c0, here);
+    if (kGitArg < 0 && pushMentioned()) opaquePush(c0, gitEnvHere ? null : here);
   };
 
   const endList = (op) => {
@@ -1159,6 +1164,12 @@ const PUSH_CONFIG = /^(remote\..+\.push|remote\..+\.mirror|push\.default)=/i;
  */
 function resolvePush(p) {
   if (p.why) return { block: p.why };
+  if (p.opaque) { // `git push` handed to something the gate can't follow: check HEAD where it runs
+    if (p.dir === null) return { block: `\`git push\` is passed to ${p.opaque}, which the gate can't follow, from a directory (or git environment) it can't tell. Run the push directly: \`cd /literal/path && git push ...\`` };
+    const top = git(p.dir, 'rev-parse', '--show-toplevel');
+    const rev = top && git(top, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}');
+    return rev ? { targets: [{ dir: top, rev }], note: `git push is passed to ${p.opaque}, which the gate can't follow; checked ${top} HEAD for it` } : { skip: true };
+  }
   if (p.dir === null) {
     return { block: "can't tell which repo a `git push` runs in: a `cd` or `-C` before it isn't a literal path, or only runs conditionally. Use `cd /literal/path && git push ...` or `git -C /literal/path push ...`" };
   }
@@ -1185,7 +1196,10 @@ function resolvePush(p) {
     if (v.startsWith('--')) {
       const name = v.split('=')[0];
       if (name === '--delete') del = true;
+      else if (name === '--no-delete') del = false; // the last of --x / --no-x wins, as in git
       else if (name === '--dry-run') dry = true;
+      else if (name === '--no-dry-run') dry = false;
+      else if (name === '--no-tags') tags = false;
       else if (name === '--help') help = true;
       else if (['--all', '--mirror', '--branches'].includes(name)) all = true;
       else if (name === '--tags') tags = true;
@@ -1269,14 +1283,7 @@ export function resolvePushes(command, cwd, env = process.env) {
     const r = resolvePush(p);
     if (r.block) return { status: 'block', reason: r.block };
     if (r.note) notes.push(r.note);
-    for (const t of r.targets ?? []) add(t);
-  }
-  if (hits.opaquePush) {
-    const { what, dir } = hits.opaquePush;
-    if (dir === null) return { status: 'block', reason: `\`git push\` is passed to ${what}, which the gate can't follow, from a directory it can't tell. Run the push directly: \`cd /literal/path && git push ...\`` };
-    const top = git(dir, 'rev-parse', '--show-toplevel');
-    const rev = top && git(top, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}');
-    if (rev) add({ dir: top, rev }, `git push is passed to ${what}, which the gate can't follow; checked ${top} HEAD for it`);
+    for (const t of r.targets ?? []) add(t, r.note ?? null);
   }
   return targets.length ? { status: 'ok', targets, notes } : { status: 'none', notes };
 }
