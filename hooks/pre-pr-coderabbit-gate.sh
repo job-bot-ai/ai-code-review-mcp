@@ -20,7 +20,7 @@
 input="$(cat)"
 
 # Fast path: if the payload can't possibly contain `gh ... pr ... create` or a push, allow now.
-printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview|push' || exit 0   # `gh pr new` is an alias
+printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview|push|git' || exit 0   # `gh pr new` is an alias
 
 # Pull the actual command string out of tool_input.command. jq is required to isolate the
 # command from surrounding JSON reliably; without it, warn (not silent) and fail open
@@ -48,6 +48,12 @@ printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([
 # the resolver decides whether a push really runs.
 if printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])git([^[:alnum:]_-]|$)' &&
    printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'; then want_push=1; fi
+# `git pu` never says push: when the config (global or the session repo's) has an alias that pushes, any git
+# command goes to the resolver, which looks the alias up where it runs.
+if [ "$want_push" = 0 ] && printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])git([^[:alnum:]_-]|$)'; then
+  _cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)"
+  git -C "${_cwd:-.}" config --get-regexp '^alias\.' 2>/dev/null | grep -Eq '(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)' && want_push=1
+fi
 [ "$want_pr" = 1 ] || [ "$want_push" = 1 ] || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

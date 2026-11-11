@@ -563,6 +563,8 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       if (!newBranchAtHead && !restoreFiles) headMoves.push({ dir: gdir, sub });
       return;
     }
+    // Not a built-in: it may be an alias (`git p` with alias.p=push, or `-c alias.p=push`), checked at resolve time.
+    if (sub && !GIT_BUILTINS.has(sub)) gitPushes.push({ alias: sub, dir: gdir, config, args: [], moves: [] });
     if (sub !== 'push') return;
     gitPushes.push({ dir: otherRepo ? null : gdir, args: cmd.slice(k + 1), moves: headMoves.filter((m) => !m.pushOnly), config,
       why: otherRepo ? '`git push` names another repository or injects git config (GIT_DIR, GIT_CONFIG_*, --git-dir or --work-tree), so the gate can\'t tell which commit it pushes. Run it from the checkout: `cd /path/to/checkout && git push ...`' : null });
@@ -1153,6 +1155,14 @@ export function resolveTargets(command, cwd, env = process.env) {
 // ── Pre-push gate ────────────────────────────────────────────────────────────
 
 // Used only when the command can't be parsed: could the push run somewhere other than the session cwd?
+// git's own subcommands (an alias can't shadow these), so only other words are looked up as aliases.
+const GIT_BUILTINS = new Set(('add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore ' +
+  'checkout cherry cherry-pick clean clone commit commit-tree config count-objects describe diff diff-files ' +
+  'diff-index diff-tree difftool fetch for-each-ref format-patch fsck gc grep hash-object help init log ls-files ' +
+  'ls-remote ls-tree merge merge-base mergetool mv notes pull push range-diff rebase reflog remote repack replace ' +
+  'request-pull reset restore rev-list rev-parse revert rm shortlog show show-branch show-ref sparse-checkout stash ' +
+  'status submodule switch symbolic-ref tag update-index update-ref var verify-commit version whatchanged worktree ' +
+  'write-tree maintenance backfill').split(' '));
 const PUSH_RISKY = /(^|[\s;&|(){}'"`])(cd|pushd|popd)(\s|$)|(^|\s)(-C|--git-dir|--work-tree)([\s=]|$)|GIT_DIR|GIT_WORK_TREE|CDPATH/;
 // `git push` options that take a separate value, and the short ones that take one (attached or next word).
 const PUSH_VALUE_LONG = new Set(['--repo', '--push-option', '--receive-pack', '--exec']);
@@ -1167,6 +1177,15 @@ const PUSH_CONFIG = /^(remote\..+\.push|remote\..+\.mirror|push\.default)=/i;
  */
 function resolvePush(p) {
   if (p.why) return { block: p.why };
+  if (p.alias !== undefined) { // `git <alias>`: blocked when the alias (repo/global config or `-c`) runs a push
+    const viaC = (p.config ?? []).filter((w) => w.dynamic || w.value.toLowerCase().startsWith(`alias.${p.alias.toLowerCase()}=`));
+    const def = viaC.length ? viaC.map((w) => (w.dynamic ? 'push' : w.value)).join(' ')
+      : p.dir === null ? null : git(p.dir, 'config', '--get', `alias.${p.alias}`);
+    if (def !== null && /(^|[^A-Za-z0-9_-])push([^A-Za-z0-9_-]|$)/.test(def)) {
+      return { block: `\`git ${p.alias}\` is an alias that pushes (${def.slice(0, 80)}), which the gate doesn't follow. Use \`git push ...\` itself.` };
+    }
+    return { skip: true };
+  }
   if (p.opaque) { // `git push` handed to something the gate can't follow: check HEAD where it runs
     if (p.dir === null) return { block: `\`git push\` is passed to ${p.opaque}, which the gate can't follow, from a directory (or git environment) it can't tell. Run the push directly: \`cd /literal/path && git push ...\`` };
     const top = git(p.dir, 'rev-parse', '--show-toplevel');
@@ -1187,6 +1206,7 @@ function resolvePush(p) {
   }
   const positional = [];
   let remoteGiven = false; let del = false; let dry = false; let help = false; let all = false; let tags = false;
+  let submodules = null; // --recurse-submodules=on-demand|only publishes submodule commits the review never saw
   const args = p.args ?? [];
   for (let j = 0; j < args.length; j++) {
     const w = args[j];
@@ -1203,6 +1223,8 @@ function resolvePush(p) {
       else if (name === '--dry-run') dry = true;
       else if (name === '--no-dry-run') dry = false;
       else if (name === '--no-tags') tags = false;
+      else if (name === '--recurse-submodules') submodules = !/=(check|no)$/.test(v);
+      else if (name === '--no-recurse-submodules') submodules = false;
       else if (name === '--help') help = true;
       else if (['--all', '--mirror', '--branches'].includes(name)) all = true;
       else if (name === '--tags') tags = true;
@@ -1223,6 +1245,12 @@ function resolvePush(p) {
     positional.push(w);
   }
   if (help || dry || del) return { skip: true }; // nothing is published (`--delete` removes refs only)
+  if (submodules === null) {
+    const cfg = (p.config ?? []).filter((w) => /^push\.recursesubmodules=/i.test(w.value)).pop();
+    const v = cfg ? cfg.value.split('=')[1] : git(top, 'config', '--get', 'push.recurseSubmodules');
+    submodules = v !== null && /^(on-demand|only)$/i.test(v);
+  }
+  if (submodules) return { block: '`git push` would also push submodule commits (--recurse-submodules=on-demand/only, or push.recurseSubmodules), which the pre-push review never saw. Push the submodule on its own first, then this branch with --recurse-submodules=check' };
   if (all) return { block: '`git push --all/--mirror/--branches` publishes every branch at once; push one branch (`git push origin HEAD`) so the gate can check its pre-push review' };
   const specs = remoteGiven ? positional : positional.slice(1);
   const headRev = () => git(top, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}');

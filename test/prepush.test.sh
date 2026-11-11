@@ -416,6 +416,20 @@ run "$H" "export GIT_CONFIG_SYSTEM=$T/cfg; git push"
 expect "an exported GIT_CONFIG_SYSTEM is blocked" 2 stderr "injects git config"
 run "$H" "HOME=$T git push"
 expect "a HOME prefix (moves the global config) is blocked" 2 stderr "injects git config"
+run "$H" "git -c alias.p=push p origin HEAD"
+expect "a -c alias that pushes is blocked" 2 stderr "is an alias that pushes"
+git -C "$H" config alias.pu "push --force"
+run "$H" "git pu origin HEAD"
+expect "a configured alias that pushes is blocked" 2 stderr "is an alias that pushes"
+git -C "$H" config --unset alias.pu
+run "$H" "git push --recurse-submodules=on-demand origin HEAD"
+expect "--recurse-submodules=on-demand is blocked (submodule commits weren't reviewed)" 2 stderr "submodule commits"
+run "$H" "git push --recurse-submodules=check origin HEAD"
+expect "--recurse-submodules=check only checks (reviewed → allowed)" 0
+git -C "$H" config push.recurseSubmodules on-demand
+run "$H" "git push origin HEAD"
+expect "push.recurseSubmodules=on-demand in config is blocked" 2 stderr "submodule commits"
+git -C "$H" config --unset push.recurseSubmodules
 git -C "$H" config remote.origin.push 'refs/heads/feat/other:refs/heads/feat/other'
 run "$H" "git push"
 expect "a bare push with configured remote push refspecs is blocked" 2 stderr "configured remote push refspecs"

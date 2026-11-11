@@ -301,9 +301,11 @@ prefix, an `env` assignment, or exported earlier in the command, including into 
 the same command as the push, and a push without a refspec when config may make it publish more
 than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`, or a `-c`
 override of those): name the refspec (`git push origin HEAD`). A tag pushed to a branch
-(`v1:release`) is checked like a branch push. A push handed to something the
+(`v1:release`) is checked like a branch push. Also blocked: `--recurse-submodules=on-demand|only`
+or `push.recurseSubmodules` set so (submodule commits weren't reviewed), and a git alias that
+pushes (`git p` with `alias.p=push` in config or `-c`; the hook looks for pushing aliases in the global and session-repo config). A push handed to something the
 gate can't follow (`ssh host 'git push'`, `python -c`) is checked against HEAD of the directory it
-runs from. Git aliases (`git -c alias.p=push p`) are not followed.
+runs from.
 
 **Escape hatch (Tim only).** `REVIEW_GATE_PREPUSH=off` in the environment Claude Code itself runs
 in (e.g. `env` in `~/.claude/settings.json`, or exported before starting `claude`) turns the push
