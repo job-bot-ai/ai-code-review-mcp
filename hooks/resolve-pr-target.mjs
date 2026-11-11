@@ -613,7 +613,10 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const rargs = cmd.slice(k + 1).map((w) => w.value);
     if (sub && refMutation(sub, rargs)) { headMoves.push({ dir: gdir, sub }); return; }
     // Not a built-in: it may be an alias (`git p` with alias.p=push, or `-c alias.p=push`), checked at resolve time.
-    if (sub && !GIT_BUILTINS.has(sub)) gitPushes.push({ alias: sub, dir: gdir, config, args: [], moves: headMoves.filter((m) => !m.pushOnly) });
+    if (sub && !GIT_BUILTINS.has(sub)) {
+      gitPushes.push({ alias: sub, dir: gdir, config, args: [], moves: headMoves.filter((m) => !m.pushOnly),
+        why: otherRepo ? `\`git ${sub}\` may be an alias, and it runs with another repository or injected git config (GIT_DIR, GIT_CONFIG_*, HOME, --git-dir), so the gate can't look it up. Use \`git push ...\` itself, from the checkout` : null });
+    }
     // The gate resolves a push against refs and config as they are BEFORE the command runs, so a push may only
     // follow read-only git commands: anything else (fetch, config writes, ref updates, aliases, ...) could change
     // what it publishes. Recorded for the push gate only (the PR gate keeps its own HEAD-mover rule).
@@ -1249,6 +1252,8 @@ function movedBefore(p, dir) {
   return `\`git ${moved.sub}\` runs before \`git push\` in the same command. The gate checks what the push publishes as the repo is before the command runs, so only read-only git commands may come first (a commit, fetch, config or ref change could make it publish an unreviewed commit). Run it first, run \`review-gate prepush\` if HEAD changed, then push on its own.`;
 }
 
+// `-c include.path=...` / `-c includeIf.<cond>.path=...` pull in a whole config file the gate doesn't read.
+const INCLUDE_CFG = /^include(if\..*)?\.path(=|$)/i;
 /** `-c key[=value]` overrides as a map (lowercased key → value; a bare `-c key` means true). */
 function configMap(config) {
   const m = new Map();
@@ -1262,8 +1267,9 @@ function configMap(config) {
 
 /** `git <alias>`: follow the alias chain (`-c` overrides first, then config where git runs); block if it pushes. */
 function resolveAlias(p) {
+  if (p.why) return { block: p.why };
   const blockMsg = (why) => ({ block: `\`git ${p.alias}\` ${why}, which the gate doesn't follow. Use \`git push ...\` itself.` });
-  if ((p.config ?? []).some((w) => w.dynamic || w.value === 'config-env')) return blockMsg('runs with a config override the gate can\'t read (it could define the alias)');
+  if ((p.config ?? []).some((w) => w.dynamic || w.value === 'config-env' || INCLUDE_CFG.test(w.value))) return blockMsg('runs with a config override the gate can\'t read (it could define the alias)');
   if ((p.moves ?? []).some((m) => m.sub === 'config')) return blockMsg('runs after a `git config` in the same command (it could have defined the alias)');
   const cfg = configMap(p.config);
   const seen = new Set();
@@ -1304,7 +1310,7 @@ function resolvePush(p) {
   if (mv) return { block: mv };
   // A `-c` override the gate can't read (non-literal, or --config-env from the environment) may set
   // push.recurseSubmodules, remote.*.push, ...: refuse it whatever the refspecs say.
-  const opaqueCfg = (p.config ?? []).find((w) => w.dynamic || w.value === 'config-env');
+  const opaqueCfg = (p.config ?? []).find((w) => w.dynamic || w.value === 'config-env' || INCLUDE_CFG.test(w.value));
   if (opaqueCfg) return { block: `\`git push\` has a config override the gate can't read (${opaqueCfg.value === 'config-env' ? '--config-env' : opaqueCfg.value}); pass it literally with -c, or drop it` };
   const positional = [];
   let remoteGiven = false; let del = false; let dry = false; let help = false; let all = false; let tags = false;
@@ -1333,7 +1339,10 @@ function resolvePush(p) {
       else if (['--all', '--mirror', '--branches'].includes(name)) all = true;
       else if (name === '--tags') tags = true;
       if (name === '--repo') remoteGiven = true;
-      if (PUSH_VALUE_LONG.has(name) && !v.includes('=')) j += 1;
+      if (PUSH_VALUE_LONG.has(name) && !v.includes('=')) {
+        if (args[j + 1]?.dynamic) return { block: `\`git push ${name}\` has a non-literal value (${args[j + 1].value}) that could change what it pushes; pass it literally` };
+        j += 1;
+      }
       continue;
     }
     if (/^-[A-Za-z0-9]/.test(v)) {
@@ -1343,7 +1352,13 @@ function resolvePush(p) {
         if (ch === 'd') del = true;
         if (ch === 'n') dry = true;
         if (ch === 'h') help = true;
-        if (PUSH_VALUE_SHORT.has(ch)) { if (c === v.length - 1) j += 1; break; }
+        if (PUSH_VALUE_SHORT.has(ch)) {
+          if (c === v.length - 1) {
+            if (args[j + 1]?.dynamic) return { block: `\`git push -${ch}\` has a non-literal value (${args[j + 1].value}); pass it literally` };
+            j += 1;
+          }
+          break;
+        }
       }
       continue;
     }

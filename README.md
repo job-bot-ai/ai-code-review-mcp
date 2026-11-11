@@ -299,7 +299,8 @@ worktree that has it checked out). Not gated: `--delete`/`-d`/`:branch`, tags on
 `--all`/`--mirror`/wildcard refspecs, non-literal refspecs or `cd`/`-C` targets, `GIT_DIR`/
 `GIT_CONFIG*` (incl. `GIT_CONFIG_GLOBAL`/`_SYSTEM`)/`HOME`/`XDG_CONFIG_HOME`/`--git-dir` (as a
 prefix, an `env` assignment, or exported earlier in the command, including into `bash -c`),
-`--config-env` and non-literal `-c` values, a push without a refspec when config may make it
+`--config-env`, `-c include.path`/`includeIf.*.path` and non-literal `-c` values or option values
+(`--repo $R`, `-o $X`), a push without a refspec when config may make it
 publish more than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`,
 or a `-c` override of those: name the refspec, `git push origin HEAD`), submodule-recursing
 pushes (`--recurse-submodules=on-demand|only`, `push.recurseSubmodules`, `submodule.recurse=true`),
