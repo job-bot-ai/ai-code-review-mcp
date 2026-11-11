@@ -315,6 +315,9 @@ const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep',
 // mention there is treated as data; inline code (-c/-e) that mentions gh pr create is opaque.
 const INTERPRETERS = new Set(['python', 'python3', 'node', 'perl', 'ruby', 'php']);
 const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+(create|new|ready)\b|markPullRequestReadyForReview/; // same boundary as the hook's pre-filter
+// `git ... push` somewhere in text handed to a program the gate can't follow (ssh, awk, python -c, a non-literal
+// command). Deliberately loose: it only decides whether to gate conservatively, never lets a push through.
+const PUSH_MENTION = /(^|[^A-Za-z0-9_-])git([^A-Za-z0-9_-][\s\S]*?)?[^A-Za-z0-9_-]push([^A-Za-z0-9_-]|$)/;
 // The GraphQL mutation that takes a PR out of draft: only `gh pr ready` may do that.
 const READY_MUTATION = /markPullRequestReadyForReview/;
 const API_CLIENTS = new Set(['curl', 'wget', 'http', 'https', 'xh']);
@@ -453,6 +456,9 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   // A push changes the remote, not the shell, so it isn't scoped to a subshell.
   const pushes = inherit.pushes ?? []; // shared with nested scripts, so their pushes count too
   const headMoves = inherit.headMoves ?? []; // git commands that change HEAD's commit (shared too)
+  // Every `git push` that runs, wherever it runs (shared with nested scripts too), for the pre-push gate:
+  // { dir (null = unknown), args, moves (head-moving git commands before it), why (a reason to block) }.
+  const gitPushes = inherit.gitPushes ?? [];
   let pipeText = null; // what the previous pipeline element feeds on stdin
   const braces = [];
   let cond = 0;
@@ -463,15 +469,20 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   let prevOp = ';';
   let words = [];
   const found = [];
+  found.gitPushes = gitPushes;
   const scope = () => scopes[scopes.length - 1];
+  // A `git push` passed to something the gate can't follow (ssh, awk system(), python -c): gated in `dir`.
+  const opaquePush = (what, dir) => { found.opaquePush ??= { what, dir: funcDepth > 0 ? null : dir }; };
 
   // Code that runs in a subshell ($(...), `...`, <(...), bash -c, eval): gate any
   // gh pr create inside it, starting from the current directory.
   const nested = (script, dir, ghRepo = scope().ghRepo) => {
     const s = scope();
-    const inner = findPrCreates(script, dir, env, { ghRepo, cdpath: s.cdpath, pushes, headMoves });
+    // A function body runs later, from wherever it's called: everything in it has an unknown directory.
+    const inner = findPrCreates(script, funcDepth > 0 ? null : dir, env, { ghRepo, cdpath: s.cdpath, pushes, headMoves, gitPushes });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
+    if (inner.opaquePush) found.opaquePush ??= inner.opaquePush;
     if (inner.readyMutation) found.readyMutation = true;
   };
   const opaque = (why) => { found.opaque ??= why; };
@@ -507,11 +518,12 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     s.dir = s.dirStack.length ? s.dirStack.pop() : null;
   };
 
-  const recordPush = (cmd, base = scope().dir) => {
+  const recordPush = (cmd, base = scope().dir, envRepo = false) => {
     // `git [-C dir] push [opts] <remote> <src>:<dst> ...` — lets `--head <dst>` be checked at
     // <src> even though the push (and its remote-tracking ref) hasn't happened yet.
     let k = 1;
     let gdir = base;
+    let otherRepo = envRepo; // GIT_DIR=/--git-dir/--work-tree: the repo isn't the directory's
     while (k < cmd.length && cmd[k].value.startsWith('-')) {
       const v = cmd[k].value;
       if (v === '-C') {
@@ -520,9 +532,14 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         k += 2;
         continue;
       }
+      if (/^--(git-dir|work-tree)(=|$)/.test(v)) otherRepo = true;
       k += ['-c', '--git-dir', '--work-tree', '--namespace'].includes(v) ? 2 : 1;
     }
     const sub = cmd[k]?.dynamic ? null : cmd[k]?.value;
+    if (cmd[k]?.dynamic) { // `git $SUB ...` may be a push: never let it through unchecked
+      gitPushes.push({ dir: gdir, args: [], moves: [], why: `\`git ${cmd[k].value}\` has a non-literal subcommand, so the gate can't tell whether it pushes. Spell it out: \`git push ...\`` });
+      return;
+    }
     if (sub && HEAD_MOVERS.has(sub)) {
       // Creating a branch at HEAD (`checkout -b x`, `switch -c x`) keeps the commit.
       const rest = cmd.slice(k + 1).map((w) => w.value);
@@ -533,6 +550,8 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       return;
     }
     if (sub !== 'push') return;
+    gitPushes.push({ dir: otherRepo ? null : gdir, args: cmd.slice(k + 1), moves: headMoves.filter((m) => !m.pushOnly),
+      why: otherRepo ? '`git push` names another repository (GIT_DIR, --git-dir or --work-tree), so the gate can\'t tell which commit it pushes. Run it from the checkout: `cd /path/to/checkout && git push ...`' : null });
     headMoves.push({ dir: gdir, sub, pushOnly: true }); // moves the PR's head, not local HEAD
     const positional = [];
     const rest = cmd.slice(k + 1);
@@ -671,10 +690,17 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // a `cd` that way is out of scope for this speed-bump; see the README.
     const stdinCode = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
     const mentioned = () => cmd.some((w) => MENTION.test(w.heredoc ? w.heredoc.body ?? '' : w.value));
-    if (cmd[0].dynamic) { if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`); return; }
+    // A `git push` in this command's words or in the text it is handed (to run somewhere the gate can't follow).
+    const pushMentioned = () => PUSH_MENTION.test(cmd.map((w) => (w.heredoc ? w.heredoc.body ?? '' : w.value)).join(' ')) ||
+      (fromPipe !== null && PUSH_MENTION.test(fromPipe));
+    if (cmd[0].dynamic) {
+      if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`);
+      if (pushMentioned()) opaquePush(`\`${cmd[0].value}\` (a non-literal command)`, here);
+      return;
+    }
     const c0 = progName(cmd[0]);
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
-    if (c0 === 'git') { recordPush(cmd, here); return; }
+    if (c0 === 'git') { recordPush(cmd, here, assigns.some((w) => /^GIT_(DIR|WORK_TREE)=/.test(w.value))); return; }
     // An API client (runners already unwrapped above) that sends the ready mutation in its
     // arguments, a heredoc, a here-string or a pipe. Only for a runner whose arguments can't be
     // parsed is every argument scanned for a client, and then a `gh pr create|ready` among its
@@ -732,7 +758,16 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     if (INTERPRETERS.has(c0)) {
       const inline = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*[ce]$/.test(w.value));
       if (inline > 0 && MENTION.test(cmd[inline + 1]?.value ?? '')) opaque(`${c0} ${cmd[inline].value}`);
+      if (inline > 0 && PUSH_MENTION.test(cmd[inline + 1]?.value ?? '')) opaquePush(`${c0} ${cmd[inline].value}`, here);
       return;
+    }
+    // A program that launches `git ...` from its arguments (`xargs git push`, `op run -- git push`, `ssh host git
+    // push`): gate the push here, conservatively. Data sinks (echo, grep, ...) never run their arguments.
+    const kGitArg = DATA_SINKS.has(c0) || c0 === 'awk' || c0 === 'gawk' || c0 === 'sed' ? -1
+      : cmd.findIndex((w, idx) => idx > 0 && !w.dynamic && progName(w) === 'git');
+    if (kGitArg > 0) {
+      const chdir = RUNNERS.has(c0) && cmd.slice(1, kGitArg).some((w) => /^(--chdir|-[A-Za-z]*[CD])/.test(w.value));
+      recordPush(cmd.slice(kGitArg), chdir ? null : here);
     }
     if (RUNNERS.has(c0)) {
       // `timeout 60 gh pr create ...`, `env -C dir GH_REPO=o/r gh pr create ...`
@@ -755,6 +790,10 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // sed/awk only run commands via awk system()/print|"cmd" or sed's e command/flag.
     if (c0 === 'awk' || c0 === 'gawk' || c0 === 'sed') {
       const sedRuns = /(^|[;{}\s])e(\s|;|$)|\/[A-Za-z0-9]*e[A-Za-z0-9]*(\s|;|}|$)/;
+      if (pushMentioned()) { // conservative: any awk/sed text that mentions git push may run it
+        const runs = c0 === 'sed' ? cmd.slice(1).some((w) => sedRuns.test(w.value)) : cmd.slice(1).some((w) => awkRuns(w.value));
+        if (runs) opaquePush(c0, here);
+      }
       if (!mentioned()) return;
       if (c0 === 'sed') { if (cmd.slice(1).some((w) => sedRuns.test(w.value))) opaque(c0); return; }
       // awk: judge only the program text, not options like -F'|' or -v x=y.
@@ -785,6 +824,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // arguments, a heredoc or a pipe) might run it. Script interpreters were handled above.
     const joined = cmd.slice(1).filter((w) => !w.heredoc).map((w) => w.value).join(' ');
     if (mentioned() || MENTION.test(joined) || (fromPipe !== null && MENTION.test(fromPipe))) opaque(c0);
+    if (kGitArg < 0 && pushMentioned()) opaquePush(c0, here);
   };
 
   const endList = (op) => {
@@ -1093,6 +1133,131 @@ export function resolveTargets(command, cwd, env = process.env) {
   return allHelp && !targets.length ? { status: 'help' } : { status: 'ok', targets };
 }
 
+// ── Pre-push gate ────────────────────────────────────────────────────────────
+
+// Used only when the command can't be parsed: could the push run somewhere other than the session cwd?
+const PUSH_RISKY = /(^|[\s;&|(){}'"`])(cd|pushd|popd)(\s|$)|(^|\s)(-C|--git-dir|--work-tree)([\s=]|$)|GIT_DIR|GIT_WORK_TREE|CDPATH/;
+// `git push` options that take a separate value, and the short ones that take one (attached or next word).
+const PUSH_VALUE_LONG = new Set(['--repo', '--push-option', '--receive-pack', '--exec']);
+const PUSH_VALUE_SHORT = new Set(['o']);
+
+/**
+ * Which commits does one `git push` publish? Returns { skip } (nothing to gate: help, dry run, deletes, tags only),
+ * { block: reason }, or { targets: [{ dir, rev }] }: each commit pushed to a branch, with the checkout whose
+ * review-gate markers hold its pre-push review.
+ */
+function resolvePush(p) {
+  if (p.why) return { block: p.why };
+  if (p.dir === null) {
+    return { block: "can't tell which repo a `git push` runs in: a `cd` or `-C` before it isn't a literal path, or only runs conditionally. Use `cd /literal/path && git push ...` or `git -C /literal/path push ...`" };
+  }
+  if (!existsSync(p.dir) || !statSync(p.dir).isDirectory()) return { block: `\`git push\` would run in ${p.dir}, which doesn't exist` };
+  const top = git(p.dir, 'rev-parse', '--show-toplevel');
+  if (top === null) return { skip: true, note: `${p.dir} isn't a git checkout; push not gated` };
+  const repoOf = (d) => (d ? git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel') : null);
+  const here = repoOf(top);
+  const moved = (p.moves ?? []).find((m) => m.dir === null || repoOf(m.dir) === here);
+  if (moved) {
+    return { block: `\`git ${moved.sub}\` runs before \`git push\` in the same command, so the push would publish a commit that doesn't exist yet and can't have had its pre-push review. Commit first, run \`review-gate prepush\`, then push on its own.` };
+  }
+  const positional = [];
+  let remoteGiven = false; let del = false; let dry = false; let help = false; let all = false; let tags = false;
+  const args = p.args ?? [];
+  for (let j = 0; j < args.length; j++) {
+    const w = args[j];
+    const v = w.value;
+    if (/^\d*[<>]/.test(v)) { if (/^\d*[<>]+&?$/.test(v)) j += 1; continue; } // a redirection, not an argument
+    if (v === '--') { positional.push(...args.slice(j + 1)); break; }
+    if (w.dynamic) { // could expand to --all, another refspec, ...
+      return { block: `\`git push\` has a non-literal argument (${v}) that could change what it pushes; pass it literally` };
+    }
+    if (v.startsWith('--')) {
+      const name = v.split('=')[0];
+      if (name === '--delete') del = true;
+      else if (name === '--dry-run') dry = true;
+      else if (name === '--help') help = true;
+      else if (['--all', '--mirror', '--branches'].includes(name)) all = true;
+      else if (name === '--tags') tags = true;
+      if (name === '--repo') remoteGiven = true;
+      if (PUSH_VALUE_LONG.has(name) && !v.includes('=')) j += 1;
+      continue;
+    }
+    if (/^-[A-Za-z0-9]/.test(v)) {
+      for (let c = 1; c < v.length; c++) {
+        const ch = v[c];
+        if (ch === 'd') del = true;
+        if (ch === 'n') dry = true;
+        if (ch === 'h') help = true;
+        if (PUSH_VALUE_SHORT.has(ch)) { if (c === v.length - 1) j += 1; break; }
+      }
+      continue;
+    }
+    positional.push(w);
+  }
+  if (help || dry || del) return { skip: true }; // nothing is published (`--delete` removes refs only)
+  if (all) return { block: '`git push --all/--mirror/--branches` publishes every branch at once; push one branch (`git push origin HEAD`) so the gate can check its pre-push review' };
+  const specs = remoteGiven ? positional : positional.slice(1);
+  const headRev = () => git(top, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}');
+  if (!specs.length) {
+    if (tags) return { skip: true }; // `git push --tags [remote]`: tags only
+    const rev = headRev(); // the current branch (push.default)
+    return rev ? { targets: [{ dir: top, rev }] } : { skip: true, note: `${top} has no commits; push not gated` };
+  }
+  const current = git(top, 'symbolic-ref', '--quiet', '--short', 'HEAD');
+  const targets = [];
+  for (let j = 0; j < specs.length; j++) {
+    const s = specs[j];
+    if (s.dynamic) return { block: `\`git push\` has a non-literal refspec (${s.value}), so the gate can't tell which commit it publishes; pass it literally` };
+    const r = s.value.replace(/^\+/, '');
+    if (r === 'tag') { j += 1; continue; } // `git push origin tag v1`
+    if (r === ':' || r.includes('*')) return { block: `\`git push ${r}\` publishes several branches at once; push one branch so the gate can check its pre-push review` };
+    const colon = r.indexOf(':');
+    const src = colon >= 0 ? r.slice(0, colon) : r;
+    const dst = colon >= 0 ? r.slice(colon + 1) : r;
+    if (!src) continue; // `:branch` deletes it
+    if (src.startsWith('refs/tags/') || dst.startsWith('refs/tags/')) continue;
+    const isBranch = src === 'HEAD' || src.startsWith('refs/') || git(top, 'rev-parse', '--verify', '--quiet', `refs/heads/${src}`) !== null;
+    if (!isBranch && git(top, 'rev-parse', '--verify', '--quiet', `refs/tags/${src}`) !== null) continue; // a tag by name
+    const rev = git(top, 'rev-parse', '--verify', '--quiet', `${src}^{commit}`);
+    if (!rev) return { block: `can't resolve \`${src}\` (pushed by \`git push\`) to a commit in ${top}, so its pre-push review can't be checked` };
+    let dir = top;
+    const branch = src.replace(/^refs\/heads\//, '');
+    if (src !== 'HEAD' && branch !== current) dir = worktreeFor(top, branch) ?? top; // markers live in that worktree
+    targets.push({ dir, rev });
+  }
+  return targets.length ? { targets } : { skip: true };
+}
+
+/** Every commit the command would push to a branch, for the pre-push gate (status ok/none/block/error). */
+export function resolvePushes(command, cwd, env = process.env) {
+  let hits;
+  try {
+    hits = findPrCreates(command, cwd, env);
+  } catch (err) {
+    return { status: 'error', reason: String(err?.message ?? err), risky: PUSH_RISKY.test(command) };
+  }
+  const targets = [];
+  const notes = [];
+  const add = (t, note = null) => {
+    const old = targets.find((x) => x.dir === t.dir && x.rev === t.rev);
+    if (!old) targets.push({ ...t, note });
+  };
+  for (const p of hits.gitPushes ?? []) {
+    const r = resolvePush(p);
+    if (r.block) return { status: 'block', reason: r.block };
+    if (r.note) notes.push(r.note);
+    for (const t of r.targets ?? []) add(t);
+  }
+  if (hits.opaquePush) {
+    const { what, dir } = hits.opaquePush;
+    if (dir === null) return { status: 'block', reason: `\`git push\` is passed to ${what}, which the gate can't follow, from a directory it can't tell. Run the push directly: \`cd /literal/path && git push ...\`` };
+    const top = git(dir, 'rev-parse', '--show-toplevel');
+    const rev = top && git(top, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}');
+    if (rev) add({ dir: top, rev }, `git push is passed to ${what}, which the gate can't follow; checked ${top} HEAD for it`);
+  }
+  return targets.length ? { status: 'ok', targets, notes } : { status: 'none', notes };
+}
+
 // Run as a script? Compare real paths: node resolves symlinks for import.meta.url but
 // argv[1] keeps the path it was invoked by (e.g. a symlinked install dir).
 function isMain() {
@@ -1105,9 +1270,10 @@ function isMain() {
 
 if (isMain()) {
   const cwd = process.argv[2] || process.cwd();
+  const mode = process.argv[3] === '--push' ? resolvePushes : resolveTargets;
   let result;
   try {
-    result = resolveTargets(readFileSync(0, 'utf8'), cwd);
+    result = mode(readFileSync(0, 'utf8'), cwd);
   } catch (err) {
     result = { status: 'error', reason: String(err?.message ?? err), risky: true };
   }

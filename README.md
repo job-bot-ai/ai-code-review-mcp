@@ -104,7 +104,9 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
 2. every **primary** reviewer has a pass **or** an announced skip. Primaries are
    `kodus coderabbit` until 2026-11-19 and `kodus greptile` from then (UTC);
    override with `REVIEW_GATE_PRIMARY` (`REVIEW_GATE_REQUIRED` is read as a legacy alias);
-3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback).
+3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback);
+4. the commit has a **pre-push review** (`review-gate prepush` passed, or its findings were
+   declined with `prepush-accept`, which every check announces). See the next section.
 
 Reviewers: `kodus`, `coderabbit`, `greptile` (primaries), `codex` (fallback), `self`
 (the agent's own thorough review, last resort). `agy` stays valid for old records. `kimi`
@@ -229,8 +231,8 @@ and prints "no output produced". Neither case is a review.
 **`kimi` (retired).** The `kimi-review` helper and its `kimi` pass were removed with the
 in-repo `ollama-review` workflow (job_bot_ai#228); Kodus runs DeepSeek on every PR instead.
 
-Scope/safety: only `gh pr create`, `gh pr ready` and the GraphQL ready mutation are
-gated (not other clients or the web UI). The hook requires `jq` (to extract the command from the payload) and
+Scope/safety: only `gh pr create`, `gh pr ready`, the GraphQL ready mutation and `git push`
+are gated (not other clients or the web UI). The hook requires `jq` (to extract the command from the payload) and
 hands any command containing the words `gh pr create` to the resolver above, which
 gates real invocations wherever they run and lets data-only mentions (echo, grep,
 commit messages, heredocs) through. Without `node`, it falls back to gating only
@@ -239,7 +241,63 @@ commit messages, heredocs) through. Without `node`, it falls back to gating only
 rather than wedging your shell — so it is a strong speed-bump, not a hard security
 boundary.
 
-Tests: `npm test` (resolver unit tests and hook integration tests against throwaway repos).
+Tests: `npm test` (resolver unit tests, and hook and `prepush` integration tests against throwaway
+repos with stub `codex`/`claude` binaries).
+
+## Pre-push review — review the whole change before every push
+
+Fixes pushed one at a time let the PR bots find the next problem on the next push (one PR took
+44 review threads). So before **every** push to a PR branch the whole change is reviewed against
+the repo's punch list, and what it finds is fixed first:
+
+```bash
+review-gate prepush [--base <ref>]   # default base: the PR's base (gh pr view), else origin/main
+# fix every P0-P2 finding (and the same bug class elsewhere), commit, run it again, then push
+review-gate prepush-accept --reason "why each P0-P2 finding is not being fixed"   # declining, for this commit only
+review-gate status                   # shows the prepush state of HEAD
+```
+
+`prepush` reviews `git diff <base>...HEAD` (the diff, the instructions in
+`prompts/prepush-review.md` and `review/PUNCH_LIST.md` when the repo has one all go into the
+prompt) with **Codex** (`codex review -`, prompt mode: `codex review --base` can't take custom
+instructions, so it could carry neither the punch list nor the answer format). If Codex can't run
+(non-zero exit or timeout, any `ERROR:` line such as the usage limit, quota or login error, or no
+final message), it falls back to a **read-only Claude** review: `claude -p --output-format json`
+with only `Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*)` allowed and
+`Edit,Write,MultiEdit,NotebookEdit` disallowed. Time limit per reviewer:
+`REVIEW_GATE_PREPUSH_TIMEOUT` seconds (default 1500).
+
+A run only counts as **completed** when the reviewer exited 0 (Claude: `is_error` false and
+`subtype` success) and its answer is either well-formed findings (each `[P0]`..`[P3]` on its own
+line, one tag per line, optionally after `- `) or a final `No findings.` with no P0-P3 mention.
+Anything else (an error, the usage-limit text, an empty or cut-off answer, a `**[P1]**` or two
+tags on a line) is **FAILED**: nothing is recorded, the reason is printed and it exits 4. A failed
+run can't be accepted either. Findings Codex printed before it failed still count.
+
+- No P0-P2 findings: a `prepush` marker is recorded for HEAD (bound to the commit like every other
+  marker; a new commit needs a new review), exit 0.
+- P0-P2 findings: nothing is recorded, exit 1. Fix them, or decline them explicitly with
+  `prepush-accept --reason "..."` (it needs a completed review of HEAD with findings; the marker
+  keeps the reason, and `check`, `check-prepush` and the hook announce it with the findings file).
+- The full output of every run is kept in `$GIT_DIR/review-gate/prepush-<sha>.txt`.
+
+**The hook blocks `git push`** until each commit it publishes to a branch has a `prepush` marker.
+The same resolver as the PR gate finds the push wherever it runs: `cd`/`git -C <dir>`, chained
+commands, env prefixes, runners (`timeout`, `env`, `sudo`, `xargs`), `bash -c`, heredocs, and the
+credential-helper form `git -c credential.helper= -c credential.helper='!f(){ ...; }; f' push -q -u origin HEAD`.
+It checks the commit actually pushed (`git push origin feat/other` checks `feat/other`, in the
+worktree that has it checked out). Not gated: `--delete`/`-d`/`:branch`, tags only (`--tags`,
+`tag v1`, `refs/tags/...`), `--dry-run`, `--help`, and outside a git repo. Blocked outright:
+`--all`/`--mirror`/wildcard refspecs, non-literal refspecs or `cd`/`-C` targets, `GIT_DIR`/
+`--git-dir`, and a commit made in the same command as the push. A push handed to something the
+gate can't follow (`ssh host 'git push'`, `python -c`) is checked against HEAD of the directory it
+runs from. Git aliases (`git -c alias.p=push p`) are not followed.
+
+**Escape hatch (Tim only).** `REVIEW_GATE_PREPUSH=off` in the environment Claude Code itself runs
+in (e.g. `env` in `~/.claude/settings.json`, or exported before starting `claude`) turns the push
+gate off. As a command prefix (`REVIEW_GATE_PREPUSH=off git push`) it does nothing. Every push it
+lets through is logged to `${XDG_STATE_HOME:-~/.local/state}/review-gate/prepush-bypass.log` and
+announced in the session. The block message never mentions it.
 
 ## Env overrides
 
@@ -248,6 +306,9 @@ Tests: `npm test` (resolver unit tests and hook integration tests against throwa
 - `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus coderabbit`
   until 2026-11-19, `kodus greptile` from then; valid: `kodus coderabbit greptile codex self agy`)
 - `REVIEW_GATE_MIN` — how many different reviewers must pass (default 2)
+- `REVIEW_GATE_PREPUSH_TIMEOUT` — seconds per pre-push reviewer run (default 1500);
+  `REVIEW_GATE_PREPUSH_MAX_DIFF` — largest diff `prepush` reviews in one prompt (default 600000 bytes)
+- `REVIEW_GATE_PREPUSH=off` — see the escape hatch above
 
 ## Headless / remote auth (CodeRabbit)
 

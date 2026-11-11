@@ -17,7 +17,12 @@ mkrepo() { # mkrepo <dir> <owner/repo>
   git init -q -b main "$1" && git -C "$1" remote add origin "https://github.com/$2.git"
   git -C "$1" commit -q --allow-empty -m init
 }
-green() { (cd "$1" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null); }
+# A pre-push review recorded for HEAD (the marker `review-gate prepush` writes; prepush itself is tested below).
+prepushed() {
+  local h gd; h="$(git -C "$1" rev-parse HEAD)"; gd="$(git -C "$1" rev-parse --absolute-git-dir)"
+  mkdir -p "$gd/review-gate" && printf '%s main 2026-11-11T00:00:00Z pass origin/main codex\n' "$h" >"$gd/review-gate/prepush"
+}
+green() { (cd "$1" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null) && prepushed "$1"; }
 run() { # run <cwd> <command> → sets rc, out, err
   local payload; payload="$(jq -cn --arg c "$2" --arg d "$1" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
   out="$(printf '%s' "$payload" | bash "$hook" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
@@ -58,7 +63,7 @@ expect "record-skip without a reason is refused" 2
 (cd "$T/c" && bash "$gate" record-skip coderabbit --reason "not installed on this repo" >/dev/null)
 run "$T/a" "cd $T/c && gh pr create --fill"
 expect "a skipped primary without a replacement pass is not enough" 2 stderr "1 of 2 review passes"
-(cd "$T/c" && bash "$gate" record codex >/dev/null)
+(cd "$T/c" && bash "$gate" record codex >/dev/null) && prepushed "$T/c"
 run "$T/a" "cd $T/c && gh pr create --fill"
 expect "a skipped primary replaced by codex passes, and the skip is announced" 0 stdout "coderabbit was SKIPPED"
 
@@ -75,17 +80,17 @@ expect "a primary with neither a pass nor a skip blocks, even with two passes" 2
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "self only counts after codex passed or was skipped" 2 stderr "self review only counts after codex"
 mkrepo "$T/d3" acme/delta3
-(cd "$T/d3" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null && bash "$gate" record self >/dev/null)
+(cd "$T/d3" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null && bash "$gate" record self >/dev/null) && prepushed "$T/d3"
 run "$T/a" "cd $T/d3 && gh pr create --fill"
 expect "an extra, ineligible self pass doesn't invalidate two primary passes" 0
-(cd "$T/d" && bash "$gate" record-skip codex --reason "codex quota exhausted today" >/dev/null)
+(cd "$T/d" && bash "$gate" record-skip codex --reason "codex quota exhausted today" >/dev/null) && prepushed "$T/d"
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "coderabbit + self with kodus and codex skipped passes" 0 stdout "codex was SKIPPED"
 (cd "$T/d" && bash "$gate" clear >/dev/null && bash "$gate" record-skip kodus --reason "kodus errored on this PR" >/dev/null \
   && bash "$gate" record-skip coderabbit --reason "no review within 30 minutes" >/dev/null && bash "$gate" record codex >/dev/null)
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "skips never count as passes (codex alone is one review)" 2 stderr "1 of 2 review passes"
-(cd "$T/d" && bash "$gate" record self >/dev/null)
+(cd "$T/d" && bash "$gate" record self >/dev/null) && prepushed "$T/d"
 run "$T/a" "cd $T/d && gh pr create --fill"
 expect "both primaries skipped: codex + self is two reviews" 0
 mkrepo "$T/d2" acme/delta2
