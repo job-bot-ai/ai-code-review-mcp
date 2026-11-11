@@ -448,6 +448,32 @@ expect "an alias that pushes, defined only in the checkout git runs in, is block
 run "$H" "git status"
 expect "a plain git command is not a push" 0
 [ -z "$out$err" ] && ok "a plain git command passes silently" || bad "git status printed: $out$err"
+git -C "$H" branch -q -f feat/old-reviewed HEAD
+git -C "$H" checkout -q -b feat/unrev && git -C "$H" commit -q --allow-empty -m unreviewed-on-branch
+(cd "$H" && git checkout -q feat/old-reviewed && git checkout -q feat/unrev)
+gdH="$(git -C "$H" rev-parse --absolute-git-dir)"; cp "$gdH/review-gate/prepush" "$T/pp.bak"
+printf '%s feat/old-reviewed 2026-11-11T00:00:00Z pass origin/main codex\n' "$(git -C "$H" rev-parse feat/old-reviewed)" >"$gdH/review-gate/prepush"
+run "$H" "git checkout -q -B feat/old-reviewed && git push origin feat/old-reviewed"
+expect "checkout -B resets a reviewed branch to an unreviewed HEAD: the push is blocked" 2 stderr "\`git checkout\` runs before \`git push\`"
+run "$H" "git switch -q -C feat/old-reviewed && git push origin feat/old-reviewed"
+expect "switch -C before the push is blocked too" 2 stderr "\`git switch\` runs before \`git push\`"
+git -C "$H" checkout -q feat/x && git -C "$H" branch -q -D feat/unrev feat/old-reviewed; cp "$T/pp.bak" "$gdH/review-gate/prepush"
+run "$H" "git config remote.origin.push refs/heads/feat/other && git push"
+expect "a git config write before the push is blocked (the gate reads the old config)" 2 stderr "\`git config\` runs before \`git push\`"
+run "$H" "git config --get remote.origin.url; git push origin HEAD"
+expect "a git config read before the push doesn't block it (reviewed → allowed)" 0
+run "$H" "git -c submodule.recurse=true push origin HEAD"
+expect "-c submodule.recurse=true (on-demand submodule push) is blocked" 2 stderr "submodule commits"
+git -C "$H" config submodule.recurse true
+run "$H" "git push origin HEAD"
+expect "submodule.recurse=true in config is blocked" 2 stderr "submodule commits"
+run "$H" "git -c push.recurseSubmodules=check push origin HEAD"
+expect "push.recurseSubmodules=check overrides submodule.recurse (reviewed → allowed)" 0
+git -C "$H" config --unset submodule.recurse
+git -C "$H" commit -q --allow-empty -m "unreviewed for the escape test"
+run "$H" "printf 'true\\ngit push origin HEAD\\n' | bash"
+expect "a git push after a \\n escape piped to bash reaches the gate" 2 stderr "BLOCKED by the pre-push review gate"
+git -C "$H" reset -q --hard HEAD~1
 run "$H" "git -c alias.p=push p origin HEAD"
 expect "a -c alias that pushes is blocked" 2 stderr "is an alias that pushes"
 git -C "$H" config alias.pu "push --force"

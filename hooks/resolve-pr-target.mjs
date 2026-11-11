@@ -305,6 +305,15 @@ const CONTINUERS = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
 // git subcommands that can change which commit HEAD is (so the reviewed commit isn't the PR's).
 const HEAD_MOVERS = new Set(['commit', 'merge', 'rebase', 'reset', 'cherry-pick', 'revert', 'pull', 'am', 'checkout', 'switch']);
+/** Does `git config <args>` write (set, unset, add, rename, edit) rather than read? */
+function configWrite(args) {
+  if (args.some((v) => /^(--get|--get-all|--get-regexp|--get-urlmatch|--get-color|--get-colorbool|-l|--list)$/.test(v))) return false;
+  if (args.some((v) => /^(--unset|--unset-all|--add|--replace-all|--rename-section|--remove-section|--edit|-e)$/.test(v))) return true;
+  const pos = args.filter((v, i) => !v.startsWith('-') && !/^(--file|-f|--blob|--type|--default|--comment)$/.test(args[i - 1] ?? ''));
+  if (['set', 'unset', 'rename-section', 'remove-section', 'edit'].includes(pos[0])) return true;
+  if (['get', 'list'].includes(pos[0])) return false;
+  return pos.length >= 2; // `git config key value`
+}
 /** Does `git <sub> <args>` change a ref (a branch, tag or HEAD itself) rather than only read it? */
 function refMutation(sub, args) {
   const pos = args.filter((v) => !v.startsWith('-'));
@@ -577,10 +586,16 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         rest.some((v) => /^-[bBcC]$/.test(v)) && rest.filter((v) => !v.startsWith('-')).length <= 1;
       const restoreFiles = sub === 'checkout' && rest.includes('--');
       if (!newBranchAtHead && !restoreFiles) headMoves.push({ dir: gdir, sub });
+      // `checkout -B x` / `switch -C x` keep HEAD's commit but reset branch x to it: a later push of x publishes
+      // HEAD, not x's old commit. That only matters to the push gate (the PR gate checks HEAD).
+      else if (newBranchAtHead && rest.some((v) => /^-[BC]$/.test(v))) headMoves.push({ dir: gdir, sub, pushOnlyEffect: true });
       return;
     }
     // Ref mutations change which commit a later `git push <ref>` (or `--head <ref>`) publishes, without moving HEAD.
     if (sub && refMutation(sub, cmd.slice(k + 1).map((w) => w.value))) { headMoves.push({ dir: gdir, sub }); return; }
+    // A config write (remote.<name>.push, an alias, push.recurseSubmodules, ...) changes what a later push does,
+    // and the gate reads the config as it is before the command runs.
+    if (sub === 'config' && configWrite(cmd.slice(k + 1).map((w) => w.value))) { headMoves.push({ dir: gdir, sub, pushOnlyEffect: true }); return; }
     // Not a built-in: it may be an alias (`git p` with alias.p=push, or `-c alias.p=push`), checked at resolve time.
     if (sub && !GIT_BUILTINS.has(sub)) gitPushes.push({ alias: sub, dir: gdir, config, args: [], moves: [] });
     if (sub !== 'push') return;
@@ -1058,7 +1073,7 @@ function resolveOne(hit) {
   // A commit made earlier in this same command (git commit/merge/rebase/pull...) is what
   // the PR will contain, but the hook runs before it exists, so it can't have been reviewed.
   const repoOf = (d) => (d ? git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel') : null);
-  const moved = (hit.headMoves ?? []).find((m) => (!m.pushOnly || sub === 'ready') &&
+  const moved = (hit.headMoves ?? []).find((m) => !m.pushOnlyEffect && (!m.pushOnly || sub === 'ready') &&
     (m.dir === null || repoOf(m.dir) === repoOf(dir)));
   if (moved?.pushOnly) {
     return { block: `\`git push\` runs before \`gh pr ready\` in the same command, so the PR's head would be a commit the gate can't look up yet. Push first, make sure the reviews cover the pushed commit, then run gh pr ready on its own.` };
@@ -1264,9 +1279,14 @@ function resolvePush(p) {
   }
   if (help || dry || del) return { skip: true }; // nothing is published (`--delete` removes refs only)
   if (submodules === null) {
-    const cfg = (p.config ?? []).filter((w) => /^push\.recursesubmodules=/i.test(w.value)).pop();
-    const v = cfg ? cfg.value.split('=')[1] : git(top, 'config', '--get', 'push.recurseSubmodules');
-    submodules = v !== null && /^(on-demand|only)$/i.test(v);
+    // push.recurseSubmodules, else submodule.recurse=true (which means on-demand); `-c` overrides win.
+    const cfgOf = (key) => {
+      const c = (p.config ?? []).filter((w) => w.value.toLowerCase().startsWith(`${key.toLowerCase()}=`)).pop();
+      return c ? c.value.slice(key.length + 1) : git(top, 'config', '--get', key);
+    };
+    const v = cfgOf('push.recurseSubmodules');
+    if (v !== null) submodules = /^(on-demand|only)$/i.test(v);
+    else submodules = /^(true|yes|on|1)$/i.test(cfgOf('submodule.recurse') ?? '');
   }
   if (submodules) return { block: '`git push` would also push submodule commits (--recurse-submodules=on-demand/only, or push.recurseSubmodules), which the pre-push review never saw. Push the submodule on its own first, then this branch with --recurse-submodules=check' };
   if (all) return { block: '`git push --all/--mirror/--branches` publishes every branch at once; push one branch (`git push origin HEAD`) so the gate can check its pre-push review' };

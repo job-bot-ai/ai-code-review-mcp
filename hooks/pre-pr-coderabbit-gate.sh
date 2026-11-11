@@ -47,7 +47,7 @@ printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([
 # Any `git` command goes to the resolver: it finds pushes however they are spelled (`git -c credential.helper='!f(){
 # ...; }; f' push`, `git -C dir push`) and looks up aliases (`git p` with alias.p=push) in the checkout where git
 # runs. Commands without git skip it.
-printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])git([^[:alnum:]_-]|$)' && want_push=1
+printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])git([^[:alnum:]_-]|$)' && want_push=1   # `\n`/`\t` escapes count as separators
 [ "$want_pr" = 1 ] || [ "$want_push" = 1 ] || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

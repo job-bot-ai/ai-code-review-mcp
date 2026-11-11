@@ -303,7 +303,10 @@ than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`
 override of those): name the refspec (`git push origin HEAD`). A tag pushed to a branch
 (`v1:release`) is checked like a branch push. Also blocked: `--recurse-submodules=on-demand|only`
 or `push.recurseSubmodules` set so (submodule commits weren't reviewed), and a git alias that
-pushes (`git p` with `alias.p=push` in config or `-c`; the hook looks for pushing aliases in the global and session-repo config). A push handed to something the
+pushes (`git p` with `alias.p=push` in config or `-c`, looked up in the checkout git runs in), and a
+ref or config write earlier in the same command (`git branch -f`, `update-ref`, `checkout -B`, `git
+config remote.origin.push ...`): the gate resolves pushes against refs and config as they are before
+the command runs. `submodule.recurse=true` counts as on-demand submodule pushing. A push handed to something the
 gate can't follow (`ssh host 'git push'`, `python -c`) is checked against HEAD of the directory it
 runs from.
 
