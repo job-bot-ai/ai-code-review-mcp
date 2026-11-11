@@ -222,7 +222,14 @@ test('git commands that move HEAD earlier in the command are recorded', () => {
   assert.deepEqual(hits('git pull --rebase; git -C /r merge main; gh pr create')[0].headMoves.map((m) => m.sub), ['pull', 'merge']);
   assert.deepEqual(hits('git checkout -b feat && git switch -c x && git checkout -- f && gh pr create')[0].headMoves, []);
   // A push doesn't move HEAD; it is recorded push-only (it moves the PR head, which matters for gh pr ready).
-  assert.deepEqual(hits('git add . && git push && gh pr create')[0].headMoves, [{ dir: '/session', sub: 'push', pushOnly: true }]);
+  // `git add` only matters to the push gate (recorded with pushOnlyEffect, ignored by the PR gate).
+  assert.deepEqual(hits('git add . && git push && gh pr create')[0].headMoves.filter((m) => !m.pushOnlyEffect), [{ dir: '/session', sub: 'push', pushOnly: true }]);
+});
+
+test('the push gate records every non-read-only git command before a push', () => {
+  const effects = (cmd) => findPrCreates(cmd, '/session', ENV).gitPushes.filter((p) => p.args).at(-1).moves.map((m) => m.sub);
+  assert.deepEqual(effects('git status; git log -1; git diff; git branch --show-current; git config --get x; git push'), []);
+  assert.deepEqual(effects('git fetch; git config a.b c; git branch -f x; git tag v1; git stash; git push'), ['fetch', 'config', 'branch', 'tag', 'stash']);
 });
 
 test('heredocs and $(...) bodies are nested code/data, not top-level commands', () => {

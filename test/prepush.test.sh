@@ -77,7 +77,7 @@ codex_says 0 "No findings."
 prep
 expect "codex 'No findings.' is a pass" 0 stdout "No findings. Recorded prepush pass"
 has_marker "a pass records a prepush marker bound to HEAD"
-grep -q '^review -$' "$S/codex.args" && ok "codex runs as \`codex review -\` (prompt on stdin)" || bad "codex args" "$(cat "$S/codex.args")"
+grep -qx 'review -c sandbox_mode="read-only" -' "$S/codex.args" && ok "codex runs as \`codex review -\` (prompt on stdin) in a read-only sandbox" || bad "codex args" "$(cat "$S/codex.args")"
 grep -q 'UNIQUE_DIFF_LINE' "$S/codex.stdin" && grep -q 'git diff origin/main\.\.\.' "$S/codex.stdin" &&
   ok "the prompt carries the full diff against the base" || bad "prompt lacks the diff"
 grep -q 'No review/PUNCH_LIST.md' "$S/codex.stdin" && ok "without a punch list the prompt says so" || bad "punch list note missing"
@@ -177,9 +177,9 @@ claude_says 0 "$(claude_json "No findings.")"
 prep
 expect "codex timing out falls back to a claude review that can pass" 0 stdout "(claude vs origin/main): No findings."
 has_marker "the claude fallback records the marker"
-grep -qx -- '-p' "$S/claude.args" && grep -qx -- '--disallowedTools' "$S/claude.args" && grep -qx 'Edit,Write,MultiEdit,NotebookEdit' "$S/claude.args" &&
-  grep -qx 'Read,Glob,Grep,Bash(git diff:\*),Bash(git log:\*),Bash(git show:\*)' "$S/claude.args" &&
-  ok "the claude fallback runs read-only (-p, allowed read tools, edit tools disallowed)" || bad "claude args" "$(cat "$S/claude.args")"
+grep -qx -- '-p' "$S/claude.args" && grep -qx -- '--disallowedTools' "$S/claude.args" && grep -qx 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch' "$S/claude.args" &&
+  grep -qx 'Read,Glob,Grep' "$S/claude.args" &&
+  ok "the claude fallback runs read-only (-p, only Read/Glob/Grep allowed, Bash and edit tools disallowed)" || bad "claude args" "$(cat "$S/claude.args")"
 grep -q 'UNIQUE_DIFF_LINE' "$S/claude.stdin" && ok "claude gets the full diff too" || bad "claude prompt lacks diff"
 (cd "$R" && bash "$gate" status) >"$T/st" 2>&1
 grep -q 'prepush .*green @ .*(claude vs origin/main)' "$T/st" && ok "status names the claude fallback" || bad "status" "$(cat "$T/st")"
@@ -474,6 +474,20 @@ git -C "$H" commit -q --allow-empty -m "unreviewed for the escape test"
 run "$H" "printf 'true\\ngit push origin HEAD\\n' | bash"
 expect "a git push after a \\n escape piped to bash reaches the gate" 2 stderr "BLOCKED by the pre-push review gate"
 git -C "$H" reset -q --hard HEAD~1
+run "$H" "git fetch -q origin && git push origin origin/main:feat/x"
+expect "a fetch before the push is blocked (it can move what the push publishes)" 2 stderr "\`git fetch\` runs before \`git push\`"
+run "$H" "git commit -q --allow-empty -m x; python3 -c 'import os; os.system(\"git push\")'"
+expect "a commit before an opaque push is blocked" 2 stderr "\`git commit\` runs before \`git push\`"
+run "$H" "git -c alias.a=p -c alias.p=push a origin HEAD"
+expect "an alias chain that ends in push is blocked" 2 stderr "a -> p -> push"
+run "$H" "git -c alias.a=a a"
+expect "an alias loop is blocked" 2 stderr "alias loop"
+run "$H" "git config alias.p2 push; git p2 origin HEAD"
+expect "an alias used after a git config in the same command is blocked" 2 stderr "after a \`git config\`"
+run "$H" "git -c submodule.recurse push origin HEAD"
+expect "a valueless -c submodule.recurse (true) is blocked" 2 stderr "submodule commits"
+run "$H" "MODE=on-demand git --config-env=push.recurseSubmodules=MODE push origin HEAD"
+expect "--config-env (unreadable override) is blocked even with a refspec" 2 stderr "config override the gate can't read"
 run "$H" "git -c alias.p=push p origin HEAD"
 expect "a -c alias that pushes is blocked" 2 stderr "is an alias that pushes"
 git -C "$H" config alias.pu "push --force"

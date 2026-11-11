@@ -65,7 +65,10 @@ prepush_note() {
 }
 
 PROMPT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prompts/prepush-review.md"
-CLAUDE_REVIEW_TOOLS="Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*)"
+# Read-only by construction: the diff is already in the prompt, so the fallback gets file reads only. No Bash at all,
+# not even `git diff/log/show`: those take --output=<file> and could overwrite the checkout.
+CLAUDE_REVIEW_TOOLS="Read,Glob,Grep"
+CLAUDE_DENIED_TOOLS="Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
 
 # run_limited <seconds> <cmd...>: run with a time limit when `timeout` exists (exit 124 when it fires).
 run_limited() {
@@ -357,7 +360,7 @@ case "${1:-help}" in
     } >"$out"
     # 1. Codex. Prompt mode (`codex review -`): `--base` can't carry the punch list or the answer format.
     echo "review-gate: reviewing ${head:0:12} vs $base with Codex (time limit ${tmo}s)..." >&2
-    rc=0; (cd "$top" && run_limited "$tmo" codex review - <"$work/prompt" >"$work/co" 2>"$work/ce") || rc=$?
+    rc=0; (cd "$top" && run_limited "$tmo" codex review -c 'sandbox_mode="read-only"' - <"$work/prompt" >"$work/co" 2>"$work/ce") || rc=$?
     { printf '\n===== codex review (exit %s): stdout =====\n' "$rc"; cat "$work/co"; printf '\n===== codex stderr =====\n'; cat "$work/ce"; } >>"$out"
     codex_err="$(grep -h -E '^ERROR:' "$work/co" "$work/ce" | head -n 1 | cut -c1-200 || true)"
     codex_final_text "$work/co" >"$work/cv"
@@ -379,7 +382,7 @@ case "${1:-help}" in
         rc=0
         (cd "$top" && run_limited "$tmo" claude -p --output-format json --max-turns 40 --no-session-persistence \
           --permission-mode default --allowedTools "$CLAUDE_REVIEW_TOOLS" \
-          --disallowedTools "Edit,Write,MultiEdit,NotebookEdit" <"$work/prompt" >"$work/lo" 2>"$work/le") || rc=$?
+          --disallowedTools "$CLAUDE_DENIED_TOOLS" <"$work/prompt" >"$work/lo" 2>"$work/le") || rc=$?
         { printf '\n===== claude -p (exit %s): stdout =====\n' "$rc"; cat "$work/lo"; printf '\n===== claude stderr =====\n'; cat "$work/le"; } >>"$out"
         jq -r 'if .is_error == false and .subtype == "success" and (.result | type) == "string" then .result else empty end' \
           <"$work/lo" >"$work/cv" 2>/dev/null || : >"$work/cv"

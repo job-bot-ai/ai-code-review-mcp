@@ -259,12 +259,13 @@ review-gate status                   # shows the prepush state of HEAD
 
 `prepush` reviews `git diff <base>...HEAD` (the diff, the instructions in
 `prompts/prepush-review.md` and `review/PUNCH_LIST.md` when the repo has one all go into the
-prompt) with **Codex** (`codex review -`, prompt mode: `codex review --base` can't take custom
+prompt) with **Codex** (`codex review -c sandbox_mode="read-only" -`, prompt mode: `codex review --base` can't take custom
 instructions, so it could carry neither the punch list nor the answer format). If Codex can't run
 (non-zero exit or timeout, any `ERROR:` line such as the usage limit, quota or login error, or no
 final message), it falls back to a **read-only Claude** review: `claude -p --output-format json`
-with only `Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*)` allowed and
-`Edit,Write,MultiEdit,NotebookEdit` disallowed. Time limit per reviewer:
+with only `Read,Glob,Grep` allowed and `Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch`
+disallowed. The diff is in the prompt, so it needs no git commands; `Bash(git diff:*)` would still
+allow `git diff --output=<file>`, which writes. Time limit per reviewer:
 `REVIEW_GATE_PREPUSH_TIMEOUT` seconds (default 1500).
 
 A run only counts as **completed** when the reviewer exited 0 (Claude: `is_error` false and
@@ -297,16 +298,19 @@ worktree that has it checked out). Not gated: `--delete`/`-d`/`:branch`, tags on
 `tag v1`, `refs/tags/...`), `--dry-run`, `--help`, and outside a git repo. Blocked outright:
 `--all`/`--mirror`/wildcard refspecs, non-literal refspecs or `cd`/`-C` targets, `GIT_DIR`/
 `GIT_CONFIG*` (incl. `GIT_CONFIG_GLOBAL`/`_SYSTEM`)/`HOME`/`XDG_CONFIG_HOME`/`--git-dir` (as a
-prefix, an `env` assignment, or exported earlier in the command, including into `bash -c`), a commit made in
-the same command as the push, and a push without a refspec when config may make it publish more
-than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`, or a `-c`
-override of those): name the refspec (`git push origin HEAD`). A tag pushed to a branch
-(`v1:release`) is checked like a branch push. Also blocked: `--recurse-submodules=on-demand|only`
-or `push.recurseSubmodules` set so (submodule commits weren't reviewed), and a git alias that
-pushes (`git p` with `alias.p=push` in config or `-c`, looked up in the checkout git runs in), and a
-ref or config write earlier in the same command (`git branch -f`, `update-ref`, `checkout -B`, `git
-config remote.origin.push ...`): the gate resolves pushes against refs and config as they are before
-the command runs. `submodule.recurse=true` counts as on-demand submodule pushing. A push handed to something the
+prefix, an `env` assignment, or exported earlier in the command, including into `bash -c`),
+`--config-env` and non-literal `-c` values, a push without a refspec when config may make it
+publish more than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`,
+or a `-c` override of those: name the refspec, `git push origin HEAD`), submodule-recursing
+pushes (`--recurse-submodules=on-demand|only`, `push.recurseSubmodules`, `submodule.recurse=true`),
+and git aliases that push (followed through alias chains, in the checkout git runs in).
+
+**A push runs on its own.** The gate resolves what a push publishes from the refs and config as
+they are *before* the command runs, so in the same command a push may only follow read-only git
+commands (`status`, `log`, `diff`, `show`, `rev-parse`, listing `branch`/`tag`, `config --get`, ...).
+A commit, fetch, config write, ref change (`branch -f`, `update-ref`, `checkout -B`), stash or alias
+before it blocks: run that first, re-run `review-gate prepush` if HEAD changed, then push. A tag
+pushed to a branch (`v1:release`) is checked like a branch push. A push handed to something the
 gate can't follow (`ssh host 'git push'`, `python -c`) is checked against HEAD of the directory it
 runs from.
 

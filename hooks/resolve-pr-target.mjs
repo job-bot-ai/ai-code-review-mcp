@@ -305,6 +305,24 @@ const CONTINUERS = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
 // git subcommands that can change which commit HEAD is (so the reviewed commit isn't the PR's).
 const HEAD_MOVERS = new Set(['commit', 'merge', 'rebase', 'reset', 'cherry-pick', 'revert', 'pull', 'am', 'checkout', 'switch']);
+// git subcommands that only read the repository (in any form).
+const READ_ONLY_GIT = new Set(('status log diff show rev-parse rev-list ls-files ls-tree ls-remote cat-file describe ' +
+  'blame annotate grep shortlog show-ref show-branch for-each-ref merge-base name-rev var version help diff-tree ' +
+  'diff-index diff-files count-objects check-ignore check-attr whatchanged cherry range-diff verify-commit').split(' '));
+/** Does `git <sub> <args>` only read? Unknown subcommands and aliases count as writes. */
+function readOnlyGit(sub, args) {
+  if (READ_ONLY_GIT.has(sub)) return true;
+  const pos = args.filter((v) => !v.startsWith('-'));
+  switch (sub) {
+    case 'branch': case 'symbolic-ref': return !refMutation(sub, args);
+    case 'config': return !configWrite(args);
+    case 'tag': return args.some((v) => v === '-l' || v === '--list') || (!pos.length && !refMutation('tag', args));
+    case 'remote': return !pos.length || ['show', 'get-url'].includes(pos[0]);
+    case 'worktree': case 'stash': return pos[0] === 'list' || (sub === 'stash' && pos[0] === 'show');
+    case 'reflog': return !pos.length || pos[0] === 'show';
+    default: return false;
+  }
+}
 /** Does `git config <args>` write (set, unset, add, rename, edit) rather than read? */
 function configWrite(args) {
   if (args.some((v) => /^(--get|--get-all|--get-regexp|--get-urlmatch|--get-color|--get-colorbool|-l|--list)$/.test(v))) return false;
@@ -507,7 +525,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
   // A `git push` passed to something the gate can't follow (ssh, awk system(), python -c): gated in `dir`.
   // Recorded with the other pushes (shared with nested scripts), so every one of them is checked.
   const opaquePush = (what, dir) => {
-    gitPushes.push({ opaque: what, dir: funcDepth > 0 || scope().gitEnv ? null : dir, args: [], moves: [] });
+    gitPushes.push({ opaque: what, dir: funcDepth > 0 || scope().gitEnv ? null : dir, args: [], moves: headMoves.filter((m) => !m.pushOnly) });
   };
 
   // Code that runs in a subshell ($(...), `...`, <(...), bash -c, eval): gate any
@@ -592,12 +610,14 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       return;
     }
     // Ref mutations change which commit a later `git push <ref>` (or `--head <ref>`) publishes, without moving HEAD.
-    if (sub && refMutation(sub, cmd.slice(k + 1).map((w) => w.value))) { headMoves.push({ dir: gdir, sub }); return; }
-    // A config write (remote.<name>.push, an alias, push.recurseSubmodules, ...) changes what a later push does,
-    // and the gate reads the config as it is before the command runs.
-    if (sub === 'config' && configWrite(cmd.slice(k + 1).map((w) => w.value))) { headMoves.push({ dir: gdir, sub, pushOnlyEffect: true }); return; }
+    const rargs = cmd.slice(k + 1).map((w) => w.value);
+    if (sub && refMutation(sub, rargs)) { headMoves.push({ dir: gdir, sub }); return; }
     // Not a built-in: it may be an alias (`git p` with alias.p=push, or `-c alias.p=push`), checked at resolve time.
-    if (sub && !GIT_BUILTINS.has(sub)) gitPushes.push({ alias: sub, dir: gdir, config, args: [], moves: [] });
+    if (sub && !GIT_BUILTINS.has(sub)) gitPushes.push({ alias: sub, dir: gdir, config, args: [], moves: headMoves.filter((m) => !m.pushOnly) });
+    // The gate resolves a push against refs and config as they are BEFORE the command runs, so a push may only
+    // follow read-only git commands: anything else (fetch, config writes, ref updates, aliases, ...) could change
+    // what it publishes. Recorded for the push gate only (the PR gate keeps its own HEAD-mover rule).
+    if (sub && sub !== 'push' && !readOnlyGit(sub, rargs)) headMoves.push({ dir: gdir, sub, pushOnlyEffect: true });
     if (sub !== 'push') return;
     gitPushes.push({ dir: otherRepo ? null : gdir, args: cmd.slice(k + 1), moves: headMoves.filter((m) => !m.pushOnly), config,
       why: otherRepo ? '`git push` names another repository or injects git config (GIT_DIR, GIT_CONFIG_*, --git-dir or --work-tree), so the gate can\'t tell which commit it pushes. Run it from the checkout: `cd /path/to/checkout && git push ...`' : null });
@@ -1208,18 +1228,56 @@ const PUSH_CONFIG = /^(remote\..+\.push|remote\..+\.mirror|push\.default)=/i;
  * { block: reason }, or { targets: [{ dir, rev }] }: each commit pushed to a branch, with the checkout whose
  * review-gate markers hold its pre-push review.
  */
+const repoOf = (d) => (d ? git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel') : null);
+
+/** A non-read-only git command earlier in the same command, in the same repo (or anywhere unknown): why to block. */
+function movedBefore(p, dir) {
+  const here = dir === null ? null : repoOf(dir);
+  const moved = (p.moves ?? []).find((m) => m.dir === null || here === null || repoOf(m.dir) === here);
+  if (!moved) return null;
+  return `\`git ${moved.sub}\` runs before \`git push\` in the same command. The gate checks what the push publishes as the repo is before the command runs, so only read-only git commands may come first (a commit, fetch, config or ref change could make it publish an unreviewed commit). Run it first, run \`review-gate prepush\` if HEAD changed, then push on its own.`;
+}
+
+/** `-c key[=value]` overrides as a map (lowercased key → value; a bare `-c key` means true). */
+function configMap(config) {
+  const m = new Map();
+  for (const w of config ?? []) {
+    if (w.dynamic || w.value === 'config-env') continue;
+    const eq = w.value.indexOf('=');
+    m.set((eq < 0 ? w.value : w.value.slice(0, eq)).toLowerCase(), eq < 0 ? 'true' : w.value.slice(eq + 1));
+  }
+  return m;
+}
+
+/** `git <alias>`: follow the alias chain (`-c` overrides first, then config where git runs); block if it pushes. */
+function resolveAlias(p) {
+  const blockMsg = (why) => ({ block: `\`git ${p.alias}\` ${why}, which the gate doesn't follow. Use \`git push ...\` itself.` });
+  if ((p.config ?? []).some((w) => w.dynamic || w.value === 'config-env')) return blockMsg('runs with a config override the gate can\'t read (it could define the alias)');
+  if ((p.moves ?? []).some((m) => m.sub === 'config')) return blockMsg('runs after a `git config` in the same command (it could have defined the alias)');
+  const cfg = configMap(p.config);
+  const seen = new Set();
+  let name = p.alias;
+  for (;;) {
+    if (seen.has(name)) return blockMsg(`is an alias loop (${[...seen].join(' -> ')})`);
+    seen.add(name);
+    const def = cfg.get(`alias.${name.toLowerCase()}`) ?? (p.dir === null ? null : git(p.dir, 'config', '--get', `alias.${name}`));
+    if (def === null || def === undefined) return { skip: true }; // not an alias (git will say so)
+    if (def.startsWith('!')) {
+      return /(^|[^A-Za-z0-9_-])push([^A-Za-z0-9_-]|$)/.test(def) ? blockMsg(`is a shell alias that pushes (${def.slice(0, 80)})`) : { skip: true };
+    }
+    const next = def.trim().split(/\s+/)[0] ?? '';
+    if (next === 'push') return blockMsg(`is an alias that pushes (${[...seen].join(' -> ')} -> ${def.slice(0, 60)})`);
+    if (GIT_BUILTINS.has(next) || !next || next.startsWith('-')) return { skip: true };
+    name = next;
+  }
+}
+
 function resolvePush(p) {
   if (p.why) return { block: p.why };
-  if (p.alias !== undefined) { // `git <alias>`: blocked when the alias (repo/global config or `-c`) runs a push
-    const viaC = (p.config ?? []).filter((w) => w.dynamic || w.value.toLowerCase().startsWith(`alias.${p.alias.toLowerCase()}=`));
-    const def = viaC.length ? viaC.map((w) => (w.dynamic ? 'push' : w.value)).join(' ')
-      : p.dir === null ? null : git(p.dir, 'config', '--get', `alias.${p.alias}`);
-    if (def !== null && /(^|[^A-Za-z0-9_-])push([^A-Za-z0-9_-]|$)/.test(def)) {
-      return { block: `\`git ${p.alias}\` is an alias that pushes (${def.slice(0, 80)}), which the gate doesn't follow. Use \`git push ...\` itself.` };
-    }
-    return { skip: true };
-  }
+  if (p.alias !== undefined) return resolveAlias(p);
   if (p.opaque) { // `git push` handed to something the gate can't follow: check HEAD where it runs
+    const mv = movedBefore(p, p.dir);
+    if (mv) return { block: mv };
     if (p.dir === null) return { block: `\`git push\` is passed to ${p.opaque}, which the gate can't follow, from a directory (or git environment) it can't tell. Run the push directly: \`cd /literal/path && git push ...\`` };
     const top = git(p.dir, 'rev-parse', '--show-toplevel');
     const rev = top && git(top, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}');
@@ -1231,12 +1289,12 @@ function resolvePush(p) {
   if (!existsSync(p.dir) || !statSync(p.dir).isDirectory()) return { block: `\`git push\` would run in ${p.dir}, which doesn't exist` };
   const top = git(p.dir, 'rev-parse', '--show-toplevel');
   if (top === null) return { skip: true, note: `${p.dir} isn't a git checkout; push not gated` };
-  const repoOf = (d) => (d ? git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel') : null);
-  const here = repoOf(top);
-  const moved = (p.moves ?? []).find((m) => m.dir === null || repoOf(m.dir) === here);
-  if (moved) {
-    return { block: `\`git ${moved.sub}\` runs before \`git push\` in the same command, so the push would publish a commit that doesn't exist yet and can't have had its pre-push review. Commit first, run \`review-gate prepush\`, then push on its own.` };
-  }
+  const mv = movedBefore(p, top);
+  if (mv) return { block: mv };
+  // A `-c` override the gate can't read (non-literal, or --config-env from the environment) may set
+  // push.recurseSubmodules, remote.*.push, ...: refuse it whatever the refspecs say.
+  const opaqueCfg = (p.config ?? []).find((w) => w.dynamic || w.value === 'config-env');
+  if (opaqueCfg) return { block: `\`git push\` has a config override the gate can't read (${opaqueCfg.value === 'config-env' ? '--config-env' : opaqueCfg.value}); pass it literally with -c, or drop it` };
   const positional = [];
   let remoteGiven = false; let del = false; let dry = false; let help = false; let all = false; let tags = false;
   let submodules = null; // --recurse-submodules=on-demand|only publishes submodule commits the review never saw
@@ -1280,10 +1338,8 @@ function resolvePush(p) {
   if (help || dry || del) return { skip: true }; // nothing is published (`--delete` removes refs only)
   if (submodules === null) {
     // push.recurseSubmodules, else submodule.recurse=true (which means on-demand); `-c` overrides win.
-    const cfgOf = (key) => {
-      const c = (p.config ?? []).filter((w) => w.value.toLowerCase().startsWith(`${key.toLowerCase()}=`)).pop();
-      return c ? c.value.slice(key.length + 1) : git(top, 'config', '--get', key);
-    };
+    const cmap = configMap(p.config);
+    const cfgOf = (key) => cmap.get(key.toLowerCase()) ?? git(top, 'config', '--get', key);
     const v = cfgOf('push.recurseSubmodules');
     if (v !== null) submodules = /^(on-demand|only)$/i.test(v);
     else submodules = /^(true|yes|on|1)$/i.test(cfgOf('submodule.recurse') ?? '');
