@@ -88,26 +88,37 @@ codex_final_text() {
     }' "$1"
 }
 
-# parse_verdict <file>: first line is one of
-#   clean | findings <blocking P0-P2> <total> | unreadable <why>
-# followed by the finding lines. Strict: every line carrying a [Pn] tag must be one finding in the format
-# (`[P1] title`, optionally after "- " or "* ", one tag per line); otherwise the verdict is unreadable, because a
-# finding we can't read could hide a blocker. "No findings." must be the last line, with no P0-P3 mention at all.
-parse_verdict() {
+# classify_tags <file>: each line prefixed with its kind: "G<0-3> " a finding line in the format (`[P1] title`,
+# optionally after "- " or "* ", exactly one structural tag), "B " a line with a [Pn] tag we can't read (two tags,
+# a tag not at the start, a cut-off `[P1` or stray `P1]`, a tag inside a leading code span), "N " anything else.
+# Tags quoted in a code span later in a line (`[P1]` in an explanation) are only quotes. Both parsers below read
+# lines through this one function, so a failed run and a completed one can't disagree about what a finding is.
+classify_tags() {
   awk '
     { line = $0; sub(/\r$/, "", line)
-      t = line; n = gsub(/\[[Pp][0-3]\]/, "", t)
-      # A cut-off or malformed tag ([P1 or P1] alone) is an unreadable finding: never let it pass unseen.
-      if (n == 0 && line ~ /\[[Pp][0-3]|[Pp][0-3]\]/) { bad[++nb] = line; next }
-      if (n > 0) {
-        if (n > 1 || line !~ /^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/) { bad[++nb] = line; next }
-        match(line, /\[P[0-3]\]/); lvl = substr(line, RSTART + 2, 1) + 0
-        f[++nf] = line; if (lvl <= 2) blk++
-        next
-      }
-      if (line ~ /[^ \t]/) { nonempty++; last = line }
-      if (line ~ /(^|[^A-Za-z0-9])[Pp][0-3]([^0-9A-Za-z]|$)/) loose++
-    }
+      tagish = "\\[[Pp][0-3]|[Pp][0-3]\\]"
+      if (line ~ /^[ \t]*([-*][ \t]*)?`/ && line ~ tagish) { print "B " line; next }
+      t = line; gsub(/`[^`]*`/, "", t)
+      n = gsub(/\[[Pp][0-3]\]/, "", t)
+      if (t ~ tagish) { print "B " line; next }
+      if (n == 0) { print "N " line; next }
+      if (n > 1 || line !~ /^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/) { print "B " line; next }
+      match(line, /\[P[0-3]\]/); print "G" substr(line, RSTART + 2, 1) " " line
+    }' "$1"
+}
+
+# parse_verdict <file>: first line is one of
+#   clean | findings <blocking P0-P2> <total> | unreadable <why>
+# followed by the finding lines. Strict: every line carrying a [Pn] tag must be one finding in the format;
+# otherwise the verdict is unreadable, because a finding we can't read could hide a blocker. "No findings." must
+# be the last line, with no P0-P3 mention at all.
+parse_verdict() {
+  classify_tags "$1" | awk '
+    { kind = substr($0, 1, index($0, " ") - 1); line = substr($0, index($0, " ") + 1) }
+    kind == "B" { bad[++nb] = line; next }
+    kind ~ /^G/ { f[++nf] = line; if (substr(kind, 2) + 0 <= 2) blk++; next }
+    { if (line ~ /[^ \t]/) { nonempty++; last = line }
+      if (line ~ /(^|[^A-Za-z0-9])[Pp][0-3]([^0-9A-Za-z]|$)/) loose++ }
     END {
       if (nb) { b = bad[1]; if (length(b) > 160) b = substr(b, 1, 160) "..."
         print "unreadable " nb " line(s) carry a [Pn] tag but are not in the finding format, e.g.: " b; exit }
@@ -117,7 +128,7 @@ parse_verdict() {
       else if (v == "No findings." && !loose) print "clean"
       else if (v == "No findings.") print "unreadable \"No findings.\" but the answer mentions a P0-P3 priority"
       else print "unreadable neither [Pn] findings nor a final \"No findings.\""
-    }' "$1"
+    }'
 }
 
 # One prepush/prepush-accept at a time per worktree: an older run must never publish a pass after a newer run of
@@ -133,13 +144,18 @@ take_lock() {
     flock -n 9 || { echo "review-gate: another prepush/prepush-accept is running in this worktree; wait for it" >&2; exit 5; }
     return 0
   fi
-  local l="$dir/prepush.lock.pid" pid
+  local l="$dir/prepush.lock.pid" t="$dir/prepush.lock.takeover" pid
   if ! ln -s "$$" "$l" 2>/dev/null; then
+    # Taking over a dead owner's link is itself serialized (atomic mkdir), and the link is re-read inside, so a
+    # second taker can never remove the link the first one just created.
+    mkdir "$t" 2>/dev/null || { echo "review-gate: another prepush is taking over the lock in this worktree; retry (a $t left by a crash can be removed)" >&2; exit 5; }
     pid="$(readlink "$l" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      echo "review-gate: another prepush/prepush-accept (pid $pid) is running in this worktree; wait for it" >&2; exit 5
+      rmdir "$t"; echo "review-gate: another prepush/prepush-accept (pid $pid) is running in this worktree; wait for it" >&2; exit 5
     fi
-    rm -f "$l"; ln -s "$$" "$l" 2>/dev/null || { echo "review-gate: couldn't take $l; retry" >&2; exit 5; }
+    rm -f "$l"
+    if ! ln -s "$$" "$l" 2>/dev/null; then rmdir "$t"; echo "review-gate: couldn't take $l; retry" >&2; exit 5; fi
+    rmdir "$t"
   fi
   LOCK="$l"
 }
@@ -354,8 +370,8 @@ case "${1:-help}" in
     if [ -n "$why" ]; then
       # Every well-formed finding line, whatever else the answer holds (a truncated or malformed line after a
       # good finding must not discard it); a tagged line we can't read means a finding could be lost.
-      codex_partial="$(awk '{ t = $0; n = gsub(/\[[Pp][0-3]\]/, "", t) } n == 1 && /^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/' "$work/cv")"
-      codex_unread="$(awk '{ t = $0; n = gsub(/\[[Pp][0-3]\]/, "", t) } n > 1 || (n == 1 && !/^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/)' "$work/cv" | head -n 1 | cut -c1-160)"
+      codex_partial="$(classify_tags "$work/cv" | sed -n 's/^G[0-3] //p')"
+      codex_unread="$(classify_tags "$work/cv" | sed -n 's/^B //p' | head -n 1 | cut -c1-160)"
       echo "review-gate: Codex can't review ($why); falling back to a read-only Claude review..." >&2
       if ! command -v claude >/dev/null 2>&1; then
         verdict="unreadable"; why="$why; claude is not installed"

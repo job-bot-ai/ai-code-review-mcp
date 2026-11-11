@@ -20,7 +20,7 @@
 input="$(cat)"
 
 # Fast path: if the payload can't possibly contain `gh ... pr ... create` or a push, allow now.
-printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview|push|git' || exit 0   # `gh pr new` is an alias
+printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview|git' || exit 0   # `gh pr new` is an alias
 
 # Pull the actual command string out of tool_input.command. jq is required to isolate the
 # command from surrounding JSON reliably; without it, warn (not silent) and fail open
@@ -44,16 +44,10 @@ fi
 # (`\n`/`\t` escapes count as separators: `printf 'cd x\ngh pr create' | bash`.)
 want_pr=0; want_push=0
 printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new|ready)([^[:alnum:]_-]|$)|markPullRequestReadyForReview' && want_pr=1
-# Any `git` word and any `push` word, however far apart (`git -c credential.helper='!f(){ ...; }; f' push`):
-# the resolver decides whether a push really runs.
-if printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])git([^[:alnum:]_-]|$)' &&
-   printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'; then want_push=1; fi
-# `git pu` never says push: when the config (global or the session repo's) has an alias that pushes, any git
-# command goes to the resolver, which looks the alias up where it runs.
-if [ "$want_push" = 0 ] && printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])git([^[:alnum:]_-]|$)'; then
-  _cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)"
-  git -C "${_cwd:-.}" config --get-regexp '^alias\.' 2>/dev/null | grep -Eq '(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)' && want_push=1
-fi
+# Any `git` command goes to the resolver: it finds pushes however they are spelled (`git -c credential.helper='!f(){
+# ...; }; f' push`, `git -C dir push`) and looks up aliases (`git p` with alias.p=push) in the checkout where git
+# runs. Commands without git skip it.
+printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])git([^[:alnum:]_-]|$)' && want_push=1
 [ "$want_pr" = 1 ] || [ "$want_push" = 1 ] || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -179,6 +173,7 @@ push_block() { echo "BLOCKED by the pre-push review gate: $1" >&2; exit 2; }
 push_risky() {
   printf '%s' "$cmd" | grep -Eq "(^|[[:space:];&|(){}'\"\`])(cd|pushd|popd)([[:space:]]|\$)|(^|[[:space:]])(-C|--git-dir|--work-tree)([[:space:]=]|\$)|GIT_DIR|GIT_WORK_TREE|CDPATH"
 }
+has_push_word() { printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'; }
 push_gate() {
   if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then
     # Tim's own switch, set in Claude Code's environment; logged so a bypass is never silent.
@@ -198,10 +193,12 @@ push_gate() {
       ok) ptargets="$(printf '%s' "$res" | jq -c '.targets[]')" ;;
       block) push_block "$reason" ;;
       *) # unparseable, or the resolver failed: the session cwd's HEAD, unless the push may run elsewhere
+        has_push_word || return 0   # without the resolver only a literal `push` is looked for
         push_risky && push_block "couldn't work out where this \`git push\` runs (${reason:-resolver failed}), and the command changes directory or names a repo. Simplify it: \`cd /literal/path && git push ...\`"
         add_msg "review-gate: couldn't parse the push (${reason:-resolver failed}); checked the session cwd's HEAD" ;;
     esac
   else
+    has_push_word || return 0
     push_risky && push_block "node isn't available to parse this \`git push\`, and the command changes directory or names a repo, so the session cwd may be the wrong repo."
     add_msg "review-gate: node unavailable; checked the session cwd's HEAD for the push"
   fi

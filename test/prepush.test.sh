@@ -228,9 +228,21 @@ expect "a failed codex run with an unreadable [Pn] line is FAILED even when clau
 has "$err" "[P1] a good finding" && ok "its readable findings are still printed" || bad "good finding not printed" "$err"
 no_marker "no marker when failed codex output had an unreadable finding"
 claude_says 1 ""
+reset_marker
+codex_says 1 "- [P1 cut off by the error" "$LIMIT"
+claude_says 0 "$(claude_json "No findings.")"
+prep
+expect "a failed codex run with a cut-off [P1 tag is FAILED even when claude is clean" 4 stderr "not in the finding format"
+no_marker "no marker when failed codex output had a cut-off tag"
+claude_says 1 ""
+reset_marker
+codex_says 0 "- [P2] Detect truncated tags — review-gate:358
+  When Codex prints a truncated tag such as \`[P1\`, or quotes \`[P2]\`, it is only a quote."
+prep
+expect "tags quoted in a code span inside an explanation are quotes, not findings" 1 stdout "1 finding(s), 1 of them P0-P2"
 
 # ── the verdict must be readable ──
-for v in "**[P1]** bold tag — a.sh:1" "1. [P1] numbered — a.sh:1" "- [P1] two — a.sh:1 [P2] tags on one line" "- [p1] lower case tag — a.sh:1"; do
+for v in "\`[P1]\` hidden in a code span — a.sh:1" "**[P1]** bold tag — a.sh:1" "1. [P1] numbered — a.sh:1" "- [P1] two — a.sh:1 [P2] tags on one line" "- [p1] lower case tag — a.sh:1"; do
   reset_marker; codex_says 0 "$v"
   prep
   expect "an unreadable tagged line fails the review: $v" 4 stderr "not in the finding format"
@@ -284,6 +296,12 @@ reset_marker; mkdir -p "$gd/review-gate"; ln -s 999999 "$gd/review-gate/prepush.
 prep
 expect "fallback lock: a lock left by a dead process is taken over" 0 stdout "No findings."
 [ ! -e "$gd/review-gate/prepush.lock.pid" ] && ok "fallback lock: released after the run" || bad "fallback lock left behind"
+ln -s 999999 "$gd/review-gate/prepush.lock.pid"
+rm -f "$gd/review-gate/prepush.lock.pid"; ln -s 999999 "$gd/review-gate/prepush.lock.pid"
+(cd "$R" && STUB_SLEEP=2 bash "$gate" prepush >/dev/null 2>&1; echo $? >"$T/r1") &
+(cd "$R" && STUB_SLEEP=2 bash "$gate" prepush >/dev/null 2>&1; echo $? >"$T/r2") &
+wait; r1="$(cat "$T/r1")"; r2="$(cat "$T/r2")"
+[ "$(printf '%s\n' "$r1" "$r2" | sort | tr '\n' ' ')" = "0 5 " ] && ok "fallback lock: two runs taking over the same dead lock, one refused" || bad "concurrent takeover: $r1 $r2"
 ln -s $$ "$gd/review-gate/prepush.lock.pid"
 prep
 expect "fallback lock: a live owner refuses the run" 5 stderr "another prepush"
@@ -374,6 +392,8 @@ run "$H" "git push origin 'refs/heads/*:refs/heads/*'"
 expect "a wildcard refspec is blocked" 2 stderr "several branches"
 run "$H" "git push origin \"\$BR\""
 expect "a non-literal refspec is blocked" 2 stderr "non-literal"
+run "$H" "git push \$FLAGS"
+expect "a non-literal word in the remote position is blocked (it could be --all, a refspec, ...)" 2 stderr "non-literal argument"
 run "$H" "git \$SUB origin HEAD; echo push"
 expect "a non-literal git subcommand in a command that mentions push is blocked" 2 stderr "non-literal subcommand"
 run "$H" "GIT_DIR=/x/.git git push"
@@ -386,7 +406,7 @@ expect "git -C with a non-literal directory is blocked" 2 stderr "isn't a litera
 git -C "$H" commit -q --allow-empty -m "unreviewed"
 git -C "$H" tag v1
 for c in "git push --delete origin feat/old" "git push -d origin feat/old" "git push origin :feat/old" "git push --tags" "git push origin --tags" \
-         "git push origin tag v1" "git push origin refs/tags/v1" "git push origin v1" "git push --dry-run" "git push -n origin HEAD" "git push --help" \
+         "git push origin tag v1" "git push origin refs/tags/v1" "git push origin HEAD:refs/tags/v2" "git push origin v1" "git push --dry-run" "git push -n origin HEAD" "git push --help" \
          "git log --grep push" "grep -rn 'git push' ." "echo git push" "git commit --allow-empty -q -m 'fix git push'" "cd $T/plain && git push"; do
   run "$H" "$c"
   expect "not a branch push, allowed without a review: $c" 0
@@ -416,6 +436,18 @@ run "$H" "export GIT_CONFIG_SYSTEM=$T/cfg; git push"
 expect "an exported GIT_CONFIG_SYSTEM is blocked" 2 stderr "injects git config"
 run "$H" "HOME=$T git push"
 expect "a HOME prefix (moves the global config) is blocked" 2 stderr "injects git config"
+run "$H" "git update-ref refs/heads/feat/other HEAD && git push origin feat/other"
+expect "a ref changed by update-ref before the push is blocked" 2 stderr "\`git update-ref\` runs before"
+run "$H" "git branch -f feat/other HEAD && git push origin feat/other"
+expect "a branch moved by branch -f before the push is blocked" 2 stderr "\`git branch\` runs before"
+run "$H" "git branch --show-current && git status && git push origin HEAD"
+expect "read-only git commands before the push don't block it (reviewed → allowed)" 0
+git -C "$T/o" config alias.p push
+run "$H" "cd $T/o && git p origin HEAD"
+expect "an alias that pushes, defined only in the checkout git runs in, is blocked" 2 stderr "is an alias that pushes"
+run "$H" "git status"
+expect "a plain git command is not a push" 0
+[ -z "$out$err" ] && ok "a plain git command passes silently" || bad "git status printed: $out$err"
 run "$H" "git -c alias.p=push p origin HEAD"
 expect "a -c alias that pushes is blocked" 2 stderr "is an alias that pushes"
 git -C "$H" config alias.pu "push --force"
@@ -478,6 +510,9 @@ expect "resolver failure + cd: the push is blocked" 2 stderr "couldn't work out 
 payload="$(jq -cn --arg c "git push" --arg d "$H" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
 out="$(printf '%s' "$payload" | bash "$T/broken/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
 expect "resolver failure, plain push: checked at the session cwd (unreviewed → blocked)" 2 stderr "BLOCKED by the pre-push review gate"
+payload="$(jq -cn --arg c "git status" --arg d "$H" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | bash "$T/broken/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "resolver failure: a git command without push is not gated" 0
 
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

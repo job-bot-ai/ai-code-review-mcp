@@ -305,6 +305,22 @@ const CONTINUERS = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
 const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
 // git subcommands that can change which commit HEAD is (so the reviewed commit isn't the PR's).
 const HEAD_MOVERS = new Set(['commit', 'merge', 'rebase', 'reset', 'cherry-pick', 'revert', 'pull', 'am', 'checkout', 'switch']);
+/** Does `git <sub> <args>` change a ref (a branch, tag or HEAD itself) rather than only read it? */
+function refMutation(sub, args) {
+  const pos = args.filter((v) => !v.startsWith('-'));
+  switch (sub) {
+    case 'update-ref': case 'replace': return true;
+    case 'symbolic-ref': return pos.length >= 2 || args.some((v) => v === '-d' || v === '--delete');
+    case 'fetch': return pos.some((v) => v.includes(':')); // `git fetch origin x:x` writes a local branch
+    case 'tag': return args.some((v) => /^(-[a-zA-Z]*[fd][a-zA-Z]*|--force|--delete)$/.test(v));
+    case 'branch': {
+      if (args.some((v) => /^(-[a-zA-Z]*[fmMcCdD][a-zA-Z]*|--force|--move|--copy|--delete)$/.test(v))) return true;
+      const listing = args.some((v) => /^(-l|--list|-a|--all|-r|--remotes|--show-current|-v+|--verbose|--contains|--no-contains|--merged|--no-merged|--points-at|--format(=.*)?|--sort(=.*)?|--column(=.*)?)$/.test(v));
+      return !listing && pos.length > 0; // `git branch name [start]` creates a branch
+    }
+    default: return false;
+  }
+}
 const RUNNERS = new Set(['exec', 'env', 'sudo', 'nohup', 'xargs', 'nice', 'timeout']);
 // Commands that never execute their arguments or stdin as shell code: a `gh pr create`
 // mentioned in their input (a commit message, a file being written) is just text.
@@ -563,6 +579,8 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       if (!newBranchAtHead && !restoreFiles) headMoves.push({ dir: gdir, sub });
       return;
     }
+    // Ref mutations change which commit a later `git push <ref>` (or `--head <ref>`) publishes, without moving HEAD.
+    if (sub && refMutation(sub, cmd.slice(k + 1).map((w) => w.value))) { headMoves.push({ dir: gdir, sub }); return; }
     // Not a built-in: it may be an alias (`git p` with alias.p=push, or `-c alias.p=push`), checked at resolve time.
     if (sub && !GIT_BUILTINS.has(sub)) gitPushes.push({ alias: sub, dir: gdir, config, args: [], moves: [] });
     if (sub !== 'push') return;
