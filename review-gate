@@ -97,6 +97,8 @@ parse_verdict() {
   awk '
     { line = $0; sub(/\r$/, "", line)
       t = line; n = gsub(/\[[Pp][0-3]\]/, "", t)
+      # A cut-off or malformed tag ([P1 or P1] alone) is an unreadable finding: never let it pass unseen.
+      if (n == 0 && line ~ /\[[Pp][0-3]|[Pp][0-3]\]/) { bad[++nb] = line; next }
       if (n > 0) {
         if (n > 1 || line !~ /^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/) { bad[++nb] = line; next }
         match(line, /\[P[0-3]\]/); lvl = substr(line, RSTART + 2, 1) + 0
@@ -119,23 +121,32 @@ parse_verdict() {
 }
 
 # One prepush/prepush-accept at a time per worktree: an older run must never publish a pass after a newer run of
-# the same commit started (or finished with findings). The lock is a directory (atomic mkdir) holding the pid;
-# a lock whose process is gone is taken over.
+# the same commit started (or finished with findings). With flock(1) the kernel holds the lock for the life of
+# the process (released however it ends, so there is no stale lock to take over). Without flock (macOS), a
+# symlink whose target is the owner's pid is created atomically (`ln -s` fails if it exists, and the pid is never
+# missing); a link whose owner is gone is taken over, best effort.
+LOCK=""; WORK=""
 take_lock() {
-  local l="$dir/prepush.lock" pid
   mkdir -p "$dir"
-  if ! mkdir "$l" 2>/dev/null; then
-    pid="$(cat "$l/pid" 2>/dev/null || true)"
+  if command -v flock >/dev/null 2>&1 && [ -z "${REVIEW_GATE_NO_FLOCK:-}" ]; then
+    exec 9>>"$dir/prepush.lock"
+    flock -n 9 || { echo "review-gate: another prepush/prepush-accept is running in this worktree; wait for it" >&2; exit 5; }
+    return 0
+  fi
+  local l="$dir/prepush.lock.pid" pid
+  if ! ln -s "$$" "$l" 2>/dev/null; then
+    pid="$(readlink "$l" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       echo "review-gate: another prepush/prepush-accept (pid $pid) is running in this worktree; wait for it" >&2; exit 5
     fi
-    rm -rf "$l"; mkdir "$l" 2>/dev/null || { echo "review-gate: couldn't take $l; retry" >&2; exit 5; }
+    rm -f "$l"; ln -s "$$" "$l" 2>/dev/null || { echo "review-gate: couldn't take $l; retry" >&2; exit 5; }
   fi
-  echo "$$" >"$l/pid"
   LOCK="$l"
 }
-LOCK=""; WORK=""
-cleanup() { [ -z "$WORK" ] || rm -rf "$WORK"; [ -z "$LOCK" ] || rm -rf "$LOCK"; }
+cleanup() {
+  [ -z "$WORK" ] || rm -rf "$WORK"
+  if [ -n "$LOCK" ] && [ "$(readlink "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi   # only our own lock
+}
 trap cleanup EXIT
 
 # The base to review against: the PR base if gh can tell, else origin/main.

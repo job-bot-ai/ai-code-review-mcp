@@ -269,7 +269,8 @@ with only `Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*)` all
 
 A run only counts as **completed** when the reviewer exited 0 (Claude: `is_error` false and
 `subtype` success) and its answer is either well-formed findings (each `[P0]`..`[P3]` on its own
-line, one tag per line, optionally after `- `) or a final `No findings.` with no P0-P3 mention.
+line, one tag per line, optionally after `- `; a cut-off `[P1` or a stray `P1]` anywhere fails the
+run) or a final `No findings.` with no P0-P3 mention.
 Anything else (an error, the usage-limit text, an empty or cut-off answer, a `**[P1]**` or two
 tags on a line) is **FAILED**: nothing is recorded, the reason is printed and it exits 4. A failed
 run can't be accepted either. Findings Codex printed before it failed still count, and a failed
@@ -282,7 +283,9 @@ Codex run that printed a tagged line in the wrong format fails the review whatev
   keeps the reason, and `check`, `check-prepush` and the hook announce it with the findings file).
 - Running `prepush` again on the same commit first withdraws that commit's earlier pass or
   acceptance: only the newest review of a commit stands. One `prepush`/`prepush-accept` runs at a
-  time per worktree (a second one exits 5; a lock left by a dead process is taken over).
+  time per worktree (a second one exits 5). The lock is `flock` on `$GIT_DIR/review-gate/prepush.lock`
+  (released by the kernel however the run ends); without `flock` (macOS) a pid symlink is used,
+  and a link left by a dead process is taken over.
 - The full output of every run is kept in `$GIT_DIR/review-gate/prepush-<sha>.txt`.
 
 **The hook blocks `git push`** until each commit it publishes to a branch has a `prepush` marker.
@@ -293,7 +296,8 @@ It checks the commit actually pushed (`git push origin feat/other` checks `feat/
 worktree that has it checked out). Not gated: `--delete`/`-d`/`:branch`, tags only (`--tags`,
 `tag v1`, `refs/tags/...`), `--dry-run`, `--help`, and outside a git repo. Blocked outright:
 `--all`/`--mirror`/wildcard refspecs, non-literal refspecs or `cd`/`-C` targets, `GIT_DIR`/
-`GIT_CONFIG_*`/`--git-dir` (as a prefix or exported earlier in the command), a commit made in
+`GIT_CONFIG*` (incl. `GIT_CONFIG_GLOBAL`/`_SYSTEM`)/`HOME`/`XDG_CONFIG_HOME`/`--git-dir` (as a
+prefix, an `env` assignment, or exported earlier in the command, including into `bash -c`), a commit made in
 the same command as the push, and a push without a refspec when config may make it publish more
 than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`, or a `-c`
 override of those): name the refspec (`git push origin HEAD`). A tag pushed to a branch

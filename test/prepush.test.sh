@@ -236,6 +236,11 @@ for v in "**[P1]** bold tag — a.sh:1" "1. [P1] numbered — a.sh:1" "- [P1] tw
   expect "an unreadable tagged line fails the review: $v" 4 stderr "not in the finding format"
   no_marker "no marker for: $v"
 done
+reset_marker; codex_says 0 "- [P3] a nit — a.sh:1
+- [P1 cut off here"
+prep
+expect "a cut-off tag after a valid finding fails the review (not a P3-only pass)" 4 stderr "not in the finding format"
+no_marker "no marker for a cut-off tag"
 reset_marker; codex_says 0 "Looks good to me."
 prep
 expect "a free-form answer is neither findings nor No findings. (FAILED)" 4 stderr "neither [Pn] findings"
@@ -255,18 +260,34 @@ out="$(cd "$R" && REVIEW_GATE_PREPUSH_TIMEOUT=1 STUB_SLEEP=5 bash "$gate" prepus
 expect "a codex run past the time limit is not a pass (claude fallback unavailable here)" 4 stderr "codex exited 124"
 no_marker "no marker after a timed-out codex"
 
-# One prepush at a time per worktree; a lock left by a dead process is taken over.
-reset_marker; codex_says 0 "No findings."
-gd="$(git -C "$R" rev-parse --absolute-git-dir)"; mkdir -p "$gd/review-gate/prepush.lock"; echo $$ >"$gd/review-gate/prepush.lock/pid"
+# One prepush at a time per worktree, raced for real: two runs started together, exactly one reviews.
+gd="$(git -C "$R" rev-parse --absolute-git-dir)"
+race() { # race → r1, r2 exit codes of two concurrent prepush runs (codex takes 2s)
+  reset_marker; codex_says 0 "No findings."
+  (cd "$R" && STUB_SLEEP=2 bash "$gate" prepush >/dev/null 2>&1; echo $? >"$T/r1") &
+  (cd "$R" && STUB_SLEEP=2 bash "$gate" prepush >/dev/null 2>&1; echo $? >"$T/r2") &
+  wait; r1="$(cat "$T/r1")"; r2="$(cat "$T/r2")"
+}
+race
+[ "$(printf '%s\n' "$r1" "$r2" | sort | tr '\n' ' ')" = "0 5 " ] && ok "two concurrent prepush runs: one reviews, the other is refused (exit 5)" || bad "concurrent runs: $r1 $r2"
+if command -v flock >/dev/null 2>&1; then
+  ( exec 9>>"$gd/review-gate/prepush.lock"; flock 9; sleep 3 ) & holder=$!; sleep 0.5
+  (cd "$R" && bash "$gate" prepush-accept --reason "racing an ongoing review here") >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 5 ] && ok "prepush-accept waits for the lock too" || bad "accept during lock rc=$rc"
+  wait "$holder"
+fi
+export REVIEW_GATE_NO_FLOCK=1   # the fallback lock (no flock, e.g. macOS)
+race
+[ "$(printf '%s\n' "$r1" "$r2" | sort | tr '\n' ' ')" = "0 5 " ] && ok "fallback lock: two concurrent runs, one refused" || bad "fallback concurrent runs: $r1 $r2"
+
+reset_marker; mkdir -p "$gd/review-gate"; ln -s 999999 "$gd/review-gate/prepush.lock.pid"
 prep
-expect "a prepush while another runs in the worktree is refused" 5 stderr "another prepush"
-[ ! -e "$S/codex.called" ] && ok "the refused run reviews nothing" || bad "codex ran despite the lock"
-(cd "$R" && bash "$gate" prepush-accept --reason "racing an ongoing review here") >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 5 ] && ok "prepush-accept waits for the lock too" || bad "accept during lock rc=$rc"
-echo 999999 >"$gd/review-gate/prepush.lock/pid"
+expect "fallback lock: a lock left by a dead process is taken over" 0 stdout "No findings."
+[ ! -e "$gd/review-gate/prepush.lock.pid" ] && ok "fallback lock: released after the run" || bad "fallback lock left behind"
+ln -s $$ "$gd/review-gate/prepush.lock.pid"
 prep
-expect "a stale lock (dead pid) is taken over" 0 stdout "No findings."
-[ ! -e "$gd/review-gate/prepush.lock" ] && ok "the lock is released after the run" || bad "lock left behind"
+expect "fallback lock: a live owner refuses the run" 5 stderr "another prepush"
+rm -f "$gd/review-gate/prepush.lock.pid"; unset REVIEW_GATE_NO_FLOCK
 
 # ── base, empty diff, record ──
 reset_marker; codex_says 0 "No findings."
@@ -388,6 +409,13 @@ expect "an env-runner GIT_DIR reaches a git push inside bash -c" 2 stderr "names
 mkrepo "$T/o"
 run "$H" "python3 -c 'import os; os.system(\"git push\")'; cd $T/o && python3 -c 'import os; os.system(\"git push\")'"
 expect "every opaque push is checked, not just the first" 2 stderr "$T/o @"
+printf '[push]\n\tdefault = matching\n' >"$T/cfg"
+run "$H" "GIT_CONFIG_GLOBAL=$T/cfg git push"
+expect "a GIT_CONFIG_GLOBAL prefix is blocked (its config is invisible to the gate)" 2 stderr "injects git config"
+run "$H" "export GIT_CONFIG_SYSTEM=$T/cfg; git push"
+expect "an exported GIT_CONFIG_SYSTEM is blocked" 2 stderr "injects git config"
+run "$H" "HOME=$T git push"
+expect "a HOME prefix (moves the global config) is blocked" 2 stderr "injects git config"
 git -C "$H" config remote.origin.push 'refs/heads/feat/other:refs/heads/feat/other'
 run "$H" "git push"
 expect "a bare push with configured remote push refspecs is blocked" 2 stderr "configured remote push refspecs"

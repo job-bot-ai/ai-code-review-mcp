@@ -330,7 +330,10 @@ const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 // Environment that makes git act on another repository or with injected config (which can change what a bare
 // `git push` publishes): a push under it can't be checked against the directory's own HEAD.
-const GIT_ENV = /^GIT_(DIR|WORK_TREE|CONFIG_COUNT|CONFIG_PARAMETERS|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)=/;
+// Covers every GIT_CONFIG* variable (GIT_CONFIG_GLOBAL/SYSTEM/NOSYSTEM/COUNT/PARAMETERS, ...) and HOME /
+// XDG_CONFIG_HOME, which move the global config. Only assignments in the command count: the hook's own environment
+// is inherited by the git calls the resolver makes, so the config they read is the one the push will use.
+const GIT_ENV = /^(GIT_(DIR|WORK_TREE|COMMON_DIR|NAMESPACE|CONFIG[A-Z0-9_]*)|HOME|XDG_CONFIG_HOME)=/;
 
 /** Roughly what a pipeline element writes to stdout, over-approximated so nothing is
  * hidden: echo's words joined by spaces; printf's format text and then each argument on
@@ -456,7 +459,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     dirStack: [],
     ghRepo: inherit.ghRepo !== undefined ? inherit.ghRepo : (env.GH_REPO || undefined),
     cdpath: inherit.cdpath ?? Boolean(env.CDPATH),
-    gitEnv: inherit.gitEnv ?? Object.keys(env).some((k) => GIT_ENV.test(`${k}=`)),
+    gitEnv: inherit.gitEnv ?? false,
   })];
   // A push changes the remote, not the shell, so it isn't scoped to a subshell.
   const pushes = inherit.pushes ?? []; // shared with nested scripts, so their pushes count too
