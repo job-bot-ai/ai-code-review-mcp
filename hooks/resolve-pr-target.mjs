@@ -622,7 +622,15 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // what it publishes. Recorded for the push gate only (the PR gate keeps its own HEAD-mover rule).
     // Read-only only in its plain form: `--output=<file>` writes, `grep -O` runs a program, and a `-c` or env prefix
     // can make even `git log`/`git diff` run commands (diff.external, GIT_EXTERNAL_DIFF, core.pager, ...).
-    const plain = !config.length && !prefixed && !rargs.some((v) => /^--(output|output-directory|open-files-in-pager|ext-diff)(=|$)|^-O/.test(v));
+    // Long options may be abbreviated (`--out=f` is --output) and short ones bundled (`-nO<cmd>`), so match prefixes.
+    const execOpt = (v) => {
+      if (v.startsWith('--')) {
+        const name = v.split('=')[0];
+        return name.length >= 3 && ['--output', '--output-directory', '--open-files-in-pager', '--ext-diff'].some((o) => o.startsWith(name));
+      }
+      return sub === 'grep' && /^-[A-Za-z]*O/.test(v);
+    };
+    const plain = !config.length && !prefixed && !rargs.some(execOpt);
     if (sub && sub !== 'push' && !(plain && readOnlyGit(sub, rargs))) headMoves.push({ dir: gdir, sub, pushOnlyEffect: true });
     if (sub !== 'push') return;
     gitPushes.push({ dir: otherRepo ? null : gdir, args: cmd.slice(k + 1), moves: headMoves.filter((m) => !m.pushOnly), config,

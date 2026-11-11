@@ -72,16 +72,21 @@ PROMPT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prompts/prepush-revie
 CLAUDE_REVIEW_TOOLS="Read,Glob,Grep"
 CLAUDE_DENIED_TOOLS="Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
 
-# run_limited <seconds> <cmd...>: run with a time limit (exit 124 when it fires). Uses timeout(1); without it
-# (stock macOS) a watchdog sends TERM, then KILL, so a stalled reviewer can't hold the lock forever.
+# run_limited <seconds> <cmd...>: run with a time limit (exit 124 when it fires). The reviewer gets its own process
+# group (job control), so the watchdog's TERM, then KILL after a grace period, reaches everything it started, even
+# a process that ignores TERM; whatever is left when it exits is killed too. Neither the reviewer nor the watchdog
+# inherits the lock's descriptor (fd 9), so a straggler can never keep the next review locked out.
 run_limited() {
   local t="$1" pid w rc=0; shift
-  if command -v timeout >/dev/null 2>&1 && [ -z "${REVIEW_GATE_NO_TIMEOUT:-}" ]; then timeout "$t" "$@"; return; fi
-  "$@" <&0 & pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 & w=$!
-  wait "$pid" || rc=$?
-  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null || true
-  [ "$rc" -lt 128 ] || rc=124   # killed by the watchdog (or a signal): not a completed run
+  set -m
+  "$@" <&0 9>&- & pid=$!
+  set +m
+  ( sleep "$t"; kill -TERM -- "-$pid" 2>/dev/null; sleep "${REVIEW_GATE_KILL_GRACE:-30}"; kill -KILL -- "-$pid" 2>/dev/null ) \
+    9>&- </dev/null >/dev/null 2>&1 & w=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  [ "$rc" -lt 128 ] || rc=124   # ended by a signal (the watchdog): not a completed run
   return "$rc"
 }
 
@@ -143,7 +148,8 @@ parse_verdict() {
     }'
 }
 
-# One prepush/prepush-accept at a time per worktree: an older run must never publish a pass after a newer run of
+# The lock lives next to $dir, not in it, so `clear` (which deletes $dir, and takes the lock first) can't remove a
+# running review's lock. One prepush/prepush-accept/clear at a time per worktree: an older run must never publish a pass after a newer run of
 # the same commit started (or finished with findings). With flock(1) the kernel holds the lock for the life of
 # the process (released however it ends, so there is no stale lock to take over). Without flock (macOS), a
 # symlink whose target is the owner's pid is created atomically (`ln -s` fails if it exists, and the pid is never
@@ -152,11 +158,11 @@ LOCK=""; WORK=""
 take_lock() {
   mkdir -p "$dir"
   if command -v flock >/dev/null 2>&1 && [ -z "${REVIEW_GATE_NO_FLOCK:-}" ]; then
-    exec 9>>"$dir/prepush.lock"
+    exec 9>>"$gitdir/review-gate.lock"
     flock -n 9 || { echo "review-gate: another prepush/prepush-accept is running in this worktree; wait for it" >&2; exit 5; }
     return 0
   fi
-  local l="$dir/prepush.lock.pid" t="$dir/prepush.lock.takeover" pid
+  local l="$gitdir/review-gate.lock.pid" t="$gitdir/review-gate.lock.takeover" pid
   if ! ln -s "$$" "$l" 2>/dev/null; then
     # Taking over a dead owner's link is itself serialized (atomic mkdir), and the link is re-read inside, so a
     # second taker can never remove the link the first one just created.
@@ -288,6 +294,7 @@ case "${1:-help}" in
     printf '  %-11s %s [required before push]\n' prepush "$s"
     ;;
   clear)
+    take_lock   # never while a review runs: it would publish into what was just cleared
     if [ "${2:-}" = prepush ]; then
       rm -f "$(marker prepush)"; echo "review-gate: cleared prepush"
     elif [ -n "${2:-}" ]; then

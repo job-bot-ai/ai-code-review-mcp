@@ -19,6 +19,7 @@ cat >"$S/bin/codex" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >"$S/codex.args"; cat >"$S/codex.stdin"; : >"$S/codex.called"
 [ -z "\${STUB_SLEEP:-}" ] || sleep "\$STUB_SLEEP"
+if [ -n "\${STUB_STUBBORN:-}" ]; then trap '' TERM; sleep 40 & echo \$! >"$S/child.pid"; sleep 40; fi
 cat "$S/codex.out"; cat "$S/codex.err" >&2; exit "\$(cat "$S/codex.rc")"
 EOF
 cat >"$S/bin/claude" <<EOF
@@ -284,44 +285,55 @@ race() { # race → r1, r2 exit codes of two concurrent prepush runs (codex take
 race
 [ "$(printf '%s\n' "$r1" "$r2" | sort | tr '\n' ' ')" = "0 5 " ] && ok "two concurrent prepush runs: one reviews, the other is refused (exit 5)" || bad "concurrent runs: $r1 $r2"
 if command -v flock >/dev/null 2>&1; then
-  ( exec 9>>"$gd/review-gate/prepush.lock"; flock 9; sleep 3 ) & holder=$!; sleep 0.5
+  ( exec 9>>"$gd/review-gate.lock"; flock 9; sleep 3 ) & holder=$!; sleep 0.5
   (cd "$R" && bash "$gate" prepush-accept --reason "racing an ongoing review here") >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 5 ] && ok "prepush-accept waits for the lock too" || bad "accept during lock rc=$rc"
+  (cd "$R" && bash "$gate" clear) >/dev/null 2>"$T/e"; rc=$?
+  [ "$rc" -eq 5 ] && ok "clear waits for a running review (it can't delete its records or lock)" || bad "clear during lock rc=$rc"
   wait "$holder"
+  [ -e "$gd/review-gate.lock" ] && ok "the lock lives outside the directory clear removes" || bad "lock not at $gd/review-gate.lock"
 fi
 export REVIEW_GATE_NO_FLOCK=1   # the fallback lock (no flock, e.g. macOS)
 race
 [ "$(printf '%s\n' "$r1" "$r2" | sort | tr '\n' ' ')" = "0 5 " ] && ok "fallback lock: two concurrent runs, one refused" || bad "fallback concurrent runs: $r1 $r2"
 
-reset_marker; mkdir -p "$gd/review-gate"; ln -s 999999 "$gd/review-gate/prepush.lock.pid"
+reset_marker; mkdir -p "$gd/review-gate"; ln -s 999999 "$gd/review-gate.lock.pid"
 prep
 expect "fallback lock: a lock left by a dead process is taken over" 0 stdout "No findings."
-[ ! -e "$gd/review-gate/prepush.lock.pid" ] && ok "fallback lock: released after the run" || bad "fallback lock left behind"
-ln -s 999999 "$gd/review-gate/prepush.lock.pid"
-rm -f "$gd/review-gate/prepush.lock.pid"; ln -s 999999 "$gd/review-gate/prepush.lock.pid"
+[ ! -e "$gd/review-gate.lock.pid" ] && ok "fallback lock: released after the run" || bad "fallback lock left behind"
+ln -s 999999 "$gd/review-gate.lock.pid"
+rm -f "$gd/review-gate.lock.pid"; ln -s 999999 "$gd/review-gate.lock.pid"
 (cd "$R" && STUB_SLEEP=2 bash "$gate" prepush >/dev/null 2>&1; echo $? >"$T/r1") &
 (cd "$R" && STUB_SLEEP=2 bash "$gate" prepush >/dev/null 2>&1; echo $? >"$T/r2") &
 wait; r1="$(cat "$T/r1")"; r2="$(cat "$T/r2")"
 [ "$(printf '%s\n' "$r1" "$r2" | sort | tr '\n' ' ')" = "0 5 " ] && ok "fallback lock: two runs taking over the same dead lock, one refused" || bad "concurrent takeover: $r1 $r2"
-rm -f "$gd/review-gate/prepush.lock.pid"; ln -s 999999 "$gd/review-gate/prepush.lock.pid"; mkdir "$gd/review-gate/prepush.lock.takeover"
+rm -f "$gd/review-gate.lock.pid"; ln -s 999999 "$gd/review-gate.lock.pid"; mkdir "$gd/review-gate.lock.takeover"
 prep
 expect "fallback lock: a takeover already in progress refuses a second taker (no double takeover)" 5 stderr "taking over the lock"
-rmdir "$gd/review-gate/prepush.lock.takeover"; rm -f "$gd/review-gate/prepush.lock.pid"
-ln -s $$ "$gd/review-gate/prepush.lock.pid"
+rmdir "$gd/review-gate.lock.takeover"; rm -f "$gd/review-gate.lock.pid"
+ln -s $$ "$gd/review-gate.lock.pid"
 prep
 expect "fallback lock: a live owner refuses the run" 5 stderr "another prepush"
-rm -f "$gd/review-gate/prepush.lock.pid"; unset REVIEW_GATE_NO_FLOCK
+rm -f "$gd/review-gate.lock.pid"; unset REVIEW_GATE_NO_FLOCK
 
-# Without timeout(1) (stock macOS) the watchdog still enforces the limit, and the prompt still reaches codex.
+# The watchdog: the limit holds, the prompt still reaches the reviewer, and a reviewer that ignores TERM (with a
+# child of its own) is killed with its whole process group, leaving nothing that could hold the lock.
 reset_marker; codex_says 0 "No findings."; claude_says 1 ""
-out="$(cd "$R" && REVIEW_GATE_NO_TIMEOUT=1 bash "$gate" prepush 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
-expect "without timeout(1) a normal run still passes" 0 stdout "No findings."
-grep -q 'UNIQUE_DIFF_LINE' "$S/codex.stdin" && ok "without timeout(1) codex still gets the prompt on stdin" || bad "watchdog path lost stdin"
+prep
+grep -q 'UNIQUE_DIFF_LINE' "$S/codex.stdin" && ok "the reviewer gets the prompt on stdin through the watchdog" || bad "watchdog path lost stdin"
 reset_marker; start=$(date +%s)
-out="$(cd "$R" && REVIEW_GATE_NO_TIMEOUT=1 REVIEW_GATE_PREPUSH_TIMEOUT=1 STUB_SLEEP=20 bash "$gate" prepush 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
-expect "without timeout(1) a stalled codex is cut off by the watchdog (not a pass)" 4 stderr "codex exited 124"
+out="$(cd "$R" && REVIEW_GATE_PREPUSH_TIMEOUT=1 STUB_SLEEP=20 bash "$gate" prepush 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "a stalled codex is cut off by the watchdog (not a pass)" 4 stderr "codex exited 124"
 [ $(( $(date +%s) - start )) -lt 15 ] && ok "the watchdog fires near the limit" || bad "watchdog took $(( $(date +%s) - start ))s"
 no_marker "no marker after the watchdog fired"
+reset_marker; rm -f "$S/child.pid"; start=$(date +%s)
+out="$(cd "$R" && REVIEW_GATE_PREPUSH_TIMEOUT=1 REVIEW_GATE_KILL_GRACE=1 STUB_STUBBORN=1 bash "$gate" prepush 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "a reviewer that ignores TERM is killed after the grace period" 4 stderr "codex exited 124"
+[ $(( $(date +%s) - start )) -lt 15 ] && ok "the TERM-ignoring reviewer didn't run out its 40s" || bad "stubborn reviewer took $(( $(date +%s) - start ))s"
+cp_=$(cat "$S/child.pid" 2>/dev/null); sleep 0.3
+[ -n "$cp_" ] && ! kill -0 "$cp_" 2>/dev/null && ok "the reviewer's own child is killed with its process group" || bad "child $cp_ survived"
+codex_says 0 "No findings."; prep
+expect "the next review isn't locked out by a straggler" 0 stdout "No findings."
 
 # ── base, empty diff, record ──
 reset_marker; codex_says 0 "No findings."
@@ -519,6 +531,10 @@ run "$H" "git show -s --format=%H --output=.git/HEAD HEAD~1 && git push origin H
 expect "a read-only command with --output (writes a file) before the push is blocked" 2 stderr "\`git show\` runs before \`git push\`"
 run "$H" "git -c diff.external=true diff && git push origin HEAD"
 expect "a read-only command with a -c override before the push is blocked" 2 stderr "\`git diff\` runs before \`git push\`"
+run "$H" "git grep -nO'git update-ref HEAD HEAD~1' x -- README.md; git push origin HEAD"
+expect "a bundled grep -O (runs a program) before the push is blocked" 2 stderr "\`git grep\` runs before \`git push\`"
+run "$H" "git show --out=.git/HEAD HEAD~1 && git push origin HEAD"
+expect "an abbreviated --output (--out=) before the push is blocked" 2 stderr "\`git show\` runs before \`git push\`"
 run "$H" "GIT_EXTERNAL_DIFF=true git diff && git push origin HEAD"
 expect "a read-only command with an env prefix before the push is blocked" 2 stderr "\`git diff\` runs before \`git push\`"
 run "$H" "git push --repo \$REMOTE HEAD"

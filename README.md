@@ -267,8 +267,9 @@ with `--tools Read,Glob,Grep` (the only built-in tools that exist in the run), `
 `--strict-mcp-config` (no MCP servers), `--permission-mode dontAsk`, and
 `Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch` disallowed. The diff is in the prompt, so it needs no git commands; `Bash(git diff:*)` would still
 allow `git diff --output=<file>`, which writes. Time limit per reviewer:
-`REVIEW_GATE_PREPUSH_TIMEOUT` seconds (default 1500), enforced by `timeout(1)` or, without it, a
-watchdog (TERM, then KILL).
+`REVIEW_GATE_PREPUSH_TIMEOUT` seconds (default 1500), enforced by a watchdog on the reviewer's
+own process group (TERM, then KILL after `REVIEW_GATE_KILL_GRACE`, default 30 s), so nothing it
+started outlives the run.
 
 A run only counts as **completed** when the reviewer exited 0 (Claude: `is_error` false and
 `subtype` success) and its answer is either well-formed findings (each `[P0]`..`[P3]` on its own
@@ -286,9 +287,10 @@ Codex run that printed a tagged line in the wrong format fails the review whatev
   keeps the reason, and `check`, `check-prepush` and the hook announce it with the findings file).
 - Running `prepush` again on the same commit first withdraws that commit's earlier pass or
   acceptance: only the newest review of a commit stands. One `prepush`/`prepush-accept` runs at a
-  time per worktree (a second one exits 5). The lock is `flock` on `$GIT_DIR/review-gate/prepush.lock`
-  (released by the kernel however the run ends); without `flock` (macOS) a pid symlink is used,
-  and a link left by a dead process is taken over.
+  time per worktree, and `clear` waits for them too (a second one exits 5). The lock is `flock` on
+  `$GIT_DIR/review-gate.lock`, outside the directory `clear` removes (released by the kernel however
+  the run ends); without `flock` (macOS) a pid symlink is used, and a link left by a dead process is
+  taken over, one taker at a time.
 - The full output of every run is kept in `$GIT_DIR/review-gate/prepush-<sha>.txt`.
 
 **The hook blocks `git push`** until each commit it publishes to a branch has a `prepush` marker.
@@ -312,7 +314,8 @@ launched by `xargs`/`parallel` (its arguments come from stdin).
 **A push runs on its own.** The gate resolves what a push publishes from the refs and config as
 they are *before* the command runs, so in the same command a push may only follow read-only git
 commands (`status`, `log`, `diff`, `show`, `rev-parse`, listing `branch`/`tag`, `config --get`, ...),
-in their plain form (no `--output`, `grep -O`, `-c` or env prefix, which can write files or run programs).
+in their plain form (no `--output`/`--out=`, `--ext-diff`, `grep -O`/`-nO`, `-c` or env prefix, which can
+write files or run programs).
 Push options must be spelled out in full: git accepts abbreviations (`--al` is `--all`), so an option
 the gate doesn't know by its exact name is refused.
 A commit, fetch, config write, ref change (`branch -f`, `update-ref`, `checkout -B`), stash or alias
