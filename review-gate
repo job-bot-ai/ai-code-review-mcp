@@ -345,7 +345,10 @@ case "${1:-help}" in
     printf 'failed review in progress (started %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$res"
     work="$(mktemp -d)"; WORK="$work"
     # The reviewed commit is fixed now: a commit made while the review runs doesn't get this review.
-    git diff "$mb" "$head" >"$work/diff"
+    # The whole change, from the repo root, whatever the config or cwd says: no diff.relative (a subdirectory would
+    # only show its own files), no external diff or textconv, every submodule change, no color.
+    git -C "$(git rev-parse --show-toplevel)" -c diff.relative=false -c diff.noprefix=false diff --no-relative \
+      --no-ext-diff --no-textconv --no-color --ignore-submodules=none --submodule=short "$mb" "$head" >"$work/diff"
     if [ ! -s "$work/diff" ]; then
       echo "review-gate: no changes between $base and ${head:0:12}: nothing to review (is --base the PR's base?)" >&2
       printf 'failed no changes against %s\n' "$base" >"$res"; exit 4

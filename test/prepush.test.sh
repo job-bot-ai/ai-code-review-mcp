@@ -335,6 +335,15 @@ cp_=$(cat "$S/child.pid" 2>/dev/null); sleep 0.3
 codex_says 0 "No findings."; prep
 expect "the next review isn't locked out by a straggler" 0 stdout "No findings."
 
+# The diff is the whole change even from a subdirectory with diff.relative=true.
+reset_marker; mkdir -p "$R/sub" && printf 'x\n' >"$R/sub/s.txt" && git -C "$R" add sub/s.txt && git -C "$R" commit -q -m sub
+git -C "$R" config diff.relative true
+codex_says 0 "No findings."
+out="$(cd "$R/sub" && bash "$gate" prepush 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+grep -q 'UNIQUE_DIFF_LINE' "$S/codex.stdin" && grep -q 'sub/s.txt' "$S/codex.stdin" &&
+  ok "with diff.relative=true, prepush from a subdirectory still reviews every file" || bad "relative diff: prompt lacks files outside sub/"
+git -C "$R" config --unset diff.relative; git -C "$R" reset -q --hard HEAD~1
+
 # ── base, empty diff, record ──
 reset_marker; codex_says 0 "No findings."
 git -C "$R" update-ref refs/remotes/origin/feat/base "$(git -C "$R" rev-parse HEAD~1)"
@@ -519,6 +528,12 @@ run "$H" "git -c submodule.recurse push origin HEAD"
 expect "a valueless -c submodule.recurse (true) is blocked" 2 stderr "submodule commits"
 run "$H" "MODE=on-demand git --config-env=push.recurseSubmodules=MODE push origin HEAD"
 expect "--config-env (unreadable override) is blocked even with a refspec" 2 stderr "config override the gate can't read"
+run "$H" "git push origin HEAD 2>&1"
+expect "2>&1 after a push is a redirection, not a refspec (reviewed → allowed)" 0
+run "$H" "git push origin HEAD > \"$T/push.log\" 2>&1"
+expect "> file 2>&1 after a push is a redirection too" 0
+run "$H" "git push origin '<feat/other' 2>/dev/null"
+expect "a quoted refspec that starts with < is a refspec, not a redirection" 2 stderr "can't resolve \`<feat/other\`"
 run "$H" "git push --al origin"
 expect "an abbreviated long option (--al = --all) is refused" 2 stderr "spell it out in full"
 run "$H" "git push --recurse-submodule=on-demand origin HEAD"

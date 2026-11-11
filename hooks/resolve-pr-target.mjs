@@ -209,29 +209,32 @@ export function tokenize(src) {
   let tilde = false;
   let substs = [];
   let hereString = false;
+  let quoted = false; // any part of the word was quoted or escaped
+  let redirect = false; // the word is a redirection operator (with its target when glued: `>/dev/null`)
+  let fd = false; // the word is the fd number of the redirection right after it (`2` in `2>&1`)
   const add = (s) => { if (word === null) tilde = false; word = (word ?? '') + s; };
   const push = () => {
-    if (word !== null) out.push({ type: 'word', value: word, dynamic, tilde, substs, herestring: hereString });
+    if (word !== null) out.push({ type: 'word', value: word, dynamic, tilde, substs, herestring: hereString, quoted, redirect, fd });
     if (word !== null) hereString = false;
-    word = null; dynamic = false; tilde = false; substs = [];
+    word = null; dynamic = false; tilde = false; substs = []; quoted = false; redirect = false; fd = false;
   };
   let i = 0;
   while (i < src.length) {
     const c = src[i];
     if (c === '\\') {
       if (src[i + 1] === '\n') { i += 2; continue; }
-      if (i + 1 < src.length) add(src[i + 1]);
+      if (i + 1 < src.length) { add(src[i + 1]); quoted = true; }
       i += 2;
       continue;
     }
-    if (c === "'") { const end = skipSingleQuoted(src, i + 1); add(src.slice(i + 1, end - 1)); i = end; continue; }
-    if (c === '"') { const r = readDoubleQuoted(src, i + 1); add(r.value); dynamic ||= r.dynamic; substs.push(...r.substs); i = r.end; continue; }
+    if (c === "'") { const end = skipSingleQuoted(src, i + 1); add(src.slice(i + 1, end - 1)); quoted = true; i = end; continue; }
+    if (c === '"') { const r = readDoubleQuoted(src, i + 1); add(r.value); quoted = true; dynamic ||= r.dynamic; substs.push(...r.substs); i = r.end; continue; }
     if (c === '`') { const end = skipBackticks(src, i + 1); substs.push(backtickBody(src, i, end)); add('`...`'); dynamic = true; i = end; continue; }
     if (c === '$' && src[i + 1] === "'") {
       // ANSI-C quoting: literal unless it uses escapes we don't decode.
       const end = skipAnsiC(src, i + 2);
       const body = src.slice(i + 2, end - 1);
-      add(body); dynamic ||= body.includes('\\'); i = end;
+      add(body); quoted = true; dynamic ||= body.includes('\\'); i = end;
       continue;
     }
     if (c === '$') {
@@ -276,7 +279,7 @@ export function tokenize(src) {
       const two = src.slice(i, i + 2);
       if (two === '&&' || two === '||') { out.push({ type: 'op', value: two }); i += 2; }
       else if (two === '|&') { out.push({ type: 'op', value: '|' }); i += 2; }
-      else if (c === '&' && src[i + 1] === '>') { add('&>'); i += 2; } // &>file redirect
+      else if (c === '&' && src[i + 1] === '>') { add('&>'); redirect = true; i += 2; } // &>file redirect
       else { out.push({ type: 'op', value: c }); i += 1; }
       continue;
     }
@@ -285,7 +288,8 @@ export function tokenize(src) {
     if (/\s/.test(c)) { push(); i += 1; continue; }
     if (c === '>' || c === '<') {
       // A redirection starts its own word, glued to its target (`>/dev/null`, `>&1`).
-      push(); add(c); i += 1;
+      if (word !== null && !quoted && /^\d+$/.test(word)) fd = true; // `2>&1`: the digits are its fd
+      push(); add(c); redirect = true; i += 1;
       if (src[i] === '&') { add('&'); i += 1; }
       continue;
     }
@@ -1332,7 +1336,8 @@ function resolvePush(p) {
   for (let j = 0; j < args.length; j++) {
     const w = args[j];
     const v = w.value;
-    if (/^\d*[<>]/.test(v)) { if (/^\d*[<>]+&?$/.test(v)) j += 1; continue; } // a redirection, not an argument
+    if (w.fd) continue; // `2` of `2>&1`
+    if (w.redirect) { if (/^(&>|[<>]+)&?$/.test(v)) j += 1; continue; } // a redirection (and its target), not an argument
     if (v === '--') { positional.push(...args.slice(j + 1)); break; }
     if (w.dynamic) { // could expand to --all, another refspec, ...
       return { block: `\`git push\` has a non-literal argument (${v}) that could change what it pushes; pass it literally` };
