@@ -572,7 +572,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     s.dir = s.dirStack.length ? s.dirStack.pop() : null;
   };
 
-  const recordPush = (cmd, base = scope().dir, envRepo = false) => {
+  const recordPush = (cmd, base = scope().dir, envRepo = false, prefixed = false) => {
     // `git [-C dir] push [opts] <remote> <src>:<dst> ...` — lets `--head <dst>` be checked at
     // <src> even though the push (and its remote-tracking ref) hasn't happened yet.
     let k = 1;
@@ -617,7 +617,10 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // The gate resolves a push against refs and config as they are BEFORE the command runs, so a push may only
     // follow read-only git commands: anything else (fetch, config writes, ref updates, aliases, ...) could change
     // what it publishes. Recorded for the push gate only (the PR gate keeps its own HEAD-mover rule).
-    if (sub && sub !== 'push' && !readOnlyGit(sub, rargs)) headMoves.push({ dir: gdir, sub, pushOnlyEffect: true });
+    // Read-only only in its plain form: `--output=<file>` writes, `grep -O` runs a program, and a `-c` or env prefix
+    // can make even `git log`/`git diff` run commands (diff.external, GIT_EXTERNAL_DIFF, core.pager, ...).
+    const plain = !config.length && !prefixed && !rargs.some((v) => /^--(output|output-directory|open-files-in-pager|ext-diff)(=|$)|^-O/.test(v));
+    if (sub && sub !== 'push' && !(plain && readOnlyGit(sub, rargs))) headMoves.push({ dir: gdir, sub, pushOnlyEffect: true });
     if (sub !== 'push') return;
     gitPushes.push({ dir: otherRepo ? null : gdir, args: cmd.slice(k + 1), moves: headMoves.filter((m) => !m.pushOnly), config,
       why: otherRepo ? '`git push` names another repository or injects git config (GIT_DIR, GIT_CONFIG_*, --git-dir or --work-tree), so the gate can\'t tell which commit it pushes. Run it from the checkout: `cd /path/to/checkout && git push ...`' : null });
@@ -772,7 +775,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     const c0 = progName(cmd[0]);
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
-    if (c0 === 'git') { recordPush(cmd, here, gitEnvHere); return; }
+    if (c0 === 'git') { recordPush(cmd, here, gitEnvHere, assigns.length > 0); return; }
     // An API client (runners already unwrapped above) that sends the ready mutation in its
     // arguments, a heredoc, a here-string or a pipe. Only for a runner whose arguments can't be
     // parsed is every argument scanned for a client, and then a `gh pr create|ready` among its
@@ -1220,6 +1223,14 @@ const PUSH_RISKY = /(^|[\s;&|(){}'"`])(cd|pushd|popd)(\s|$)|(^|\s)(-C|--git-dir|
 // `git push` options that take a separate value, and the short ones that take one (attached or next word).
 const PUSH_VALUE_LONG = new Set(['--repo', '--push-option', '--receive-pack', '--exec']);
 const PUSH_VALUE_SHORT = new Set(['o']);
+// Every `git push` option, by its full name (git 2.4x). Anything else, abbreviations included, is refused.
+const PUSH_LONG = new Set(('--all --branches --mirror --tags --no-tags --follow-tags --no-follow-tags --atomic --no-atomic ' +
+  '--dry-run --no-dry-run --porcelain --no-porcelain --delete --no-delete --prune --no-prune --force --no-force ' +
+  '--force-with-lease --no-force-with-lease --force-if-includes --no-force-if-includes --repo --set-upstream ' +
+  '--no-set-upstream --thin --no-thin --quiet --no-quiet --verbose --no-verbose --progress --no-progress ' +
+  '--push-option --no-push-option --receive-pack --exec --recurse-submodules --no-recurse-submodules --verify ' +
+  '--no-verify --signed --no-signed --ipv4 --ipv6 --help').split(' '));
+const PUSH_SHORT = new Set([...'qvndfu46oh']);
 // Config that decides what a push without refspecs publishes (`remote.<name>.push`, push.default=matching).
 const PUSH_CONFIG = /^(remote\..+\.push|remote\..+\.mirror|push\.default)=/i;
 
@@ -1309,6 +1320,8 @@ function resolvePush(p) {
     }
     if (v.startsWith('--')) {
       const name = v.split('=')[0];
+      // git accepts any unique prefix of a long option (`--al` is --all): only exact, known names are read.
+      if (!PUSH_LONG.has(name)) return { block: `\`git push ${name}\` isn't an option the gate knows by that exact name (git also takes abbreviations like --al for --all); spell it out in full` };
       if (name === '--delete') del = true;
       else if (name === '--no-delete') del = false; // the last of --x / --no-x wins, as in git
       else if (name === '--dry-run') dry = true;
@@ -1326,6 +1339,7 @@ function resolvePush(p) {
     if (/^-[A-Za-z0-9]/.test(v)) {
       for (let c = 1; c < v.length; c++) {
         const ch = v[c];
+        if (!PUSH_SHORT.has(ch)) return { block: `\`git push -${ch}\` isn't an option the gate knows; spell the option out in full` };
         if (ch === 'd') del = true;
         if (ch === 'n') dry = true;
         if (ch === 'h') help = true;

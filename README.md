@@ -307,7 +307,10 @@ and git aliases that push (followed through alias chains, in the checkout git ru
 
 **A push runs on its own.** The gate resolves what a push publishes from the refs and config as
 they are *before* the command runs, so in the same command a push may only follow read-only git
-commands (`status`, `log`, `diff`, `show`, `rev-parse`, listing `branch`/`tag`, `config --get`, ...).
+commands (`status`, `log`, `diff`, `show`, `rev-parse`, listing `branch`/`tag`, `config --get`, ...),
+in their plain form (no `--output`, `grep -O`, `-c` or env prefix, which can write files or run programs).
+Push options must be spelled out in full: git accepts abbreviations (`--al` is `--all`), so an option
+the gate doesn't know by its exact name is refused.
 A commit, fetch, config write, ref change (`branch -f`, `update-ref`, `checkout -B`), stash or alias
 before it blocks: run that first, re-run `review-gate prepush` if HEAD changed, then push. A tag
 pushed to a branch (`v1:release`) is checked like a branch push. A push handed to something the
