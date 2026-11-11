@@ -178,7 +178,8 @@ prep
 expect "codex timing out falls back to a claude review that can pass" 0 stdout "(claude vs origin/main): No findings."
 has_marker "the claude fallback records the marker"
 grep -qx -- '-p' "$S/claude.args" && grep -qx -- '--disallowedTools' "$S/claude.args" && grep -qx 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch' "$S/claude.args" &&
-  grep -qx 'Read,Glob,Grep' "$S/claude.args" &&
+  grep -qx 'Read,Glob,Grep' "$S/claude.args" && grep -qx -- '--restricted' "$S/claude.args" && grep -qx -- '--strict-mcp-config' "$S/claude.args" &&
+  grep -qx -- '--tools' "$S/claude.args" && grep -qx 'dontAsk' "$S/claude.args" &&
   ok "the claude fallback runs read-only (-p, only Read/Glob/Grep allowed, Bash and edit tools disallowed)" || bad "claude args" "$(cat "$S/claude.args")"
 grep -q 'UNIQUE_DIFF_LINE' "$S/claude.stdin" && ok "claude gets the full diff too" || bad "claude prompt lacks diff"
 (cd "$R" && bash "$gate" status) >"$T/st" 2>&1
@@ -311,6 +312,17 @@ prep
 expect "fallback lock: a live owner refuses the run" 5 stderr "another prepush"
 rm -f "$gd/review-gate/prepush.lock.pid"; unset REVIEW_GATE_NO_FLOCK
 
+# Without timeout(1) (stock macOS) the watchdog still enforces the limit, and the prompt still reaches codex.
+reset_marker; codex_says 0 "No findings."; claude_says 1 ""
+out="$(cd "$R" && REVIEW_GATE_NO_TIMEOUT=1 bash "$gate" prepush 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "without timeout(1) a normal run still passes" 0 stdout "No findings."
+grep -q 'UNIQUE_DIFF_LINE' "$S/codex.stdin" && ok "without timeout(1) codex still gets the prompt on stdin" || bad "watchdog path lost stdin"
+reset_marker; start=$(date +%s)
+out="$(cd "$R" && REVIEW_GATE_NO_TIMEOUT=1 REVIEW_GATE_PREPUSH_TIMEOUT=1 STUB_SLEEP=20 bash "$gate" prepush 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "without timeout(1) a stalled codex is cut off by the watchdog (not a pass)" 4 stderr "codex exited 124"
+[ $(( $(date +%s) - start )) -lt 15 ] && ok "the watchdog fires near the limit" || bad "watchdog took $(( $(date +%s) - start ))s"
+no_marker "no marker after the watchdog fired"
+
 # ── base, empty diff, record ──
 reset_marker; codex_says 0 "No findings."
 git -C "$R" update-ref refs/remotes/origin/feat/base "$(git -C "$R" rev-parse HEAD~1)"
@@ -360,7 +372,6 @@ blocked_forms=(
   "GIT_TERMINAL_PROMPT=0 git push"
   "sudo -uroot git push"
   "bash -c 'git push origin HEAD'"
-  "echo HEAD | xargs git push origin"
   "true && git push --force-with-lease origin HEAD:feat/x"
   "git push origin +HEAD:refs/heads/feat/x"
   "git push --follow-tags origin HEAD"
@@ -383,6 +394,10 @@ for c in "${blocked_forms[@]}"; do
   expect "reviewed push is allowed: $c" 0
 done
 
+run "$H" "echo HEAD | xargs git push origin"
+expect "git push run by xargs is blocked even with a reviewed HEAD (its arguments come from stdin)" 2 stderr "adds arguments the gate can't see"
+run "$H" "echo --all | xargs git push origin"
+expect "xargs can't smuggle --all into a push" 2 stderr "adds arguments the gate can't see"
 run "$H" "git commit -q --allow-empty -m wip && git push"
 expect "a commit in the same command as the push is blocked (it can't have been reviewed)" 2 stderr "\`git commit\` runs before \`git push\`"
 git -C "$H" branch -q feat/other HEAD~1

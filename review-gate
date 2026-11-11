@@ -67,13 +67,22 @@ prepush_note() {
 PROMPT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prompts/prepush-review.md"
 # Read-only by construction: the diff is already in the prompt, so the fallback gets file reads only. No Bash at all,
 # not even `git diff/log/show`: those take --output=<file> and could overwrite the checkout.
+# --tools makes them the only built-in tools that exist, --restricted removes every code-running tool,
+# --strict-mcp-config (with no --mcp-config) loads no MCP servers, and dontAsk denies anything not allowed.
 CLAUDE_REVIEW_TOOLS="Read,Glob,Grep"
 CLAUDE_DENIED_TOOLS="Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
 
-# run_limited <seconds> <cmd...>: run with a time limit when `timeout` exists (exit 124 when it fires).
+# run_limited <seconds> <cmd...>: run with a time limit (exit 124 when it fires). Uses timeout(1); without it
+# (stock macOS) a watchdog sends TERM, then KILL, so a stalled reviewer can't hold the lock forever.
 run_limited() {
-  local t="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then timeout "$t" "$@"; else "$@"; fi
+  local t="$1" pid w rc=0; shift
+  if command -v timeout >/dev/null 2>&1 && [ -z "${REVIEW_GATE_NO_TIMEOUT:-}" ]; then timeout "$t" "$@"; return; fi
+  "$@" <&0 & pid=$!
+  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 & w=$!
+  wait "$pid" || rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null || true
+  [ "$rc" -lt 128 ] || rc=124   # killed by the watchdog (or a signal): not a completed run
+  return "$rc"
 }
 
 # The verdict part of a Codex run's stdout: after its last "codex" header line if it prints a transcript,
@@ -381,7 +390,8 @@ case "${1:-help}" in
       else
         rc=0
         (cd "$top" && run_limited "$tmo" claude -p --output-format json --max-turns 40 --no-session-persistence \
-          --permission-mode default --allowedTools "$CLAUDE_REVIEW_TOOLS" \
+          --restricted --strict-mcp-config --tools "$CLAUDE_REVIEW_TOOLS" \
+          --permission-mode dontAsk --allowedTools "$CLAUDE_REVIEW_TOOLS" \
           --disallowedTools "$CLAUDE_DENIED_TOOLS" <"$work/prompt" >"$work/lo" 2>"$work/le") || rc=$?
         { printf '\n===== claude -p (exit %s): stdout =====\n' "$rc"; cat "$work/lo"; printf '\n===== claude stderr =====\n'; cat "$work/le"; } >>"$out"
         jq -r 'if .is_error == false and .subtype == "success" and (.result | type) == "string" then .result else empty end' \

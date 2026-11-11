@@ -845,7 +845,12 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       : cmd.findIndex((w, idx) => idx > 0 && !w.dynamic && progName(w) === 'git');
     if (kGitArg > 0) {
       const chdir = RUNNERS.has(c0) && cmd.slice(1, kGitArg).some((w) => /^(--chdir|-[A-Za-z]*[CD])/.test(w.value));
+      const before = gitPushes.length;
       recordPush(cmd.slice(kGitArg), chdir ? null : here, gitEnvHere);
+      // xargs/parallel append arguments read from stdin: the push's real refspecs and options are unknown.
+      if (['xargs', 'parallel'].includes(c0)) {
+        for (const g of gitPushes.slice(before)) g.why ??= `\`${c0} git ...\` adds arguments the gate can't see (from stdin), so it can't tell what the push publishes. Run \`git push <remote> <refspec>\` directly`;
+      }
     }
     if (RUNNERS.has(c0)) {
       // `timeout 60 gh pr create ...`, `env -C dir GH_REPO=o/r gh pr create ...`

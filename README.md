@@ -263,10 +263,12 @@ prompt) with **Codex** (`codex review -c sandbox_mode="read-only" -`, prompt mod
 instructions, so it could carry neither the punch list nor the answer format). If Codex can't run
 (non-zero exit or timeout, any `ERROR:` line such as the usage limit, quota or login error, or no
 final message), it falls back to a **read-only Claude** review: `claude -p --output-format json`
-with only `Read,Glob,Grep` allowed and `Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch`
-disallowed. The diff is in the prompt, so it needs no git commands; `Bash(git diff:*)` would still
+with `--tools Read,Glob,Grep` (the only built-in tools that exist in the run), `--restricted`,
+`--strict-mcp-config` (no MCP servers), `--permission-mode dontAsk`, and
+`Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch` disallowed. The diff is in the prompt, so it needs no git commands; `Bash(git diff:*)` would still
 allow `git diff --output=<file>`, which writes. Time limit per reviewer:
-`REVIEW_GATE_PREPUSH_TIMEOUT` seconds (default 1500).
+`REVIEW_GATE_PREPUSH_TIMEOUT` seconds (default 1500), enforced by `timeout(1)` or, without it, a
+watchdog (TERM, then KILL).
 
 A run only counts as **completed** when the reviewer exited 0 (Claude: `is_error` false and
 `subtype` success) and its answer is either well-formed findings (each `[P0]`..`[P3]` on its own
@@ -291,7 +293,7 @@ Codex run that printed a tagged line in the wrong format fails the review whatev
 
 **The hook blocks `git push`** until each commit it publishes to a branch has a `prepush` marker.
 The same resolver as the PR gate finds the push wherever it runs: `cd`/`git -C <dir>`, chained
-commands, env prefixes, runners (`timeout`, `env`, `sudo`, `xargs`), `bash -c`, heredocs, and the
+commands, env prefixes, runners (`timeout`, `env`, `sudo`), `bash -c`, heredocs, and the
 credential-helper form `git -c credential.helper= -c credential.helper='!f(){ ...; }; f' push -q -u origin HEAD`.
 It checks the commit actually pushed (`git push origin feat/other` checks `feat/other`, in the
 worktree that has it checked out). Not gated: `--delete`/`-d`/`:branch`, tags only (`--tags`,
@@ -304,7 +306,8 @@ prefix, an `env` assignment, or exported earlier in the command, including into 
 publish more than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`,
 or a `-c` override of those: name the refspec, `git push origin HEAD`), submodule-recursing
 pushes (`--recurse-submodules=on-demand|only`, `push.recurseSubmodules`, `submodule.recurse=true`),
-and git aliases that push (followed through alias chains, in the checkout git runs in).
+git aliases that push (followed through alias chains, in the checkout git runs in), and a push
+launched by `xargs`/`parallel` (its arguments come from stdin).
 
 **A push runs on its own.** The gate resolves what a push publishes from the refs and config as
 they are *before* the command runs, so in the same command a push may only follow read-only git
