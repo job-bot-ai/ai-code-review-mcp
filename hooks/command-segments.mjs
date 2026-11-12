@@ -8,15 +8,48 @@
 //   redirect targets  the words written to by > >> >| &> (an fd duplication like >&2 is not a target)
 //   alone  1 when the command is only assignments (`HOME=/x`: it holds for the rest of the shell)
 //   assigned names    the NAME= words before the command word
+//   written  for cp/mv/ln/install/rsync (also behind sudo/env/timeout/nice/nohup/exec): the paths it writes, the
+//            destination (the last operand, or -t DIR) and, for mv, its sources too (moving one away removes it);
+//            every operand when a word is built at run time
+//   copier   1 when written was worked out; 0 otherwise (the hook then treats any path in the command as written)
 // Code fed to a shell on stdin (a heredoc or here-string to bash/sh/zsh/dash/ksh, or to eval/source/.) is code too:
 // its commands are listed as well.
 // It splits with the hook's own tokenizer (resolve-pr-target.mjs): quotes, heredocs and substitutions stay inside
 // the command that holds them. Exit 1 (no output) when it can't tokenize; the hook then falls back to a cruder split.
 // Part of https://github.com/job-bot-ai/ai-code-review-mcp
 import { readFileSync } from 'node:fs';
-import { tokenize, SHELLS, progName } from './resolve-pr-target.mjs';
+import { tokenize, SHELLS, progName, runnerExec } from './resolve-pr-target.mjs';
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_%]*\+?=/;
+const COPIERS = new Set(['cp', 'mv', 'ln', 'install', 'rsync']);
+
+/** The paths a cp/mv/ln/install/rsync command writes: [written[], parsed]. */
+function copierWrites(words, k) {
+  const prog = progName(words[k]);
+  if (!COPIERS.has(prog)) return [[], false];
+  const args = words.slice(k + 1).filter((w) => !w.heredoc && !w.herestring && !/^\d*[<>&]/.test(w.value));
+  const operands = [];
+  let target = null;
+  let endOpts = false;
+  for (let a = 0; a < args.length; a += 1) {
+    const v = args[a].value;
+    if (!endOpts && v === '--') { endOpts = true; continue; }
+    if (!endOpts && v === '--target-directory') { target = args[a + 1]?.value ?? ''; a += 1; continue; }
+    if (!endOpts && v.startsWith('--target-directory=')) { target = v.slice('--target-directory='.length); continue; }
+    if (!endOpts && /^-[A-Za-z]*t$/.test(v)) { target = args[a + 1]?.value ?? ''; a += 1; continue; } // -t DIR, -rt DIR
+    if (!endOpts && /^-[A-Za-z]*t./.test(v) && !v.startsWith('--')) { target = v.slice(v.indexOf('t') + 1); continue; } // -tDIR
+    if (!endOpts && v.startsWith('-') && v !== '-') continue;
+    operands.push(v);
+  }
+  // A word built at run time could be an option (-t DIR) or a path: every operand counts as written.
+  if (args.some((w) => w.dynamic)) return [operands.concat(target ?? []), true];
+  const written = [];
+  if (target !== null) written.push(target);
+  else if (operands.length) written.push(operands[operands.length - 1]);
+  if (prog === 'mv') written.push(...(target !== null ? operands : operands.slice(0, -1)));
+  if (prog === 'rsync' && args.some((w) => w.value === '--remove-source-files')) written.push(...operands);
+  return [written, true];
+}
 const flat = (s) => s.replace(/[\t\n\r]/g, ' ');
 
 export function segments(src, out = [], depth = 0) {
@@ -42,13 +75,17 @@ export function segments(src, out = [], depth = 0) {
       targets.push(t);
     }
     const text = words.filter((w) => !w.heredoc).map((w) => w.value).join(' ');
+    let k = i;
+    for (let n = 0; n < 5 && words[k]; n += 1) { const r = runnerExec(words.slice(k)); if (!r) break; k += r.k; }
+    const [written, copier] = words[k] ? copierWrites(words, k) : [[], false];
     if (cmd && (SHELLS.has(progName(cmd)) || ['eval', 'source', '.'].includes(cmd.value))) {
       for (const w of words) {
         if (w.heredoc) stdinCode.push(w.heredoc); // its body is read after this command's line
         else if (w.herestring) nested.push(w.value);
       }
     }
-    out.push([subst ? 1 : 0, flat(text), flat(targets.join(' ')), i === words.length ? 1 : 0, names.join(' ')].join('\x1f'));
+    out.push([subst ? 1 : 0, flat(text), flat(targets.join(' ')), i === words.length ? 1 : 0, names.join(' '),
+      flat(written.join(' ')), copier ? 1 : 0].join('\x1f'));
     words = [];
   };
   for (const t of tokenize(src)) {

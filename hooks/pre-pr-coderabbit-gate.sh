@@ -85,8 +85,8 @@ bypass_check() {
   # (`HOME=/tmp npm test; git status`, `PATH=$PATH:/x go build`). Only assignments holds for the rest of the shell.
   local ev='(GIT_CONFIG[[:alnum:]_]*|GIT_DIR|GIT_COMMON_DIR|HOME|XDG_CONFIG_HOME|XDG_STATE_HOME|PATH|BASH_ENV|ENV|BASH_FUNC_[^[:space:]=]*|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH)'
   env_reaches_git() {
-    local sub text tg alone names
-    while IFS="$US" read -r sub text tg alone names; do
+    local sub text tg alone names _wr _parsed
+    while IFS="$US" read -r sub text tg alone names _wr _parsed; do
       [ -n "$text" ] || continue
       printf ' %s ' "$names" | grep -Eq -- " $ev " ||
         printf '%s' "$text" | grep -Eq -- "(^|[[:space:]])(env|export|declare|typeset|readonly|local)([[:space:]]+[^[:space:]]+)*[[:space:]]+$ev[[:space:]]*\\+?=" ||
@@ -102,6 +102,21 @@ bypass_check() {
   local prot='(\.gitconfig|\.git/config|git/config|\.git/hooks|(^|[^[:alnum:]_.-])githooks(/|$|[[:space:]])|review-gate-prepush|(^|[^[:alnum:]_-])\.openqodex(/|$|[[:space:]]))'
   local protp='(\.gitconfig|\.git/config|git/config|\.git/hooks|githooks|review-gate-prepush|\.openqodex)'
   local tool='(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod|install|rsync|dd)([^[:alnum:]_-]|$)'
+  # cp/mv/ln/install/rsync write only their destination (and mv removes its sources): when command-segments.mjs could
+  # work that out (field 6/7), only those paths count, so `cp ~/.gitconfig /tmp/backup` is a read. When it couldn't
+  # (xargs cp, bash -c 'cp ...', no node), any protected path in the command counts. The other tools write what they name.
+  local copiers='(^|[^[:alnum:]_-])(cp|mv|ln|install|rsync)([^[:alnum:]_-]|$)'
+  local others='(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|rm|truncate|chmod|dd)([^[:alnum:]_-]|$)'
+  tool_writes_prot() {
+    local sub text tg alone names wr parsed
+    while IFS="$US" read -r sub text tg alone names wr parsed; do
+      printf '%s' "$text" | grep -Eq -- "$prot" || continue
+      printf '%s' "$text" | grep -Eq -- "$others" && return 0
+      if [ "$parsed" = 1 ]; then printf '%s' "$wr" | grep -Eq -- "$protp" && return 0
+      else printf '%s' "$text" | grep -Eq -- "$copiers" && return 0; fi
+    done <<<"$segtsv"
+    return 1
+  }
   if m '(^|[^[:alnum:]_])(REVIEW_GATE_[[:alnum:]_]*|OPENQODEX_[[:alnum:]_]*)[[:space:]]*=' || m '(^|[^[:alnum:]_])REVIEW_GATE_PREPUSH([^[:alnum:]_]|$)'; then
     why="it sets a REVIEW_GATE_* / OPENQODEX_* variable. The gate's settings, and the REVIEW_GATE_PREPUSH=off switch, are Tim's."
   elif m '(^|[^[:alnum:]_.-])review.gate([[:space:]]+[^;&|]*)?[[:space:]]prepush-accept([^[:alnum:]_-]|$)'; then
@@ -127,7 +142,7 @@ bypass_check() {
   elif m 'install-githooks' && m '--uninstall'; then
     why="it uninstalls the pre-push hook."
   elif printf '%s\n' "$targets" | grep -Eq -- "$protp" ||
-       seg2 "(^|[^0-9&>])>>?\|?[[:space:]]*[^[:space:]]*$protp" . || seg2 "$prot" "$tool" ||
+       seg2 "(^|[^0-9&>])>>?\|?[[:space:]]*[^[:space:]]*$protp" . || tool_writes_prot ||
        { [ "$crude" = 1 ] && m "$prot" && m "((^|[^0-9&>])>|$tool)"; } ||
        { { printf '%s' "$targets" | grep -q '[^[:space:]]' || seg2 "$tool" .; } &&
          { seg2 "$prot" '(^|[^[:alnum:]_])(cd|pushd)[[:space:]]' || seg2 "[[:alnum:]_]\+?=[^[:space:]]*$protp" .; }; }; then
@@ -218,9 +233,10 @@ while IFS= read -r t; do
   [ -n "$t" ] || continue
   dir="$(printf '%s' "$t" | jq -r '.dir')"
   rev="$(printf '%s' "$t" | jq -r '.rev // empty')"
+  tbranch="$(printf '%s' "$t" | jq -r '.branch // empty')"   # the PR's branch: its base is what the review is judged by
   note="$(printf '%s' "$t" | jq -r '.note // empty')"
   where="$dir${rev:+ @ ${rev:0:12}}"
-  out="$( (cd "$dir" && bash "$gate" check ${rev:+--rev "$rev"}) 2>&1 >/dev/null )"; rc=$?
+  out="$( (cd "$dir" && bash "$gate" check ${rev:+--rev "$rev"} ${tbranch:+--branch "$tbranch"}) 2>&1 >/dev/null )"; rc=$?
   [ -n "$note" ] && msgs="${msgs:+$msgs
 }review-gate: $note"
   case "$rc" in

@@ -1006,10 +1006,13 @@ function resolveOne(hit) {
     if (!git(dir, 'rev-parse', '--verify', '--quiet', `${pr.oid}^{commit}`)) {
       return { block: `the PR's head commit ${pr.oid.slice(0, 12)} (${pr.branch}) isn't in ${dir}, so it can't have been reviewed there. Fetch or check out the branch, review that commit, then run \`gh pr ready\`.` };
     }
-    return { target: { dir, rev: pr.oid, note: notes.length ? notes.join('; ') : null } };
+    // The PR's branch goes with its commit: `check` judges the review's base against THIS PR's base, not against the
+    // branch that happens to be checked out in dir.
+    return { target: { dir, rev: pr.oid, branch: pr.branch ?? null, note: notes.length ? notes.join('; ') : null } };
   }
 
   let rev = null;
+  let headBranch = null;
   if (head === null) {
     return { block: '--head is not a literal value, so there is no way to tell which commit the PR contains. Pass the branch name literally.' };
   }
@@ -1017,6 +1020,7 @@ function resolveOne(hit) {
     const colon = head.indexOf(':');
     const owner = colon >= 0 ? head.slice(0, colon).toLowerCase() : null;
     const branch = colon >= 0 ? head.slice(colon + 1) : head;
+    headBranch = branch;
     if (owner && !remoteSlugs().some((slug) => slug.split('/')[0] === owner)) {
       return { block: `--head ${head} is a branch in ${owner}'s repo, but none of ${dir}'s remotes belong to ${owner}` };
     }
@@ -1052,7 +1056,7 @@ function resolveOne(hit) {
       }
     }
   }
-  return { target: { dir, rev, note: notes.length ? notes.join('; ') : null } };
+  return { target: { dir, rev, branch: headBranch, note: notes.length ? notes.join('; ') : null } };
 }
 
 export function resolveTargets(command, cwd, env = process.env) {

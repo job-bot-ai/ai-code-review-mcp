@@ -400,11 +400,20 @@ case "${1:-help}" in
     echo "review-gate: every gate check on this commit will announce the skip; a real pass still needs another reviewer"
     ;;
   check)
-    rev="$head"
-    if [ "${2:-}" = "--rev" ]; then
-      rev="$(git rev-parse --verify -q "${3:-}^{commit}" 2>/dev/null)" || {
-        echo "review-gate: --rev '${3:-}' is not a commit" >&2; exit 1; }
-    fi
+    # --branch: the PR's branch (the hook passes the one the resolver found), whose PR base the pre-push review's base
+    # is judged by. Without it: the checked-out branch for HEAD; for another --rev, no branch (only origin's default
+    # branch counts as a base), never the checked-out branch's PR.
+    rev="$head"; to=""; shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --rev) rev="$(git rev-parse --verify -q "${2:-}^{commit}" 2>/dev/null)" || {
+                 echo "review-gate: --rev '${2:-}' is not a commit" >&2; exit 1; }
+               shift 2 ;;
+        --branch) [ -n "${2:-}" ] || { echo "review-gate: --branch needs a name" >&2; exit 1; }; to="$2"; shift 2 ;;
+        *) echo "review-gate: usage: check [--rev <commit>] [--branch <name>]" >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$to" ] || [ "$rev" != "$head" ] || to="$branch"
     for r in ${PRIMARY[@]+"${PRIMARY[@]}"}; do
       is_valid "$r" || { echo "review-gate: unknown primary reviewer '$r' (valid: $VALID)" >&2; exit 1; }
     done
@@ -432,7 +441,7 @@ case "${1:-help}" in
         problems+=("primary reviewer $r has no pass or skip")
     done
     # Nothing reaches "ready" without the pre-push review the git hook requires for that commit.
-    if pp="$(verify_prepush "$rev" "$branch" 2>&1)"; then [ -z "$pp" ] || echo "$pp" >&2   # accepted findings are announced
+    if pp="$(verify_prepush "$rev" "$to" 2>&1)"; then [ -z "$pp" ] || echo "$pp" >&2   # accepted findings are announced
     else problems+=("$pp"); fi
     if [ "${#counted[@]}" -lt "$MIN" ]; then
       problems+=("${#counted[@]} of $MIN review passes (${counted[*]:-none})")
@@ -491,7 +500,7 @@ case "${1:-help}" in
     ;;
   *)
     {
-      echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer|prepush]}"
+      echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>] [--branch <name>]|status|clear [reviewer|prepush]}"
       echo "       review-gate {prepush [--base <ref>]|prepush-accept --reason \"...\"|check-prepush [--rev <commit> [--branch <name>]]|change-id <base> [<commit>]|bypass-log}"
       echo "  reviewers: $VALID"
       echo "  primary  : ${PRIMARY[*]-}  (override with REVIEW_GATE_PRIMARY=\"kodus greptile\")"

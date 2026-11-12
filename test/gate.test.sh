@@ -460,6 +460,27 @@ expect "a hook installed via a symlinked path still resolves the target" 2 stder
 run "$T/u" "op run -- gh pr create --fill"
 expect "op run -- gh pr create (a wrapper that runs gh locally) is gated" 2 stderr "$T/u: missing/stale"
 
+# Greptile on cb0924c: `gh pr ready <n>` for a stacked PR whose branch isn't checked out judges the review's base by
+# THAT PR's base, not by the checked-out branch's PR. (The fake gh gives main a PR on base1 too, so a check that used
+# the checked-out branch would pass where it must not.)
+mkrepo "$T/stackrepo" acme/stack
+git -C "$T/stackrepo" update-ref refs/remotes/origin/main HEAD
+git -C "$T/stackrepo" switch -q -c base1 && echo b >"$T/stackrepo/b" && git -C "$T/stackrepo" add b && git -C "$T/stackrepo" commit -q -m base1
+git -C "$T/stackrepo" update-ref refs/remotes/origin/base1 HEAD
+git -C "$T/stackrepo" switch -q -c stk && echo s >"$T/stackrepo/s" && git -C "$T/stackrepo" add s && git -C "$T/stackrepo" commit -q -m stk
+stk="$(git -C "$T/stackrepo" rev-parse HEAD)"
+printf '#!/bin/sh\ncase "$1" in api|auth) exec "%s" "$@";; esac\n[ "$1 $2" = "pr view" ] || exit 1\ncase "$3" in\n  7) echo "{\\"headRefOid\\":\\"%s\\",\\"headRefName\\":\\"stk\\"}"; exit 0;;\n  stk|main) echo base1; exit 0;;\nesac\nexit 1\n' "$stubgh" "$stk" >"$T/stackgh"
+chmod +x "$T/stackgh"
+(cd "$T/stackrepo" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null &&
+  REVIEW_GATE_GH="$T/stackgh" bash "$gate" prepush --base origin/base1 >/dev/null 2>&1) || echo "stacked prepush failed" >&2
+git -C "$T/stackrepo" switch -q main
+REVIEW_GATE_GH="$T/stackgh" run "$T/stackrepo" "gh pr ready 7"
+expect "gh pr ready <n> for a reviewed stacked PR, from main, judges the base by that PR's base (allowed)" 0
+out="$(cd "$T/stackrepo" && REVIEW_GATE_GH="$T/stackgh" bash "$gate" check --rev "$stk" 2>&1)"; rc=$?
+expect "check --rev of another commit without --branch never uses the checked-out branch's PR (only the default branch)" 1 "not on origin's default branch"
+out="$(cd "$T/stackrepo" && REVIEW_GATE_GH="$T/stackgh" bash "$gate" check --branch stk --rev "$stk" 2>&1)"; rc=$?
+expect "check --branch <the PR's branch> --rev (either order) passes" 0
+
 # ── Ways around the git pre-push hook (bypass_check): blocked; ordinary git use is not ──
 for c in "git push --no-verify origin HEAD" "git push --no-verif" "git p --no-verify" "git push origin HEAD;--no-verify" "git -C /x push origin main --no-verify" \
   "git -c core.hooksPath=/dev/null push" "git -c core.hookspath= push" "git --config-env=core.hooksPath=X push" \
@@ -563,6 +584,18 @@ run "$T/a" "cat <<EOF > /tmp/notes
 cp x .git/hooks/pre-push is now blocked
 EOF"
 expect "a heredoc for cat (data, not code) that mentions a hooks write is not a bypass" 0
+# Greptile on cb0924c: cp/mv/ln/install/rsync write only their destination (mv also removes its sources).
+for c in "cp ~/.gitconfig /tmp/gitconfig-backup" "cp githooks/pre-push /tmp/pre-push-copy" "install -m 644 .git/config /tmp/c" \
+  "rsync -a githooks/ /tmp/gh/" "sudo cp ~/.gitconfig /tmp/b && git status"; do
+  run "$T/a" "$c"
+  expect "not a bypass (a copy only reads it): $c" 0
+done
+for c in "mv githooks/pre-push /tmp/x" "cp /tmp/x githooks/pre-push" "cp -t .git/hooks /tmp/x" "sudo cp a .git/hooks/x" \
+  "timeout 5 cp a ~/.gitconfig" "xargs cp -t .git/hooks < /tmp/list" "bash -c 'cp x .git/hooks/y'" "cp \$o githooks/pre-push /tmp/x" \
+  "rsync --remove-source-files githooks/pre-push /tmp/" "ln -s /tmp/x .git/hooks/pre-push"; do
+  run "$T/a" "$c"
+  expect "bypass blocked (copy onto or away from a protected path): $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
 # Without node (or when the tokenizer fails) the hook falls back to a cruder split that errs toward blocking.
 mkdir -p "$T/crude/hooks" && cp "$hook" "$root/hooks/resolve-pr-target.mjs" "$T/crude/hooks/" && cp "$gate" "$T/crude/"
 for c in "echo 'exit 0' > \"\$(echo /x)/githooks/pre-push\"" "git -c core.hooks\$(true; echo Path)=/dev/null push" "BASH_ENV=/tmp/x git push"; do

@@ -307,7 +307,8 @@ through. Nitpicks and observations never block.
 
 **The git hook.** `githooks/pre-push`, installed with `core.hooksPath`, reads git's ref lines and, for each pushed
 branch commit, runs `review-gate check-prepush --rev <sha>`, the same function (`verify_prepush`) `review-gate check`
-uses for `gh pr ready`. It passes only when all of these hold:
+uses for `gh pr ready`. (`gh pr ready` passes the PR's own branch, as the resolver found it, with `check --branch`,
+so a stacked PR marked ready from another checkout is judged by its own PR base.) It passes only when all of these hold:
 
 - the record for that commit exists and OpenQodex's own receipt (`~/.openqodex/receipts/<repo id>/<change id>.json`)
   says `kind: complete` with the same change, verdict, base and `block_on_severity`;
@@ -350,8 +351,10 @@ temporary one for a single other command (`HOME=/tmp npm test; git status`; a se
 backticks counts), and `env -i`/`-u` or `unset` of them; `export -f`/`declare -fx` (an exported function) with
 `git` or `review-gate`; any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the
 gate's settings are Tim's); `review-gate prepush-accept` (Tim's waiver, above); `install-githooks --uninstall`;
-a write (a redirect to it, or `tee`, `sed -i`, `cp`, `mv`, `ln`, `rm`, ... on it in the same command, or a `cd` into
-it or a variable holding it plus any write) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`, `githooks/`,
+a write (a redirect to it; `tee`, `sed -i`, `rm`, `chmod`, ... on it in the same command; for `cp`, `ln`,
+`install` and `rsync` only their destination (the last operand, or `-t DIR`), so `cp ~/.gitconfig /tmp/backup` is a
+read, and for `mv` its sources too, since moving one away removes it; any path in the command when the copy is hidden
+behind `xargs`, `bash -c` or a word built at run time; or a `cd` into it or a variable holding it plus any write) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`, `githooks/`,
 the pre-push records (`review-gate-prepush/`) or OpenQodex's (`.openqodex/`, `~/.openqodex/`);
 `git config --remove-section`/`--rename-section`/`--edit`; `git send-pack`/`http-push` (they run no hook); on a
 push, any `-c` but `credential.helper=...`, and `--config-env`. Quotes and backslashes are removed before matching,
