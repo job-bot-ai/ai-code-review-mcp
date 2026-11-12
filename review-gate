@@ -69,7 +69,7 @@ PUNCH_REPO="${REVIEW_GATE_PUNCH_REPO:-j-bot-ai/pr-orchestrator}"
 GH="${REVIEW_GATE_GH:-gh}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 common="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
-pdir="$common/review-gate/prepush"   # <sha>.json per reviewed commit, shared by every worktree of the repo
+pdir="$common/review-gate-prepush"   # <sha>.json per reviewed commit, shared by every worktree; not under $dir, which `clear` removes
 top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 
 die() { echo "review-gate: $*" >&2; exit 2; }
@@ -117,10 +117,11 @@ punch_fetch() {
 # The reviewer was given every punch-list file whole (OpenQodex skips an over-cap file whole), with these hashes.
 MANIFEST_MATCHES='[.instruction_files[] | {path, sha256, omitted}] | sort == ($m[0].punch.files | map({path, sha256, omitted: null}) | sort)'
 
-# verify_prepush <sha>: the one check of a pre-push review, used by `check-prepush` (the git hook) and by `check`.
-# 0 = the push of <sha> may go (accepted findings are announced on stderr); 1 = blocked, with the reason on stderr.
+# verify_prepush <sha> <branch>: the one check of a pre-push review, used by `check-prepush` (the git hook) and by
+# `check`. 0 = the push of <sha> to <branch> may go (accepted findings are announced on stderr); 1 = blocked, with
+# the reason on stderr.
 verify_prepush() {
-  local sha="$1" m="$pdir/$1.json" rec rd v cur
+  local sha="$1" br="${2:-}" m="$pdir/$1.json" rec rd v cur b
   bad() { echo "no passing pre-push review for ${sha:0:12}: $*" >&2; }
   if [ ! -f "$m" ]; then
     if [ -f "$pdir/$sha.last" ]; then bad "its last \`review-gate prepush\` did not pass: $(head -c 400 "$pdir/$sha.last")"
@@ -139,7 +140,13 @@ verify_prepush() {
   jq -e --slurpfile m "$m" '.completion.status == "complete" and .change_id == $m[0].change_id and .verdict == $m[0].verdict' \
     "$rd/report.json" >/dev/null 2>&1 || { bad "the report is not a complete review of this change"; return 1; }
   [ "$(jq -r .block_on "$m")" = "$BLOCK_ON" ] || { bad "reviewed with block_on_severity $(jq -r .block_on "$m"); the gate uses $BLOCK_ON"; return 1; }
-  git merge-base --is-ancestor "$(jq -r .base_sha "$m")" "$sha" 2>/dev/null || { bad "the reviewed base is not an ancestor of it"; return 1; }
+  b="$(jq -r .base_sha "$m")"
+  git merge-base --is-ancestor "$b" "$sha" 2>/dev/null || { bad "the reviewed base is not an ancestor of it"; return 1; }
+  # The whole change: the base must be on a remote branch other than the one pushed (a PR base), so a review of
+  # only the newest commits (--base HEAD~1, or the branch's own remote tip) doesn't count.
+  git for-each-ref --contains "$b" --format='%(refname)' refs/remotes/ 2>/dev/null |
+    grep -v -x -e '.*/HEAD' ${br:+-e "refs/remotes/[^/]*/$br"} | grep -q . ||
+    { bad "the reviewed base ${b:0:12} is not on a remote branch other than ${br:-this one}: review the whole change against the PR's base (--base origin/<base>)"; return 1; }
   jq -e --slurpfile m "$m" "$MANIFEST_MATCHES" "$rd/manifest.json" >/dev/null 2>&1 ||
     { bad "the review's manifest doesn't show the whole punch list supplied"; return 1; }
   case "$v" in
@@ -164,7 +171,7 @@ verify_prepush() {
 prepush_lock() {
   mkdir -p "$pdir"
   command -v flock >/dev/null 2>&1 || return 0
-  exec 9>>"$common/review-gate/prepush.lock"
+  exec 9>>"$pdir/lock"
   flock -n 9 || die "another prepush/prepush-accept is running in this repository; wait for it"
 }
 
@@ -209,7 +216,7 @@ run_prepush() {
   punch_list "$list" || fail "couldn't list the punch list on $PUNCH_REPO main (no review without it)"
   copy="$top/.openqodex/punch-list"; rm -rf "${copy:?}"; mkdir -p "$copy"
   punch_fetch "$list" "$copy" || fail "couldn't download the punch list from $PUNCH_REPO main (no review without it)"
-  cfg="$common/review-gate/openqodex.yaml"   # ours, outside the work tree: a branch can't loosen it
+  cfg="$pdir/openqodex.yaml"   # ours, outside the work tree: a branch can't loosen it
   {
     printf 'version: 1\nmin_version: %s\nreview:\n  block_on_severity: %s\n  instructions_files:\n' "$OQ_VERSION" "$BLOCK_ON"
     while IFS=$'\t' read -r name blob path; do
@@ -343,7 +350,7 @@ case "${1:-help}" in
         problems+=("primary reviewer $r has no pass or skip")
     done
     # Nothing reaches "ready" without the pre-push review the git hook requires for that commit.
-    if pp="$(verify_prepush "$rev" 2>&1)"; then [ -z "$pp" ] || echo "$pp" >&2   # accepted findings are announced
+    if pp="$(verify_prepush "$rev" "$branch" 2>&1)"; then [ -z "$pp" ] || echo "$pp" >&2   # accepted findings are announced
     else problems+=("$pp"); fi
     if [ "${#counted[@]}" -lt "$MIN" ]; then
       problems+=("${#counted[@]} of $MIN review passes (${counted[*]:-none})")
@@ -387,13 +394,14 @@ case "${1:-help}" in
     ;;
   prepush) shift; run_prepush "$@" ;;
   prepush-accept) shift; run_accept "$@" ;;
-  check-prepush)   # the git pre-push hook: may this commit be pushed?
-    rev="$head"
+  check-prepush)   # the git pre-push hook: may this commit be pushed (to branch <name>)?
+    rev="$head"; to="$branch"
     if [ "${2:-}" = "--rev" ]; then
       rev="$(git rev-parse --verify -q "${3:-}^{commit}" 2>/dev/null)" || {
         echo "review-gate: --rev '${3:-}' is not a commit" >&2; exit 1; }
+      [ "${4:-}" = "--branch" ] && to="${5:-}"
     fi
-    verify_prepush "$rev" || exit 1
+    verify_prepush "$rev" "$to" || exit 1
     ;;
   *)
     {

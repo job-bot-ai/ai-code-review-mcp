@@ -36,7 +36,7 @@ expect "a passing review records a pass" 0 "pre-push review passed"
 grep -q -- '--offline' "$T/oq-args" && grep -q -- '--reviewer-web off' "$T/oq-args" && grep -q -- '--block-on-severity minor' "$T/oq-args" \
   && ! grep -q -- '--agent' "$T/oq-args" && rc=0 || rc=1
 expect "OpenQodex runs offline, without web tools, blocking at minor, never --agent" 0
-cfg="$(git -C "$W" rev-parse --git-common-dir)/review-gate/openqodex.yaml"
+cfg="$(git -C "$W" rev-parse --git-common-dir)/review-gate-prepush/openqodex.yaml"
 grep -q 'block_on_severity: minor' "$W/$cfg" && grep -q '".openqodex/punch-list/PUNCH_LIST.md"' "$W/$cfg"; rc=$?
 expect "our config (outside the tree) names the punch-list copy as a convention file" 0
 cmp -s "$W/.openqodex/punch-list/PUNCH_LIST.md" "$T/punch/review/PUNCH_LIST.md"; rc=$?
@@ -45,6 +45,25 @@ expect "the punch list from main is copied into the git-ignored .openqodex/" 0
 expect "the copy and OpenQodex's report folder leave the tree clean" 0
 push -q origin feat
 expect "the reviewed commit can be pushed" 0
+
+(cd "$W" && bash "$gate" clear >/dev/null) && push -q origin HEAD:refs/heads/after-clear
+expect "review-gate clear (the reviewer passes) leaves pre-push records alone" 0
+
+# ── only the newest commits reviewed ──
+change base-a; push -q --no-verify origin feat; change base-b
+out="$(cd "$W" && bash "$gate" prepush --base origin/feat 2>&1)"; rc=$?
+push -q origin feat
+expect "a review against the branch's own remote tip (not the PR base) doesn't count" 1 "not on a remote branch other than feat"
+out="$(cd "$W" && bash "$gate" prepush --base HEAD~1 2>&1)"; rc=$?
+push -q origin feat
+expect "a review against an unpushed HEAD~1 doesn't count" 1 "not on a remote branch other than feat"
+prepush; push -q origin feat
+expect "the whole change against the PR base does" 0
+
+# ── one review at a time ──
+mkdir -p "$W/.git/review-gate-prepush"
+flock "$W/.git/review-gate-prepush/lock" bash -c "cd '$W' && bash '$gate' prepush --base origin/main" >"$T/lk" 2>&1; rc=$?; out="$(cat "$T/lk")"
+expect "a second prepush while one runs is refused" 2 "another prepush/prepush-accept is running"
 
 # ── a different commit ──
 change two
@@ -124,7 +143,7 @@ expect "reviewed again with the current list: allowed" 0
 
 # ── tampering with the records ──
 change four; prepush
-m="$(git -C "$W" rev-parse --git-common-dir)/review-gate/prepush/$(git -C "$W" rev-parse HEAD).json"; m="$W/$m"
+m="$(git -C "$W" rev-parse --git-common-dir)/review-gate-prepush/$(git -C "$W" rev-parse HEAD).json"; m="$W/$m"
 rd="$(jq -r .run_dir "$m")"
 cp "$rd/manifest.json" "$T/man"; jq '.instruction_files[0].sha256 = "0"' "$T/man" >"$rd/manifest.json"
 push -q origin feat
@@ -205,6 +224,9 @@ REVIEW_GATE_PREPUSH=off push -q origin feat
 expect "REVIEW_GATE_PREPUSH=off lets an unreviewed push through, announced" 0 "pre-push gate is OFF"
 grep -q 'git-hook' "$XDG_STATE_HOME/review-gate/prepush-bypass.log"; rc=$?
 expect "and the bypass is logged" 0
+: >"$T/notadir"
+XDG_STATE_HOME="$T/notadir" REVIEW_GATE_PREPUSH=off push -q origin HEAD:refs/heads/unlogged
+expect "the switch doesn't work when the bypass can't be logged" 1 "can't be logged"
 mkdir -p "$T/broken/githooks" && cp "$root/githooks/pre-push" "$T/broken/githooks/"
 printf '#!/bin/sh\nexit 7\n' >"$T/broken/review-gate"
 change eight; prepush

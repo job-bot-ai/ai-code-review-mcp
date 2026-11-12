@@ -15,8 +15,9 @@ input="$(cat)"
 
 if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then
   log="${XDG_STATE_HOME:-$HOME/.local/state}/review-gate/prepush-bypass.log"
-  mkdir -p "$(dirname "$log")" && printf '%s\tgit-hook\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" \
-    "$(printf '%s' "$input" | tr '\n' ' ' | cut -c1-300)" >>"$log"
+  { mkdir -p "$(dirname "$log")" && printf '%s\tgit-hook\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" \
+    "$(printf '%s' "$input" | tr '\n' ' ' | cut -c1-300)" >>"$log"; } 2>/dev/null ||
+    { echo "BLOCKED: REVIEW_GATE_PREPUSH=off, but the bypass can't be logged to $log (a bypass is never silent)" >&2; exit 1; }
   echo "review-gate: pre-push gate is OFF (REVIEW_GATE_PREPUSH=off); push not checked, logged to $log" >&2
 else
   blocked=""
@@ -28,7 +29,7 @@ else
       blocked="$blocked  $lref -> $rref: not a commit
 "; continue
     fi
-    out="$(bash "$gate" check-prepush --rev "$sha" 2>&1)"; rc=$?
+    out="$(bash "$gate" check-prepush --rev "$sha" --branch "${rref#refs/heads/}" 2>&1)"; rc=$?
     if [ "$rc" -eq 0 ]; then
       [ -z "$out" ] || printf '%s\n' "$out" >&2   # accepted findings are announced, never hidden
     else

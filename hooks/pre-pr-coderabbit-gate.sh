@@ -40,9 +40,10 @@ bypass_check() {
   local why="" log
   if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then   # Tim's switch, set in Claude Code's own environment
     log="${XDG_STATE_HOME:-$HOME/.local/state}/review-gate/prepush-bypass.log"
-    mkdir -p "$(dirname "$log")" 2>/dev/null &&
-      printf '%s\tclaude-hook\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%s' "$cmd" | tr '\n\t' '  ' | cut -c1-300)" >>"$log" 2>/dev/null
-    return 0
+    # A bypass is never silent: when it can't be logged, the checks below apply.
+    { mkdir -p "$(dirname "$log")" &&
+      printf '%s\tclaude-hook\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%s' "$cmd" | tr '\n\t' '  ' | cut -c1-300)" >>"$log"; } 2>/dev/null &&
+      return 0
   fi
   # Matched with quotes and backslashes removed, so `"core.hooks""Path"` or `"-"c` is read as what the shell runs.
   local c; c="$(printf '%s' "$cmd" | tr -d "\"'\\\\")"
@@ -57,8 +58,10 @@ bypass_check() {
     why="a git push may only take -c credential.helper=...: any other -c or --config-env can switch the pre-push hook off."
   elif m "$git" && mi 'hookspath' && ! mi '^[[:space:]]*git[[:space:]]+(-C[[:space:]]+[^[:space:];&|]+[[:space:]]+)?config([[:space:]]+--(global|local|system|show-origin|show-scope))*[[:space:]]+--get(-all)?[[:space:]]+core\.hookspath[[:space:]]*$'; then
     why="it sets or overrides core.hooksPath (git -c, --config-env, git config): the pre-push hook would not run."
-  elif m "$git" && mi "(^|[[:space:]])(-c|--config-env)[[:space:]=]*[\"']?include(\.|if)"; then
-    why="it includes extra git config on the command line, which can replace core.hooksPath."
+  elif m "$git" && m '(^|[^[:alnum:]_-])(send-pack|http-push)([^[:alnum:]_-]|$)'; then
+    why="git send-pack/http-push publish refs without running the pre-push hook."
+  elif m "$git" && m '(^|[^[:alnum:]_-])config([[:space:]]+[^;&|]*)?[[:space:]](--remove-section|--rename-section|--edit|-e)([[:space:]]|$)'; then
+    why="it edits or removes git config sections, which can drop core.hooksPath."
   elif m "$git" && m '(^|[^[:alnum:]_])(GIT_CONFIG[[:alnum:]_]*|GIT_DIR|GIT_COMMON_DIR|HOME|XDG_CONFIG_HOME)[[:space:]]*='; then
     why="it overrides GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME or XDG_CONFIG_HOME for git: another config, without the hook."
   elif m "$git" && m '(^|[^[:alnum:]_-])(env[[:space:]]+(-[[:alpha:]]*[iu]|--ignore-environment|--unset)|unset[[:space:]]+[^;&|]*(HOME|XDG_CONFIG_HOME|GIT_))'; then

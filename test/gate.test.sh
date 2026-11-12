@@ -24,7 +24,9 @@ export OPENQODEX_HOME="$T/oqhome" REVIEW_GATE_OPENQODEX="$root/test/stub/openqod
 export PUNCH_FIXTURE="$T/punch" XDG_STATE_HOME="$T/state"; unset GH_TOKEN STUB_OQ PUNCH_FAIL REVIEW_GATE_PREPUSH
 mkdir -p "$T/punch/review" && echo '- 1.1 an item' >"$T/punch/review/PUNCH_LIST.md"
 stubgh="$root/test/stub/gh"; export REVIEW_GATE_GH="$stubgh"
-prepushed() { (cd "$1" && bash "$gate" prepush --base HEAD >/dev/null 2>&1) || echo "prepushed $1 failed" >&2; }
+prepushed() { # the PR base: a remote branch holding the base commit
+  git -C "$1" update-ref refs/remotes/origin/base HEAD
+  (cd "$1" && bash "$gate" prepush --base origin/base >/dev/null 2>&1) || echo "prepushed $1 failed" >&2; }
 green() { (cd "$1" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null) && prepushed "$1"; }
 run() { # run <cwd> <command> → sets rc, out, err
   local payload; payload="$(jq -cn --arg c "$2" --arg d "$1" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
@@ -467,13 +469,15 @@ for c in "git push --no-verify origin HEAD" "git push --no-verif" "git -C /x pus
   "env HOME=/tmp git push" "XDG_CONFIG_HOME=/tmp git push" "env -i git push" "env -u HOME git push" "unset HOME; git push" \
   "git -c include.path=/tmp/c push" "REVIEW_GATE_PREPUSH=off git push" "export REVIEW_GATE_PREPUSH=off; git push" \
   "env REVIEW_GATE_PREPUSH=off git push" "OPENQODEX_HOME=/tmp/fake git push" "REVIEW_GATE_PUNCH_REPO=me/empty review-gate prepush" \
+  "git send-pack origin HEAD:refs/heads/x" "git config --remove-section core && git push" "git config -e" \
   "OPENQODEX_SKIP=1 git push" "read REVIEW_GATE_PREPUSH <<< off; export REVIEW_GATE_PREPUSH; git push" "bash install-githooks --uninstall --global"; do
   run "$T/a" "$c"
   expect "bypass blocked: $c" 2 stderr "BLOCKED by the pre-push review gate"
 done
 for c in "git push" "git push -u origin feat" "git push --force-with-lease origin HEAD" "git status" "git commit -m 'no verify needed'" \
   "git config --get core.hooksPath" "git config --global --get core.hooksPath" "cd \$HOME && git push" \
-  "git -c credential.helper= -c credential.helper='!f(){ echo username=x; }; f' push -q origin HEAD" "echo \$HOME" "ls ~/.gitconfig"; do
+  "git -c credential.helper= -c credential.helper='!f(){ echo username=x; }; f' push -q origin HEAD" "echo \$HOME" "ls ~/.gitconfig" \
+  "git log --oneline | grep -e config"; do
   run "$T/a" "$c"
   expect "not a bypass: $c" 0
 done
@@ -504,6 +508,9 @@ REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
 expect "Tim's REVIEW_GATE_PREPUSH=off (the hook's own environment) lets a bypass through" 0
 grep -q 'claude-hook' "$XDG_STATE_HOME/review-gate/prepush-bypass.log"; rc=$?
 expect "and logs it" 0
+: >"$T/notadir"
+XDG_STATE_HOME="$T/notadir" REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
+expect "the switch doesn't work when the bypass can't be logged" 2 stderr "--no-verify skips"
 
 # An unexpected exit code from review-gate check never passes the PR gate.
 mkdir -p "$T/odd/hooks" && cp "$hook" "$T/odd/hooks/" && cp "$root/hooks/resolve-pr-target.mjs" "$T/odd/hooks/"

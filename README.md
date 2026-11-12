@@ -269,7 +269,7 @@ reviewed change exactly the commit you push) it:
    against its git blob id. A failed fetch fails the review; it never means "review without the list";
 2. copies it to `.openqodex/punch-list/` in the checkout (git-ignored: `prepush` adds `/.openqodex/` to
    `.git/info/exclude`), and names those copies in `review.instructions_files` of **our own** OpenQodex config,
-   `$GIT_COMMON_DIR/review-gate/openqodex.yaml`, outside the work tree so a branch can't loosen it. OpenQodex's
+   `$GIT_COMMON_DIR/review-gate-prepush/openqodex.yaml`, outside the work tree so a branch can't loosen it. OpenQodex's
    limits: 32 KB per file, 64 KB in all; a file past either is skipped whole, and `prepush` then fails. (Not
    `--instructions`: it takes one file of at most 32 KB, and the split list is up to 56 KB. `--instructions` gets
    `prompts/openqodex-instructions.md`, so a repo's own `.openqodex/custom-instructions.md` is not used.)
@@ -277,8 +277,8 @@ reviewed change exactly the commit you push) it:
    --block-on-severity minor --timeout 1800` under `systemd-run --scope -p MemoryMax=2G -p MemorySwapMax=256M`
    (panda is RAM-fragile: a runaway is killed inside its scope instead of swap-thrashing the host). Never
    `review --agent`: that is the coding agent reviewing its own work;
-4. records the result in `$GIT_COMMON_DIR/review-gate/prepush/<sha>.json` (shared by all worktrees, keyed by
-   commit), only for a review that **finished**: exit 0 with verdict `passed`, or exit 1 with `blocked`, OpenQodex's
+4. records the result in `$GIT_COMMON_DIR/review-gate-prepush/<sha>.json` (shared by all worktrees, keyed by
+   commit; `clear` doesn't touch it, `clear prepush` removes HEAD's), only for a review that **finished**: exit 0 with verdict `passed`, or exit 1 with `blocked`, OpenQodex's
    `last-review` record written by this run, the report matching its sha256, and the manifest showing every
    punch-list file supplied whole with the hashes we fetched. Exit 2 (incomplete, no reviewer that can start,
    OpenQodex failing), "Nothing to review", HEAD moving during the run: nothing passes, exit 4, and the reason is
@@ -302,6 +302,8 @@ uses for `gh pr ready`. It passes only when all of these hold:
   says `kind: complete` with the same change, verdict, base and `block_on_severity`;
 - `report.json` and `manifest.json` still have the sha256 recorded, the report is `complete`, and the manifest shows
   the whole punch list supplied;
+- the reviewed base is an ancestor of the commit and is on a remote branch other than the one pushed (the PR's
+  base), so a review of only the newest commits (`--base HEAD~1`, or the branch's own remote tip) doesn't count;
 - the verdict is `passed`, or `blocked` with an accepted reason;
 - the punch list on `main` **now** has the same files and blob ids as the one reviewed (one or two `gh api` calls; a
   failed fetch blocks).
@@ -323,7 +325,9 @@ in the command (no parsing): `--no-verify` with `push`; `core.hooksPath` in a `g
 `GIT_DIR`, `GIT_COMMON_DIR`, `HOME` or `XDG_CONFIG_HOME` assignments, `env -i`/`-u` or `unset` of them, with `git`;
 any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the gate's settings are Tim's); `install-githooks --uninstall`;
 a write (`>`, `tee`, `sed -i`, `cp`, `mv`, `ln`, `rm`, ...) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`
-or `githooks/`. And a command with `git` and `push` is blocked unless `core.hooksPath` in the session's checkout
+or `githooks/`; `git config --remove-section`/`--rename-section`/`--edit`; `git send-pack`/`http-push` (they run
+no hook); on a push, any `-c` but `credential.helper=...`, and `--config-env`. Quotes and backslashes are removed
+before matching. And a command with `git` and `push` is blocked unless `core.hooksPath` in the session's checkout
 is this repo's `githooks/`: a repo-local `core.hooksPath` (husky sets one) wins over the global one and would
 switch the gate off there, and with nothing installed no push passes. It is a speed bump against an agent
 working around the gate, not a sandbox: it sees only Bash commands (not Edit/Write), and only the session's
@@ -335,7 +339,8 @@ checkout for the `core.hooksPath` check.
 **Escape hatch (Tim only).** `REVIEW_GATE_PREPUSH=off` in the environment Claude Code itself runs in (e.g. `env` in
 `~/.claude/settings.json`, or exported before starting `claude`) lets both hooks through; git inherits it from
 Claude Code. As a command prefix it is blocked. Every use is logged to
-`${XDG_STATE_HOME:-~/.local/state}/review-gate/prepush-bypass.log`. By hand, outside Claude Code, the same variable
+`${XDG_STATE_HOME:-~/.local/state}/review-gate/prepush-bypass.log`; when that log can't be written, the switch
+doesn't work (a bypass is never silent). By hand, outside Claude Code, the same variable
 works (and `git push --no-verify` is git's own).
 
 ### Installing
