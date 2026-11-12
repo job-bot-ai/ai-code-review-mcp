@@ -606,6 +606,18 @@ for c in "cp ~/.gitconfig /tmp/b 2>/dev/null" "cp githooks/pre-push /tmp/x > /tm
   run "$T/a" "$c"
   expect "not a bypass (a copy with redirects only reads it): $c" 0
 done
+# Codex on 0a62a5e: a copier's option values are not operands (`--suffix .bak` is not the destination); an option
+# whose arity isn't known makes the destination unknown, so any protected path counts.
+for c in "cp /tmp/x .git/hooks/pre-push --suffix .bak" "install -m 755 /tmp/x .git/hooks/pre-push" "cp /tmp/x .git/hooks/pre-push --weird .bak" \
+  "cp /tmp/x .git/hooks/pre-push -S .bak" "cp /tmp/x .git/hooks/pre-push -Q .bak" \
+  "mv -S .bak /tmp/x githooks/pre-push" "install -o root -g root /tmp/x ~/.gitconfig"; do
+  run "$T/a" "$c"
+  expect "bypass blocked (a copier's option values): $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+for c in "cp --suffix=.bak ~/.gitconfig /tmp/b" "install -m 755 githooks/pre-push /tmp/x" "cp -S .bak githooks/pre-push /tmp/y"; do
+  run "$T/a" "$c"
+  expect "not a bypass (a copier with option values only reads it): $c" 0
+done
 # Without node (or when the tokenizer fails) the hook falls back to a cruder split that errs toward blocking.
 mkdir -p "$T/crude/hooks" && cp "$hook" "$root/hooks/resolve-pr-target.mjs" "$T/crude/hooks/" && cp "$gate" "$T/crude/"
 for c in "echo 'exit 0' > \"\$(echo /x)/githooks/pre-push\"" "git -c core.hooks\$(true; echo Path)=/dev/null push" "BASH_ENV=/tmp/x git push"; do

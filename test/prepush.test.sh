@@ -357,6 +357,21 @@ expect "an OpenQodex that never returns is stopped (exit 4)" 4 "didn't finish wi
 prepush
 expect "and the next prepush is not locked out, though a reviewer it started still runs" 0 "pre-push review passed"
 kill "$(cat "$OPENQODEX_HOME/orphan.pid")" 2>/dev/null
+# A reviewer that ignores TERM (Codex on 0a62a5e): the watchdog escalates to KILL, and the run ends in bounded time.
+s0=$SECONDS
+STUB_OQ=stubborn REVIEW_GATE_PREPUSH_TIMEOUT=1 REVIEW_GATE_PREPUSH_GRACE=1 REVIEW_GATE_PREPUSH_KILL_AFTER=1 prepush
+[ $((SECONDS - s0)) -le 20 ] || { out="$out (took $((SECONDS - s0))s)"; rc=99; }
+expect "an OpenQodex that ignores TERM is killed after the grace (exit 4, well before its own 60 s)" 4 "didn't finish within 2s"
+prepush
+expect "and the lock is free again" 0 "pre-push review passed"
+# The run's group leader itself ignoring TERM (here a systemd-run stand-in): KILL still comes after the grace.
+printf '#!/bin/bash\ntrap "" TERM\nwhile [ "$1" != -- ]; do shift; done; shift\n"$@"\n' >"$T/bin/sdrun-stubborn"; chmod +x "$T/bin/sdrun-stubborn"
+s0=$SECONDS
+STUB_OQ=hang REVIEW_GATE_SYSTEMD_RUN="$T/bin/sdrun-stubborn" REVIEW_GATE_OPENQODEX_MEMORY=1G REVIEW_GATE_PREPUSH_TIMEOUT=1 \
+  REVIEW_GATE_PREPUSH_GRACE=1 REVIEW_GATE_PREPUSH_KILL_AFTER=1 prepush
+[ $((SECONDS - s0)) -le 20 ] || { out="$out (took $((SECONDS - s0))s)"; rc=99; }
+expect "a group leader that ignores TERM is killed after the grace too" 4 "didn't finish within 2s"
+kill "$(cat "$OPENQODEX_HOME/orphan.pid")" 2>/dev/null
 STUB_OQ=killed prepush
 expect "a SIGKILL (the memory cap) is reported as that, naming MemoryMax" 4 "MemoryMax"
 

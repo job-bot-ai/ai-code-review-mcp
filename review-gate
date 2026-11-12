@@ -301,15 +301,39 @@ run_prepush() {
   start="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"   # OpenQodex writes ms; a record of an earlier run never counts
   echo "review-gate: OpenQodex $OQ_VERSION reviewing ${head:0:12} vs $base (${off[*]:-online}, memory cap $mem, punch list @ $(sed -n 's/^#ref //p' "$list" | cut -c1-12): $total of $OQ_TOTAL_MAX bytes)..." >&2
   # Never `review --agent` (the coding agent reviewing its own work): only OpenQodex's own reviewer counts.
-  # No GitHub token reaches OpenQodex or its reviewer. An outer timeout (TERM to its whole process group) stops a run
-  # that ignores --timeout, and the lock's fd is closed for it, so a hang or a leftover reviewer never holds the lock.
-  # No `timeout -k`: uutils' timeout (Ubuntu's default) then exits 125 instead of 124.
-  (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && OPENQODEX_AUTO_UPDATE=0 ${cap[@]+"${cap[@]}"} \
-    timeout "$((tmo + grace))" bash -c '"$@"; rc=$?
+  # No GitHub token reaches OpenQodex or its reviewer. A watchdog of our own stops a run that ignores --timeout: the run
+  # gets its own process group (set -m), which gets TERM at --timeout + grace and KILL $killafter s later (a reviewer
+  # that ignores TERM can't hold on). Not timeout(1): uutils' timeout (Ubuntu's default) neither escalates nor exits
+  # 124 with -k. The lock's fd is closed for the run, so a leftover reviewer in a session of its own never holds it.
+  local pid t0 fired=0 kill_at=0 killafter="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}"
+  [[ "$killafter" =~ ^[0-9]+$ ]] || fail "REVIEW_GATE_PREPUSH_KILL_AFTER must be seconds"
+  set -m
+  (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && OPENQODEX_AUTO_UPDATE=0 exec ${cap[@]+"${cap[@]}"} \
+    bash -c '"$@"; rc=$?
       p="/sys/fs/cgroup$(cut -d: -f3- /proc/self/cgroup 2>/dev/null | head -n 1)/memory.peak"
       [ -r "$p" ] && echo "review-gate: OpenQodex peak memory $(( $(cat "$p") / 1048576 )) MiB" >&2
       exit $rc' _ "$OQ_BIN" review --base "$base" ${off[@]+"${off[@]}"} --reviewer-web off --config "$cfg" \
-      --instructions "$HERE/prompts/openqodex-instructions.md" --block-on-severity "$BLOCK_ON" --timeout "$tmo" </dev/null 9>&-) || rc=$?
+      --instructions "$HERE/prompts/openqodex-instructions.md" --block-on-severity "$BLOCK_ON" --timeout "$tmo") </dev/null 9>&- &
+  pid=$!
+  set +m
+  trap 'kill -TERM -- "-$pid" 2>/dev/null; exit 130' INT TERM HUP   # our run is in its own group: take it down with us
+  t0=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$fired" = 0 ] && [ $((SECONDS - t0)) -ge $((tmo + grace)) ]; then
+      kill -TERM -- "-$pid" 2>/dev/null || true; fired=1; kill_at=$((SECONDS + killafter))
+    elif [ "$fired" = 1 ] && [ "$SECONDS" -ge "$kill_at" ]; then
+      kill -KILL -- "-$pid" 2>/dev/null || true; fired=2
+    fi
+    sleep 1
+  done
+  # The leader can die of TERM while a member that ignores it lives on: once we fired, KILL what is left of the group.
+  if [ "$fired" = 1 ]; then
+    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_at" ]; do sleep 1; done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || rc=$?
+  trap - INT TERM HUP
+  [ "$fired" = 0 ] || rc=124   # we stopped it: a timeout, whatever signal it died of
   { [ "$(git rev-parse HEAD)" = "$head" ] && ! dirty; } || fail "HEAD or the work tree changed while the review ran; review again"
   case "$rc" in
     0|1) ;;

@@ -22,6 +22,30 @@ import { tokenize, SHELLS, progName, runnerExec } from './resolve-pr-target.mjs'
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_%]*\+?=/;
 const COPIERS = new Set(['cp', 'mv', 'ln', 'install', 'rsync']);
+// Each copier's options (GNU coreutils, rsync): short letters with no value, short letters that take one, long options
+// that take one (`--suffix .bak` or `--suffix=.bak`), and long options without one (or only `--opt=value`). Anything
+// else and the destination can't be told: the hook then treats any protected path in the command as written.
+const BACKUP = ['--backup', '--force', '--interactive', '--no-target-directory', '--verbose', '--strip-trailing-slashes', '--debug', '--context'];
+const COPIER_OPTS = {
+  cp: { flags: 'abdfHilLnPpRrsTuvxZ', args: 'St', argLong: ['--suffix', '--target-directory', '--no-preserve', '--sparse'],
+    flagLong: [...BACKUP, '--archive', '--attributes-only', '--copy-contents', '--dereference', '--link', '--no-dereference',
+      '--no-clobber', '--one-file-system', '--parents', '--preserve', '--recursive', '--remove-destination', '--symbolic-link',
+      '--update', '--reflink', '--keep-directory-symlink'] },
+  mv: { flags: 'bfinTuvZ', args: 'St', argLong: ['--suffix', '--target-directory'],
+    flagLong: [...BACKUP, '--no-clobber', '--no-copy', '--update', '--exchange'] },
+  ln: { flags: 'bdFfinLPrsTv', args: 'St', argLong: ['--suffix', '--target-directory'],
+    flagLong: [...BACKUP, '--directory', '--logical', '--no-dereference', '--physical', '--relative', '--symbolic'] },
+  install: { flags: 'bcCdDpsTvZ', args: 'gmoSt', argLong: ['--group', '--mode', '--owner', '--suffix', '--target-directory', '--strip-program'],
+    flagLong: [...BACKUP, '--compare', '--directory', '--preserve-timestamps', '--strip', '--preserve-context'] },
+  rsync: { flags: 'avrlptgoDzhPnucHAXxSqiWKkLEmIOJRbd', args: 'efBTM',
+    argLong: ['--exclude', '--include', '--rsh', '--filter', '--exclude-from', '--include-from', '--files-from', '--chmod',
+      '--chown', '--suffix', '--backup-dir', '--temp-dir', '--partial-dir', '--log-file', '--bwlimit', '--timeout', '--max-size',
+      '--min-size', '--compare-dest', '--copy-dest', '--link-dest', '--out-format', '--password-file', '--port', '--block-size'],
+    flagLong: ['--archive', '--verbose', '--recursive', '--delete', '--delete-after', '--delete-before', '--dry-run', '--progress',
+      '--partial', '--checksum', '--compress', '--human-readable', '--update', '--remove-source-files', '--times', '--perms',
+      '--links', '--hard-links', '--acls', '--xattrs', '--itemize-changes', '--stats', '--quiet', '--inplace', '--whole-file',
+      '--existing', '--ignore-existing', '--mkpath', '--backup', '--relative', '--no-perms', '--no-owner', '--no-group'] },
+};
 
 const REDIRECT = /^(?:&>>?|>&|<&|>>?\|?|<<?<?|<>)/; // the operator at the start of a tokenizer word
 /**
@@ -51,18 +75,36 @@ function copierWrites(words, k) {
   const prog = progName(words[k]);
   if (!COPIERS.has(prog)) return [[], false];
   const args = withoutRedirects(words.slice(k + 1));
+  const spec = COPIER_OPTS[prog];
   const operands = [];
   let target = null;
   let endOpts = false;
   for (let a = 0; a < args.length; a += 1) {
     const v = args[a].value;
-    if (!endOpts && v === '--') { endOpts = true; continue; }
-    if (!endOpts && v === '--target-directory') { target = args[a + 1]?.value ?? ''; a += 1; continue; }
-    if (!endOpts && v.startsWith('--target-directory=')) { target = v.slice('--target-directory='.length); continue; }
-    if (!endOpts && /^-[A-Za-z]*t$/.test(v)) { target = args[a + 1]?.value ?? ''; a += 1; continue; } // -t DIR, -rt DIR
-    if (!endOpts && /^-[A-Za-z]*t./.test(v) && !v.startsWith('--')) { target = v.slice(v.indexOf('t') + 1); continue; } // -tDIR
-    if (!endOpts && v.startsWith('-') && v !== '-') continue;
-    operands.push(v);
+    if (endOpts || v === '-' || !v.startsWith('-')) { operands.push(v); continue; }
+    if (v === '--') { endOpts = true; continue; }
+    if (v.startsWith('--')) {
+      const eq = v.indexOf('=');
+      const name = eq < 0 ? v : v.slice(0, eq);
+      let value = eq < 0 ? null : v.slice(eq + 1);
+      if (spec.argLong.includes(name)) {
+        if (value === null) { value = args[a + 1]?.value ?? ''; a += 1; } // `--suffix .bak`: the value is not an operand
+      } else if (!spec.flagLong.includes(name)) {
+        return [[], false]; // an option we don't know the arity of: can't tell the destination
+      }
+      if (name === '--target-directory') target = value;
+      continue;
+    }
+    // A short-option cluster: a value-taking letter takes the rest of the word, or the next word.
+    for (let j = 1; j < v.length; j += 1) {
+      const ch = v[j];
+      if (spec.flags.includes(ch)) continue;
+      if (!spec.args.includes(ch)) return [[], false];
+      let value = v.slice(j + 1);
+      if (value === '') { value = args[a + 1]?.value ?? ''; a += 1; }
+      if (ch === 't') target = value;
+      break;
+    }
   }
   // A word built at run time could be an option (-t DIR) or a path: every operand counts as written.
   if (args.some((w) => w.dynamic)) return [operands.concat(target ?? []), true];

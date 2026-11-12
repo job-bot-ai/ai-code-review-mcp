@@ -280,8 +280,10 @@ reviewed change exactly the commit you push) it:
 3. runs `openqodex review --base <base> --offline --reviewer-web off --config <ours> --instructions <ours>
    --block-on-severity minor --timeout 1800` under `systemd-run --scope -p MemoryMax=2G -p MemorySwapMax=256M`
    (panda is RAM-fragile: a runaway is killed inside its scope instead of swap-thrashing the host; exit 137 is
-   reported as that kill, naming `MemoryMax`, not as a timeout), inside an outer
-   `timeout` of `--timeout` + 120 s that stops its whole process group if it ignores `--timeout`; the lock's file
+   reported as that kill, naming `MemoryMax`, not as a timeout), watched by a
+   watchdog of its own: the run gets its own process group, which gets TERM at `--timeout` + 120 s and KILL 30 s
+   later, so a reviewer that ignores `--timeout` and TERM can't hold on (not `timeout(1)`: uutils' timeout, Ubuntu's
+   default, neither escalates nor exits 124 with `-k`); the lock's file
    descriptor is closed for it, so a hung run or a leftover reviewer never holds the lock. Never `review --agent`:
    that is the coding agent reviewing its own work;
 4. records the result in `$GIT_COMMON_DIR/review-gate-prepush/<sha>.json` (shared by all worktrees, keyed by
@@ -352,7 +354,9 @@ backticks counts), and `env -i`/`-u` or `unset` of them; `export -f`/`declare -f
 `git` or `review-gate`; any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the
 gate's settings are Tim's); `review-gate prepush-accept` (Tim's waiver, above); `install-githooks --uninstall`;
 a write (a redirect to it; `tee`, `sed -i`, `rm`, `chmod`, ... on it in the same command; for `cp`, `ln`,
-`install` and `rsync` only their destination (the last operand, or `-t DIR`), so `cp ~/.gitconfig /tmp/backup` is a
+`install` and `rsync` only their destination (the last operand, or `-t DIR`; option values such as
+`--suffix .bak` or `-m 755` are not operands, and an option whose arity isn't known counts every path; redirects such
+as `2>/dev/null` are not operands either), so `cp ~/.gitconfig /tmp/backup` is a
 read, and for `mv` its sources too, since moving one away removes it; any path in the command when the copy is hidden
 behind `xargs`, `bash -c` or a word built at run time; or a `cd` into it or a variable holding it plus any write) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`, `githooks/`,
 the pre-push records (`review-gate-prepush/`) or OpenQodex's (`.openqodex/`, `~/.openqodex/`);
@@ -446,7 +450,7 @@ never change the verdict; `openqodex doctor --install` (online, once) would fetc
 - `REVIEW_GATE_OPENQODEX_MEMORY` — the scope's `MemoryMax` (default `2G`; `off` runs uncapped),
   `REVIEW_GATE_OPENQODEX_SWAP` — its `MemorySwapMax` (default `256M`)
 - `REVIEW_GATE_PREPUSH_TIMEOUT` — OpenQodex's `--timeout` in seconds (default 1800); `REVIEW_GATE_PREPUSH_GRACE` —
-  how much longer the outer `timeout` waits before stopping it (default 120)
+  how much longer the watchdog waits before TERM (default 120); `REVIEW_GATE_PREPUSH_KILL_AFTER` — then KILL (default 30)
 - `REVIEW_GATE_BYPASS_LOG` — where bypasses and `prepush-accept`s are logged (default
   `~<user>/.local/state/review-gate/prepush-bypass.log`)
 - `REVIEW_GATE_SYSTEMD_RUN`, `REVIEW_GATE_GH` — the `systemd-run` and `gh` to use (tests; default: the fixed `PATH`'s)
