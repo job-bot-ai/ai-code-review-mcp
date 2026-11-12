@@ -11,6 +11,7 @@ set -euo pipefail
 [ "${1:-}" = review ] || { echo "stub openqodex: only review" >&2; exit 2; }
 shift
 [ -z "${STUB_OQ_ARGS:-}" ] || printf '%s\n' "$*" >>"$STUB_OQ_ARGS"
+[ -z "${STUB_OQ_ARGS:-}" ] || printf 'GH_TOKEN=%s\nGITHUB_TOKEN=%s\n' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >"$(dirname "$STUB_OQ_ARGS")/oq-env"
 base="" cfg="" blk=""
 while [ $# -gt 0 ]; do
   case "$1" in

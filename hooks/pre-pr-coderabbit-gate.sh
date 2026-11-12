@@ -52,9 +52,9 @@ bypass_check() {
   local git='(^|[^[:alnum:]_.-])git([^[:alnum:]_-]|$)' push='(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'
   if m '(^|[^[:alnum:]_])(REVIEW_GATE_[[:alnum:]_]*|OPENQODEX_[[:alnum:]_]*)[[:space:]]*=' || m '(^|[^[:alnum:]_])REVIEW_GATE_PREPUSH([^[:alnum:]_]|$)'; then
     why="it sets a REVIEW_GATE_* / OPENQODEX_* variable. The gate's settings, and the REVIEW_GATE_PREPUSH=off switch, are Tim's."
-  elif m "$git" && m '(^|[[:space:]])--no-ve'; then   # any git command: an alias can be a push
+  elif m "$git" && m '--no-ve'; then   # any git command: an alias can be a push
     why="--no-verify skips git's hooks, the pre-push review hook among them."
-  elif m "$git" && m "$push" && printf '%s' "$c" | grep -Pq -- '(^|\s)(-c\s+(?!credential\.helper=)|--config-env)'; then
+  elif m "$git" && m "$push" && printf '%s' "$c" | grep -Pq -- '(^|[^\w.-])git(\s+(-C\s+\S+|-c\s+credential\.helper=\S*(\s+[^-\s]\S*)*|--?[\w-]+(=\S*)?))*\s+(-c\s+(?!credential\.helper=)|--config-env)'; then
     why="a git push may only take -c credential.helper=...: any other -c or --config-env can switch the pre-push hook off."
   elif m "$git" && mi 'hookspath' && ! mi '^[[:space:]]*git[[:space:]]+(-C[[:space:]]+[^[:space:];&|]+[[:space:]]+)?config([[:space:]]+--(global|local|system|show-origin|show-scope))*[[:space:]]+--get(-all)?[[:space:]]+core\.hookspath[[:space:]]*$'; then
     why="it sets or overrides core.hooksPath (git -c, --config-env, git config): the pre-push hook would not run."

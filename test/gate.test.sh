@@ -6,7 +6,7 @@ set -uo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 hook="$root/hooks/pre-pr-coderabbit-gate.sh"
 gate="$root/review-gate"
-T="$(cd "$(mktemp -d)" && pwd -P)"   # physical path: macOS /var is a symlink to /private/var
+T="$(mktemp -d)" && T="$(cd "$T" && pwd -P)" && [ -n "$T" ] || exit 1   # physical path: macOS /var is a symlink to /private/var
 trap 'rm -rf "$T"' EXIT
 unset REVIEW_GATE_REQUIRED REVIEW_GATE_MIN
 export REVIEW_GATE_PRIMARY="kodus coderabbit"   # the date-based default is tested separately
@@ -461,7 +461,7 @@ run "$T/u" "op run -- gh pr create --fill"
 expect "op run -- gh pr create (a wrapper that runs gh locally) is gated" 2 stderr "$T/u: missing/stale"
 
 # ── Ways around the git pre-push hook (bypass_check): blocked; ordinary git use is not ──
-for c in "git push --no-verify origin HEAD" "git push --no-verif" "git p --no-verify" "git -C /x push origin main --no-verify" \
+for c in "git push --no-verify origin HEAD" "git push --no-verif" "git p --no-verify" "git push origin HEAD;--no-verify" "git -C /x push origin main --no-verify" \
   "git -c core.hooksPath=/dev/null push" "git -c core.hookspath= push" "git --config-env=core.hooksPath=X push" \
   "git config core.hooksPath /tmp/none" "git config --global core.hooksPath ''" "git config --unset core.hooksPath" \
   "GIT_CONFIG_GLOBAL=/dev/null git push" "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=x git push" \
@@ -477,7 +477,7 @@ done
 for c in "git push" "git push -u origin feat" "git push --force-with-lease origin HEAD" "git status" "git commit -m 'no verify needed'" \
   "git config --get core.hooksPath" "git config --global --get core.hooksPath" "cd \$HOME && git push" \
   "git -c credential.helper= -c credential.helper='!f(){ echo username=x; }; f' push -q origin HEAD" "echo \$HOME" "ls ~/.gitconfig" \
-  "git log --oneline | grep -e config"; do
+  "git log --oneline | grep -e config" "git push origin HEAD && grep -c TODO README.md" "git -C /tmp/x push -q origin HEAD"; do
   run "$T/a" "$c"
   expect "not a bypass: $c" 0
 done

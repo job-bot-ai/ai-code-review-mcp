@@ -76,11 +76,12 @@ die() { echo "review-gate: $*" >&2; exit 2; }
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
 # OpenQodex keys its records by sha256(realpath(work tree root)) (repoId in its src/receipts.ts).
 repo_id() { printf '%s' "$(realpath "$1")" | sha256sum | cut -d' ' -f1; }
-# The token never reaches a command line or the output.
-gh_env() {
-  [ -n "${GH_TOKEN:-}" ] && return 0
-  local t; t="$("$GH" auth token --user job-bot-ai 2>/dev/null || true)"
-  [ -z "$t" ] || export GH_TOKEN="$t"
+# gh for the punch list, as job-bot-ai. The token lives in a variable that is not exported: it reaches gh's
+# environment only, never a command line, the output, or the OpenQodex reviewer.
+PUNCH_TOKEN="${GH_TOKEN:-}"
+pgh() {
+  [ -n "$PUNCH_TOKEN" ] || PUNCH_TOKEN="$("$GH" auth token --user job-bot-ai 2>/dev/null || true)"
+  if [ -n "$PUNCH_TOKEN" ]; then GH_TOKEN="$PUNCH_TOKEN" timeout 60 "$GH" "$@"; else timeout 60 "$GH" "$@"; fi
 }
 
 # punch_list <out.tsv>: the punch list on $PUNCH_REPO main, one "<name>\t<git blob id>\t<path>" line per file, then
@@ -88,12 +89,11 @@ gh_env() {
 # reviewer), else review/PUNCH_LIST.md. Any failure, or no file, returns non-zero: never "review without the list".
 punch_list() {
   local out="$1" ref listing
-  gh_env
-  ref="$(timeout 30 "$GH" api "repos/$PUNCH_REPO/commits/main" --jq .sha 2>/dev/null)" || return 1
+  ref="$(pgh api "repos/$PUNCH_REPO/commits/main" --jq .sha 2>/dev/null)" || return 1
   [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
-  listing="$(timeout 30 "$GH" api "repos/$PUNCH_REPO/contents/review?ref=$ref" 2>/dev/null)" || return 1
+  listing="$(pgh api "repos/$PUNCH_REPO/contents/review?ref=$ref" 2>/dev/null)" || return 1
   if printf '%s' "$listing" | jq -e 'any(.[]; .name == "punch-list" and .type == "dir")' >/dev/null 2>&1; then
-    listing="$(timeout 30 "$GH" api "repos/$PUNCH_REPO/contents/review/punch-list?ref=$ref" 2>/dev/null)" || return 1
+    listing="$(pgh api "repos/$PUNCH_REPO/contents/review/punch-list?ref=$ref" 2>/dev/null)" || return 1
     printf '%s' "$listing" | jq -r '.[] | select(.type == "file" and (.name | test("^[0-9][0-9]-[A-Za-z0-9._-]+\\.md$")))
       | [.name, .sha, .path] | @tsv' >"$out" 2>/dev/null || return 1
   else
@@ -110,7 +110,7 @@ punch_fetch() {
   ref="$(sed -n 's/^#ref //p' "$list")"
   while IFS=$'\t' read -r name blob path; do
     case "$name" in '#'*) continue;; esac
-    timeout 60 "$GH" api -H 'Accept: application/vnd.github.raw' "repos/$PUNCH_REPO/contents/$path?ref=$ref" >"$d/$name" 2>/dev/null || return 1
+    pgh api -H 'Accept: application/vnd.github.raw' "repos/$PUNCH_REPO/contents/$path?ref=$ref" >"$d/$name" 2>/dev/null || return 1
     [ "$(git hash-object --no-filters "$d/$name")" = "$blob" ] || return 1
   done <"$list"
 }
@@ -187,7 +187,10 @@ default_base() {
   echo "origin/main"
 }
 
-dirty() { [ -n "$(git status --porcelain --untracked-files=all --ignore-submodules=none)" ]; }
+dirty() {   # a git status that fails counts as dirty
+  local o; o="$(git status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null)" || return 0
+  [ -n "$o" ]
+}
 
 run_prepush() {
   local base="" tmo mem cfg list copy tmp rid lr start rc=0 rd cid verdict kind name blob path
@@ -234,7 +237,8 @@ run_prepush() {
   start="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"   # OpenQodex writes ms; a record of an earlier run never counts
   echo "review-gate: OpenQodex $OQ_VERSION reviewing ${head:0:12} vs $base (${off[*]:-online}, memory cap $mem, punch list @ $(sed -n 's/^#ref //p' "$list" | cut -c1-12))..." >&2
   # Never `review --agent` (the coding agent reviewing its own work): only OpenQodex's own reviewer counts.
-  (cd "$top" && OPENQODEX_AUTO_UPDATE=0 ${cap[@]+"${cap[@]}"} bash -c '"$@"; rc=$?
+  # No GitHub token reaches OpenQodex or its reviewer.
+  (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && OPENQODEX_AUTO_UPDATE=0 ${cap[@]+"${cap[@]}"} bash -c '"$@"; rc=$?
       p="/sys/fs/cgroup$(cut -d: -f3- /proc/self/cgroup 2>/dev/null | head -n 1)/memory.peak"
       [ -r "$p" ] && echo "review-gate: OpenQodex peak memory $(( $(cat "$p") / 1048576 )) MiB" >&2
       exit $rc' _ "$OQ_BIN" review --base "$base" ${off[@]+"${off[@]}"} --reviewer-web off --config "$cfg" \

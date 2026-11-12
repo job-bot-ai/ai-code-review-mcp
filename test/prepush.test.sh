@@ -5,13 +5,14 @@ set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 gate="$root/review-gate"
-T="$(cd "$(mktemp -d)" && pwd -P)"
+T="$(mktemp -d)" && T="$(cd "$T" && pwd -P)" && [ -n "$T" ] || exit 1
 trap 'rm -rf "$T"' EXIT
 export GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export OPENQODEX_HOME="$T/oqhome" XDG_STATE_HOME="$T/state"
 export REVIEW_GATE_OPENQODEX="$root/test/stub/openqodex" REVIEW_GATE_GH="$root/test/stub/gh"
 export REVIEW_GATE_OPENQODEX_MEMORY=off PUNCH_FIXTURE="$T/punch" STUB_OQ_ARGS="$T/oq-args"
-unset GH_TOKEN STUB_OQ PUNCH_FAIL REVIEW_GATE_PREPUSH REVIEW_GATE_BLOCK_ON
+unset GH_TOKEN STUB_OQ PUNCH_FAIL PUNCH_CORRUPT PUNCH_REF REVIEW_GATE_PREPUSH REVIEW_GATE_BLOCK_ON REVIEW_GATE_PUNCH_REPO \
+  REVIEW_GATE_OPENQODEX_OFFLINE REVIEW_GATE_OPENQODEX_SWAP REVIEW_GATE_PREPUSH_TIMEOUT
 
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); echo "ok   - $1"; }
@@ -31,8 +32,10 @@ change() { echo "$1" >>"$W/f.txt"; git -C "$W" add f.txt && git -C "$W" commit -
 change one
 
 # ── passed ──
-prepush
+GH_TOKEN=secret-should-not-leak GITHUB_TOKEN=also-secret prepush
 expect "a passing review records a pass" 0 "pre-push review passed"
+grep -q '^GH_TOKEN=$' "$T/oq-env" && grep -q '^GITHUB_TOKEN=$' "$T/oq-env"; rc=$?
+expect "no GitHub token reaches OpenQodex (GH_TOKEN/GITHUB_TOKEN unset in its environment)" 0
 grep -q -- '--offline' "$T/oq-args" && grep -q -- '--reviewer-web off' "$T/oq-args" && grep -q -- '--block-on-severity minor' "$T/oq-args" \
   && ! grep -q -- '--agent' "$T/oq-args" && rc=0 || rc=1
 expect "OpenQodex runs offline, without web tools, blocking at minor, never --agent" 0
@@ -46,7 +49,9 @@ expect "the copy and OpenQodex's report folder leave the tree clean" 0
 push -q origin feat
 expect "the reviewed commit can be pushed" 0
 
-(cd "$W" && bash "$gate" clear >/dev/null) && push -q origin HEAD:refs/heads/after-clear
+out="$(cd "$W" && bash "$gate" clear 2>&1)"; rc=$?
+expect "review-gate clear runs" 0 "cleared all"
+push -q origin HEAD:refs/heads/after-clear
 expect "review-gate clear (the reviewer passes) leaves pre-push records alone" 0
 
 # ── only the newest commits reviewed ──
