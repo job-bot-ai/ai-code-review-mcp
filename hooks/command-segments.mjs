@@ -23,11 +23,34 @@ import { tokenize, SHELLS, progName, runnerExec } from './resolve-pr-target.mjs'
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_%]*\+?=/;
 const COPIERS = new Set(['cp', 'mv', 'ln', 'install', 'rsync']);
 
+const REDIRECT = /^(?:&>>?|>&|<&|>>?\|?|<<?<?|<>)/; // the operator at the start of a tokenizer word
+/**
+ * A command's words without its redirects: the operator word (`>/dev/null`, `>&1`, `</dev/null`, `&>log`), a bare
+ * operator's target word (`>` `log`; `>>` is two `>` words), an fd number in front of an operator (`2>/dev/null` is
+ * `2` `>/dev/null`), heredocs and here-strings. Redirect targets are checked as writes separately (field 3).
+ */
+function withoutRedirects(words) {
+  const out = [];
+  for (let j = 0; j < words.length; j += 1) {
+    const w = words[j];
+    if (w.heredoc || w.herestring || w.value === '<<' || w.value === '<<<') continue;
+    if (/^\d+$/.test(w.value) && REDIRECT.test(words[j + 1]?.value ?? '')) continue; // the 2 of 2>file
+    const m = w.value.match(REDIRECT);
+    if (!m) { out.push(w); continue; }
+    // A bare operator (nothing after it in this word) takes the next word: its target, or the fd of `>& 2`.
+    if (w.value.length === m[0].length) {
+      while (words[j + 1] && REDIRECT.test(words[j + 1].value) && words[j + 1].value === '>') j += 1; // `>` `>` = >>
+      j += 1;
+    }
+  }
+  return out;
+}
+
 /** The paths a cp/mv/ln/install/rsync command writes: [written[], parsed]. */
 function copierWrites(words, k) {
   const prog = progName(words[k]);
   if (!COPIERS.has(prog)) return [[], false];
-  const args = words.slice(k + 1).filter((w) => !w.heredoc && !w.herestring && !/^\d*[<>&]/.test(w.value));
+  const args = withoutRedirects(words.slice(k + 1));
   const operands = [];
   let target = null;
   let endOpts = false;
@@ -68,6 +91,7 @@ export function segments(src, out = [], depth = 0) {
     for (let j = 0; j < words.length; j += 1) {
       const m = words[j].value.match(/^(?:&>|>[>|]?)(.*)$/s);
       if (!m) continue;
+      if (m[1] === '&' && !/^(?:\d+-?|-)$/.test(words[j + 1]?.value ?? '')) { targets.push(words[j + 1]?.value ?? ''); j += 1; continue; } // >& FILE
       if (m[1].startsWith('&')) continue; // >&2: an fd, not a file
       if (m[1] === '' && words[j + 1]?.value.startsWith('>')) continue; // `>>` is two words here: the second has the target
       const t = m[1] !== '' ? m[1] : (words[j + 1]?.value ?? '');

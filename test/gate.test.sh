@@ -596,6 +596,16 @@ for c in "mv githooks/pre-push /tmp/x" "cp /tmp/x githooks/pre-push" "cp -t .git
   run "$T/a" "$c"
   expect "bypass blocked (copy onto or away from a protected path): $c" 2 stderr "BLOCKED by the pre-push review gate"
 done
+# Greptile on 459e382: a copy's redirects are not its operands (`2>/dev/null` is not a destination `2`).
+for c in "cp /tmp/x githooks/pre-push 2>/dev/null" "cp /tmp/x .git/hooks/y > log" "cp a ~/.gitconfig 2>&1" \
+  "install x .git/hooks/y </dev/null" "cp a .git/hooks/y >> log 2>&1" "cp a ~/.gitconfig >& log" "echo x >& ~/.gitconfig" "cp a .git/hooks/y >& 2"; do
+  run "$T/a" "$c"
+  expect "bypass blocked (a copy with redirects): $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+for c in "cp ~/.gitconfig /tmp/b 2>/dev/null" "cp githooks/pre-push /tmp/x > /tmp/log"; do
+  run "$T/a" "$c"
+  expect "not a bypass (a copy with redirects only reads it): $c" 0
+done
 # Without node (or when the tokenizer fails) the hook falls back to a cruder split that errs toward blocking.
 mkdir -p "$T/crude/hooks" && cp "$hook" "$root/hooks/resolve-pr-target.mjs" "$T/crude/hooks/" && cp "$gate" "$T/crude/"
 for c in "echo 'exit 0' > \"\$(echo /x)/githooks/pre-push\"" "git -c core.hooks\$(true; echo Path)=/dev/null push" "BASH_ENV=/tmp/x git push"; do
