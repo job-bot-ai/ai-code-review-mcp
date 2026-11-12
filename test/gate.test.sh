@@ -17,11 +17,13 @@ mkrepo() { # mkrepo <dir> <owner/repo>
   git init -q -b main "$1" && git -C "$1" remote add origin "https://github.com/$2.git"
   git -C "$1" commit -q --allow-empty -m init
 }
-# A pre-push review recorded for HEAD (the marker `review-gate prepush` writes; prepush itself is tested below).
-prepushed() {
-  local h gd; h="$(git -C "$1" rev-parse HEAD)"; gd="$(git -C "$1" rev-parse --absolute-git-dir)"
-  mkdir -p "$gd/review-gate" && printf '%s main 2026-11-11T00:00:00Z pass origin/main codex\n' "$h" >"$gd/review-gate/prepush"
-}
+# `check` also needs the pre-push review the git hook needs (test/prepush.test.sh tests it): a stubbed OpenQodex
+# review of HEAD, with the punch list from a stubbed gh.
+export OPENQODEX_HOME="$T/oqhome" REVIEW_GATE_OPENQODEX="$root/test/stub/openqodex" REVIEW_GATE_OPENQODEX_MEMORY=off
+export PUNCH_FIXTURE="$T/punch" XDG_STATE_HOME="$T/state"; unset GH_TOKEN STUB_OQ PUNCH_FAIL REVIEW_GATE_PREPUSH
+mkdir -p "$T/punch/review" && echo '- 1.1 an item' >"$T/punch/review/PUNCH_LIST.md"
+stubgh="$root/test/stub/gh"; export REVIEW_GATE_GH="$stubgh"
+prepushed() { (cd "$1" && bash "$gate" prepush --base HEAD >/dev/null 2>&1) || echo "prepushed $1 failed" >&2; }
 green() { (cd "$1" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null) && prepushed "$1"; }
 run() { # run <cwd> <command> → sets rc, out, err
   local payload; payload="$(jq -cn --arg c "$2" --arg d "$1" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
@@ -154,7 +156,7 @@ run "$T/r" "bash -c 'gh pr create --fill'"
 expect "a non-draft gh pr create inside bash -c is still blocked" 2 stderr "missing/stale"
 run "$T/r" "GH_REPO=acme/ready gh pr create --fill"
 expect "an env-prefixed non-draft gh pr create is still blocked" 2 stderr "missing/stale"
-export REVIEW_GATE_GH="$T/nogh"; printf '#!/bin/sh\nexit 1\n' >"$T/nogh"; chmod +x "$T/nogh"
+export REVIEW_GATE_GH="$T/nogh"; printf '#!/bin/sh\ncase "$1" in api|auth) exec "%s" "$@";; esac\nexit 1\n' "$stubgh" >"$T/nogh"; chmod +x "$T/nogh"
 run "$T/r" "gh pr ready"
 expect "gh pr ready before any reviews is blocked" 2 stderr "0 of 2 review passes"
 run "$T/r" "eval 'gh pr ready'"
@@ -234,7 +236,7 @@ green "$T/r"
 run "$T/r" "gh pr ready"
 expect "gh pr ready after two passes is allowed (falls back to local HEAD when gh can't look it up)" 0 stdout "checked local HEAD"
 # With a (fake) gh that reports the PR's head: the gate checks THAT commit.
-fakegh() { printf '#!/bin/sh\necho "{\\"headRefOid\\":\\"%s\\",\\"headRefName\\":\\"main\\"}"\n' "$1" >"$T/fakegh"; chmod +x "$T/fakegh"; }
+fakegh() { printf '#!/bin/sh\ncase "$1" in api|auth) exec "%s" "$@";; esac\necho "{\\"headRefOid\\":\\"%s\\",\\"headRefName\\":\\"main\\"}"\n' "$stubgh" "$1" >"$T/fakegh"; chmod +x "$T/fakegh"; }
 fakegh "$(git -C "$T/r" rev-parse HEAD)"
 export REVIEW_GATE_GH="$T/fakegh"
 run "$T/r" "gh pr ready 7"
@@ -264,7 +266,7 @@ expect "an env-wrapped git push before gh pr ready blocks" 2 stderr "runs before
 fakegh 0123456789abcdef0123456789abcdef01234567
 run "$T/r" "gh pr ready"
 expect "a PR head that isn't in the checkout is blocked" 2 stderr "isn't in"
-unset REVIEW_GATE_GH
+export REVIEW_GATE_GH="$stubgh"
 
 mkrepo "$T/e" acme/epsilon
 git -C "$T/e" worktree add -q -b feat/x "$T/e-wt" && green "$T/e-wt"
@@ -451,6 +453,40 @@ expect "a hook installed via a symlinked path still resolves the target" 2 stder
 
 run "$T/u" "op run -- gh pr create --fill"
 expect "op run -- gh pr create (a wrapper that runs gh locally) is gated" 2 stderr "$T/u: missing/stale"
+
+# ── Ways around the git pre-push hook (bypass_check): blocked; ordinary git use is not ──
+for c in "git push --no-verify origin HEAD" "git push --no-verif" "git -C /x push origin main --no-verify" \
+  "git -c core.hooksPath=/dev/null push" "git -c core.hookspath= push" "git --config-env=core.hooksPath=X push" \
+  "git config core.hooksPath /tmp/none" "git config --global core.hooksPath ''" "git config --unset core.hooksPath" \
+  "GIT_CONFIG_GLOBAL=/dev/null git push" "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=x git push" \
+  "GIT_CONFIG_PARAMETERS=\"'core.hookspath'='x'\" git push" "GIT_DIR=/tmp/x/.git git push" "HOME=/tmp git push" \
+  "env HOME=/tmp git push" "XDG_CONFIG_HOME=/tmp git push" "env -i git push" "env -u HOME git push" "unset HOME; git push" \
+  "git -c include.path=/tmp/c push" "REVIEW_GATE_PREPUSH=off git push" "export REVIEW_GATE_PREPUSH=off; git push" \
+  "env REVIEW_GATE_PREPUSH=off git push" "OPENQODEX_HOME=/tmp/fake git push" "REVIEW_GATE_PUNCH_REPO=me/empty review-gate prepush" \
+  "OPENQODEX_SKIP=1 git push" "bash install-githooks --uninstall --global"; do
+  run "$T/a" "$c"
+  expect "bypass blocked: $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+for c in "git push" "git push -u origin feat" "git push --force-with-lease origin HEAD" "git status" "git commit -m 'no verify needed'" \
+  "git config --get core.hooksPath" "git config --global --get core.hooksPath" "cd \$HOME && git push" \
+  "git -c credential.helper= -c credential.helper='!f(){ echo username=x; }; f' push -q origin HEAD" "echo \$HOME" "ls ~/.gitconfig"; do
+  run "$T/a" "$c"
+  expect "not a bypass: $c" 0
+done
+REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
+expect "Tim's REVIEW_GATE_PREPUSH=off (the hook's own environment) lets a bypass through" 0
+grep -q 'claude-hook' "$XDG_STATE_HOME/review-gate/prepush-bypass.log"; rc=$?
+expect "and logs it" 0
+
+# An unexpected exit code from review-gate check never passes the PR gate.
+mkdir -p "$T/odd/hooks" && cp "$hook" "$T/odd/hooks/" && cp "$root/hooks/resolve-pr-target.mjs" "$T/odd/hooks/"
+printf '#!/bin/sh\nexit 7\n' >"$T/odd/review-gate"
+payload="$(jq -cn --arg c "gh pr ready" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | bash "$T/odd/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "review-gate check exiting 7 blocks gh pr ready (fail closed)" 2 stderr "failed unexpectedly (exit 7)"
+printf '#!/bin/sh\nexit 3\n' >"$T/odd/review-gate"
+out="$(printf '%s' "$payload" | bash "$T/odd/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "review-gate's exit 3 (nothing to gate) is still not gated" 0
 
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]

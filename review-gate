@@ -19,14 +19,13 @@
 # within 30 min) is skipped for ONE commit with `record-skip <reviewer> --reason "..."`.
 # The skip is stored separately ($GIT_DIR/review-gate/<reviewer>.skip), is announced by
 # every `check` that relies on it, and never counts as a pass.
-#   4. the commit has a pre-push review: `review-gate prepush` passed for it (no P0-P2 findings), or its
-#      findings were declined explicitly with `review-gate prepush-accept --reason "..."` (announced like a skip).
+#   4. the commit has a pre-push review that still holds (`verify_prepush`, the same check the git pre-push hook
+#      runs): a finished OpenQodex review of exactly that commit that passed, or whose findings were declined with
+#      `prepush-accept --reason "..."` (announced like a skip), given the punch list that is on main now.
 #
-# Pre-push review (`prepush [--base <ref>]`): before every push to a PR branch the WHOLE change (`git diff
-# <base>...HEAD`) is reviewed against the repo's punch list (review/PUNCH_LIST.md when present) by Codex
-# (`codex review -`), or by a read-only `claude -p` when Codex can't run. Only a review that completed (exit 0 and
-# either well-formed [P0]-[P3] finding lines or an explicit "No findings.") counts; an error, quota message, empty
-# or cut-off answer records nothing. The PreToolUse hook blocks `git push` until HEAD has a `prepush` marker.
+# Pre-push review (`prepush [--base <ref>]`): OpenQodex reviews the whole change against the base, with the punch
+# list as its convention files. githooks/pre-push (installed with install-githooks) runs `check-prepush` for every
+# branch commit a `git push` sends and blocks anything else: no review, an unfinished one, findings, a stale list.
 # Reviewers: kodus, greptile (primaries), codex (fallback), self (last resort). `coderabbit` stays
 # valid for old records and an explicit REVIEW_GATE_PRIMARY, but is no longer a default primary.
 # `agy` stays valid for old records. `kimi` (the retired DeepSeek/kimi-review pass) is no longer a
@@ -55,144 +54,236 @@ marker()   { printf '%s/%s' "$dir" "$1"; }
 recorded() { local m; m="$(marker "$1")"; [ -f "$m" ] && cut -d' ' -f1 <"$m" || true; }
 skipped()  { local m; m="$(marker "$1").skip"; [ -f "$m" ] && cut -d' ' -f1 <"$m" || true; }
 skip_reason() { cut -d' ' -f4- <"$(marker "$1").skip"; }
-# Pre-push marker: "<sha> <branch> <time> <pass|accepted> <base> <reviewer> [reason]" in $dir/prepush.
-prepush_rev()  { local m; m="$(marker prepush)"; [ -f "$m" ] && cut -d' ' -f1 <"$m" || true; }
-prepush_field() { cut -d' ' -f"$1" <"$(marker prepush)"; }
-# Announce an accepted pre-push review (it never reads like a clean pass).
-prepush_note() {
-  [ "$(prepush_field 4)" = accepted ] || return 0
-  echo "review-gate: pre-push review findings for ${1:0:12} were ACCEPTED, not fixed — reason: $(prepush_field 7-) (findings: $dir/prepush-$1.txt)" >&2
+
+# ── Pre-push review: OpenQodex (https://github.com/openqodex/openqodex) reviews; this is glue around it ──
+# `prepush` runs `openqodex review` on a clean work tree at HEAD (so the reviewed change is exactly HEAD's tree
+# against the base), with the current punch list from $PUNCH_REPO main as its convention files, offline, under a
+# memory cap, and records which OpenQodex receipt/report/manifest belong to that commit. `check-prepush` (the git
+# pre-push hook) and `check` accept a commit only while that record holds: a FINISHED review of exactly that commit
+# that passed (or whose findings were declined with `prepush-accept`), given the punch list that is on main NOW.
+OQ_VERSION="0.18.0"   # pinned; upgrading is a reviewed change (README: "Upgrading OpenQodex")
+OQ_BIN="${REVIEW_GATE_OPENQODEX:-/opt/openqodex/bin/openqodex}"
+OQ_HOME="${OPENQODEX_HOME:-$HOME/.openqodex}"
+BLOCK_ON="${REVIEW_GATE_BLOCK_ON:-minor}"   # minor = "a real bug that will rarely surface", our P2 (README)
+PUNCH_REPO="${REVIEW_GATE_PUNCH_REPO:-j-bot-ai/pr-orchestrator}"
+GH="${REVIEW_GATE_GH:-gh}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+common="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+pdir="$common/review-gate/prepush"   # <sha>.json per reviewed commit, shared by every worktree of the repo
+top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+die() { echo "review-gate: $*" >&2; exit 2; }
+sha256() { sha256sum "$1" | cut -d' ' -f1; }
+# OpenQodex keys its records by sha256(realpath(work tree root)) (repoId in its src/receipts.ts).
+repo_id() { printf '%s' "$(realpath "$1")" | sha256sum | cut -d' ' -f1; }
+# The token never reaches a command line or the output.
+gh_env() {
+  [ -n "${GH_TOKEN:-}" ] && return 0
+  local t; t="$("$GH" auth token --user job-bot-ai 2>/dev/null || true)"
+  [ -z "$t" ] || export GH_TOKEN="$t"
 }
 
-PROMPT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/prompts/prepush-review.md"
-# Read-only by construction: the diff is already in the prompt, so the fallback gets file reads only. No Bash at all,
-# not even `git diff/log/show`: those take --output=<file> and could overwrite the checkout.
-# --tools makes them the only built-in tools that exist, --restricted removes every code-running tool,
-# --strict-mcp-config (with no --mcp-config) loads no MCP servers, and dontAsk denies anything not allowed.
-CLAUDE_REVIEW_TOOLS="Read,Glob,Grep"
-CLAUDE_DENIED_TOOLS="Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
-
-# run_limited <seconds> <cmd...>: run with a time limit (exit 124 when it fires). The reviewer gets its own process
-# group (job control), so the watchdog's TERM, then KILL after a grace period, reaches everything it started, even
-# a process that ignores TERM; whatever is left when it exits is killed too. Neither the reviewer nor the watchdog
-# inherits the lock's descriptor (fd 9), so a straggler can never keep the next review locked out.
-run_limited() {
-  local t="$1" pid w rc=0; shift
-  set -m
-  "$@" <&0 9>&- & pid=$!
-  set +m
-  ( sleep "$t"; kill -TERM -- "-$pid" 2>/dev/null; sleep "${REVIEW_GATE_KILL_GRACE:-30}"; kill -KILL -- "-$pid" 2>/dev/null ) \
-    9>&- </dev/null >/dev/null 2>&1 & w=$!
-  wait "$pid" 2>/dev/null || rc=$?
-  kill "$w" 2>/dev/null || true; wait "$w" 2>/dev/null || true
-  kill -KILL -- "-$pid" 2>/dev/null || true
-  [ "$rc" -lt 128 ] || rc=124   # ended by a signal (the watchdog): not a completed run
-  return "$rc"
-}
-
-# The verdict part of a Codex run's stdout: after its last "codex" header line if it prints a transcript,
-# else all of it (a bare final message).
-codex_final_text() {
-  awk '
-    { l[NR] = $0; h = $0; sub(/[ \t\r]+$/, "", h); if (h == "codex") last = NR }
-    END {
-      if (!last) { for (i = 1; i <= NR; i++) print l[i]; exit }
-      for (i = last + 1; i <= NR; i++) {
-        h = l[i]; sub(/[ \t\r]+$/, "", h)
-        if (h == "exec" || h == "thinking" || h == "user" || h == "codex" || h == "tokens used") break
-        print l[i]
-      }
-    }' "$1"
-}
-
-# classify_tags <file>: each line prefixed with its kind: "G<0-3> " a finding line in the format (`[P1] title`,
-# optionally after "- " or "* ", exactly one structural tag), "B " a line with a [Pn] tag we can't read (two tags,
-# a tag not at the start, a cut-off `[P1` or stray `P1]`, a tag inside a leading code span), "N " anything else.
-# Tags quoted in a code span later in a line (`[P1]` in an explanation) are only quotes. Both parsers below read
-# lines through this one function, so a failed run and a completed one can't disagree about what a finding is.
-classify_tags() {
-  awk '
-    { line = $0; sub(/\r$/, "", line)
-      tagish = "\\[[Pp][0-3]|[Pp][0-3]\\]"
-      if (line ~ /^[ \t]*([-*][ \t]*)?`/ && line ~ tagish) { print "B " line; next }
-      t = line; gsub(/`[^`]*`/, "", t)
-      n = gsub(/\[[Pp][0-3]\]/, "", t)
-      if (t ~ tagish) { print "B " line; next }
-      if (n == 0) { print "N " line; next }
-      if (n > 1 || line !~ /^[ \t]*([-*][ \t]*)?\[P[0-3]\][ \t]*[^ \t]/) { print "B " line; next }
-      match(line, /\[P[0-3]\]/); print "G" substr(line, RSTART + 2, 1) " " line
-    }' "$1"
-}
-
-# parse_verdict <file>: first line is one of
-#   clean | findings <blocking P0-P2> <total> | unreadable <why>
-# followed by the finding lines. Strict: every line carrying a [Pn] tag must be one finding in the format;
-# otherwise the verdict is unreadable, because a finding we can't read could hide a blocker. "No findings." must
-# be the last line, with no P0-P3 mention at all.
-parse_verdict() {
-  classify_tags "$1" | awk '
-    { kind = substr($0, 1, index($0, " ") - 1); line = substr($0, index($0, " ") + 1) }
-    kind == "B" { bad[++nb] = line; next }
-    kind ~ /^G/ { f[++nf] = line; if (substr(kind, 2) + 0 <= 2) blk++; next }
-    { if (line ~ /[^ \t]/) { nonempty++; last = line }
-      if (line ~ /(^|[^A-Za-z0-9])[Pp][0-3]([^0-9A-Za-z]|$)/) loose++ }
-    END {
-      if (nb) { b = bad[1]; if (length(b) > 160) b = substr(b, 1, 160) "..."
-        print "unreadable " nb " line(s) carry a [Pn] tag but are not in the finding format, e.g.: " b; exit }
-      if (nf) { print "findings " blk + 0 " " nf; for (i = 1; i <= nf; i++) print f[i]; exit }
-      v = last; gsub(/^[ \t*_`>]+|[ \t*_`]+$/, "", v)
-      if (!nonempty) print "unreadable empty answer"
-      else if (v == "No findings." && !loose) print "clean"
-      else if (v == "No findings.") print "unreadable \"No findings.\" but the answer mentions a P0-P3 priority"
-      else print "unreadable neither [Pn] findings nor a final \"No findings.\""
-    }'
-}
-
-# The lock lives next to $dir, not in it, so `clear` (which deletes $dir, and takes the lock first) can't remove a
-# running review's lock. One prepush/prepush-accept/clear at a time per worktree: an older run must never publish a pass after a newer run of
-# the same commit started (or finished with findings). With flock(1) the kernel holds the lock for the life of
-# the process (released however it ends, so there is no stale lock to take over). Without flock (macOS), a
-# symlink whose target is the owner's pid is created atomically (`ln -s` fails if it exists, and the pid is never
-# missing); a link whose owner is gone is taken over, best effort.
-LOCK=""; WORK=""
-take_lock() {
-  mkdir -p "$dir"
-  if command -v flock >/dev/null 2>&1 && [ -z "${REVIEW_GATE_NO_FLOCK:-}" ]; then
-    exec 9>>"$gitdir/review-gate.lock"
-    flock -n 9 || { echo "review-gate: another prepush/prepush-accept is running in this worktree; wait for it" >&2; exit 5; }
-    return 0
+# punch_list <out.tsv>: the punch list on $PUNCH_REPO main, one "<name>\t<git blob id>\t<path>" line per file, then
+# a "#ref <commit>" line. review/punch-list/NN-*.md when that folder exists (log.md and the rest are not for the
+# reviewer), else review/PUNCH_LIST.md. Any failure, or no file, returns non-zero: never "review without the list".
+punch_list() {
+  local out="$1" ref listing
+  gh_env
+  ref="$(timeout 30 "$GH" api "repos/$PUNCH_REPO/commits/main" --jq .sha 2>/dev/null)" || return 1
+  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
+  listing="$(timeout 30 "$GH" api "repos/$PUNCH_REPO/contents/review?ref=$ref" 2>/dev/null)" || return 1
+  if printf '%s' "$listing" | jq -e 'any(.[]; .name == "punch-list" and .type == "dir")' >/dev/null 2>&1; then
+    listing="$(timeout 30 "$GH" api "repos/$PUNCH_REPO/contents/review/punch-list?ref=$ref" 2>/dev/null)" || return 1
+    printf '%s' "$listing" | jq -r '.[] | select(.type == "file" and (.name | test("^[0-9][0-9]-[A-Za-z0-9._-]+\\.md$")))
+      | [.name, .sha, .path] | @tsv' >"$out" 2>/dev/null || return 1
+  else
+    printf '%s' "$listing" | jq -r '.[] | select(.type == "file" and .name == "PUNCH_LIST.md") | [.name, .sha, .path] | @tsv' \
+      >"$out" 2>/dev/null || return 1
   fi
-  local l="$gitdir/review-gate.lock.pid" t="$gitdir/review-gate.lock.takeover" pid
-  if ! ln -s "$$" "$l" 2>/dev/null; then
-    # Taking over a dead owner's link is itself serialized (atomic mkdir), and the link is re-read inside, so a
-    # second taker can never remove the link the first one just created.
-    mkdir "$t" 2>/dev/null || { echo "review-gate: another prepush is taking over the lock in this worktree; retry (a $t left by a crash can be removed)" >&2; exit 5; }
-    pid="$(readlink "$l" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      rmdir "$t"; echo "review-gate: another prepush/prepush-accept (pid $pid) is running in this worktree; wait for it" >&2; exit 5
-    fi
-    rm -f "$l"
-    if ! ln -s "$$" "$l" 2>/dev/null; then rmdir "$t"; echo "review-gate: couldn't take $l; retry" >&2; exit 5; fi
-    rmdir "$t"
+  [ -s "$out" ] || return 1
+  LC_ALL=C sort -o "$out" "$out"
+  printf '#ref %s\n' "$ref" >>"$out"
+}
+# punch_fetch <list.tsv> <dir>: download each file at the listed commit; its git blob id must match the listing.
+punch_fetch() {
+  local list="$1" d="$2" ref name blob path
+  ref="$(sed -n 's/^#ref //p' "$list")"
+  while IFS=$'\t' read -r name blob path; do
+    case "$name" in '#'*) continue;; esac
+    timeout 60 "$GH" api -H 'Accept: application/vnd.github.raw' "repos/$PUNCH_REPO/contents/$path?ref=$ref" >"$d/$name" 2>/dev/null || return 1
+    [ "$(git hash-object --no-filters "$d/$name")" = "$blob" ] || return 1
+  done <"$list"
+}
+# The reviewer was given every punch-list file whole (OpenQodex skips an over-cap file whole), with these hashes.
+MANIFEST_MATCHES='[.instruction_files[] | {path, sha256, omitted}] | sort == ($m[0].punch.files | map({path, sha256, omitted: null}) | sort)'
+
+# verify_prepush <sha>: the one check of a pre-push review, used by `check-prepush` (the git hook) and by `check`.
+# 0 = the push of <sha> may go (accepted findings are announced on stderr); 1 = blocked, with the reason on stderr.
+verify_prepush() {
+  local sha="$1" m="$pdir/$1.json" rec rd v cur
+  bad() { echo "no passing pre-push review for ${sha:0:12}: $*" >&2; }
+  if [ ! -f "$m" ]; then
+    if [ -f "$pdir/$sha.last" ]; then bad "its last \`review-gate prepush\` did not pass: $(head -c 400 "$pdir/$sha.last")"
+    else bad "run \`review-gate prepush\` on that commit"; fi
+    return 1
   fi
-  LOCK="$l"
+  jq -e --arg s "$sha" '.version == 1 and .sha == $s' "$m" >/dev/null 2>&1 || { bad "unreadable record $m"; return 1; }
+  rd="$(jq -r .run_dir "$m")"; v="$(jq -r .verdict "$m")"
+  # OpenQodex's own record (written only when a review finished), then the report and the manifest it hashed.
+  rec="$OQ_HOME/receipts/$(jq -r .repo_id "$m")/$(jq -r .change_id "$m").json"
+  jq -e --slurpfile m "$m" '.version == 1 and .kind == "complete" and .change_id == $m[0].change_id
+    and .verdict == $m[0].verdict and .base.sha == $m[0].base_sha and .block_on_severity == $m[0].block_on' "$rec" >/dev/null 2>&1 ||
+    { bad "OpenQodex's receipt $rec is missing or doesn't match (not a finished review of this change)"; return 1; }
+  [ "$(sha256 "$rd/report.json" 2>/dev/null)" = "$(jq -r .report_sha256 "$m")" ] || { bad "$rd/report.json changed or is gone"; return 1; }
+  [ "$(sha256 "$rd/manifest.json" 2>/dev/null)" = "$(jq -r .manifest_sha256 "$m")" ] || { bad "$rd/manifest.json changed or is gone"; return 1; }
+  jq -e --slurpfile m "$m" '.completion.status == "complete" and .change_id == $m[0].change_id and .verdict == $m[0].verdict' \
+    "$rd/report.json" >/dev/null 2>&1 || { bad "the report is not a complete review of this change"; return 1; }
+  [ "$(jq -r .block_on "$m")" = "$BLOCK_ON" ] || { bad "reviewed with block_on_severity $(jq -r .block_on "$m"); the gate uses $BLOCK_ON"; return 1; }
+  git merge-base --is-ancestor "$(jq -r .base_sha "$m")" "$sha" 2>/dev/null || { bad "the reviewed base is not an ancestor of it"; return 1; }
+  jq -e --slurpfile m "$m" "$MANIFEST_MATCHES" "$rd/manifest.json" >/dev/null 2>&1 ||
+    { bad "the review's manifest doesn't show the whole punch list supplied"; return 1; }
+  case "$v" in
+    passed) ;;
+    blocked)
+      jq -e '.accepted.reason | type == "string" and length >= 10' "$m" >/dev/null 2>&1 ||
+        { bad "OpenQodex blocked it ($(jq -r .counts "$m"); $BLOCK_ON and above block): fix them, or \`review-gate prepush-accept --reason ...\`. Report: $rd/report.html"; return 1; } ;;
+    *) bad "verdict '$v'"; return 1 ;;
+  esac
+  # The punch list it was given must be the one on main now. A failed fetch blocks.
+  cur="$(mktemp)"
+  if ! punch_list "$cur"; then rm -f "${cur:?}"; bad "couldn't fetch the current punch list from $PUNCH_REPO main (a failed fetch never passes)"; return 1; fi
+  if [ "$(grep -v '^#' "$cur" | cut -f1,2)" != "$(jq -r '.punch.files[] | [.name, .blob] | @tsv' "$m" | LC_ALL=C sort)" ]; then
+    rm -f "${cur:?}"; bad "the punch list on $PUNCH_REPO main changed since the review (reviewed at $(jq -r .punch.ref "$m" | cut -c1-12)); run \`review-gate prepush\` again"; return 1
+  fi
+  rm -f "${cur:?}"
+  [ "$v" = passed ] || echo "review-gate: pre-push review findings for ${sha:0:12} ($(jq -r .counts "$m")) were ACCEPTED, not fixed — reason: $(jq -r .accepted.reason "$m") (report: $rd/report.html)" >&2
+  return 0
 }
-cleanup() {
-  [ -z "$WORK" ] || rm -rf "$WORK"
-  if [ -n "$LOCK" ] && [ "$(readlink "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi   # only our own lock
+
+# One prepush/prepush-accept at a time per repository (they share OpenQodex's last-review record).
+prepush_lock() {
+  mkdir -p "$pdir"
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>>"$common/review-gate/prepush.lock"
+  flock -n 9 || die "another prepush/prepush-accept is running in this repository; wait for it"
 }
-trap cleanup EXIT
 
 # The base to review against: the PR base if gh can tell, else origin/main.
 default_base() {
   local b
-  b="$(run_limited 20 "${REVIEW_GATE_GH:-gh}" pr view --json baseRefName -q .baseRefName 2>/dev/null </dev/null || true)"
-  case "$b" in ''|*[!A-Za-z0-9._/-]*) b="";; esac
+  b="$(timeout 20 "$GH" pr view --json baseRefName -q .baseRefName 2>/dev/null </dev/null || true)"
+  [[ "$b" =~ ^[A-Za-z0-9._/-]+$ ]] || b=""
   if [ -n "$b" ]; then
-    GIT_TERMINAL_PROMPT=0 run_limited 60 git fetch -q origin "$b" >/dev/null 2>&1 </dev/null || true
+    GIT_TERMINAL_PROMPT=0 timeout 60 git fetch -q origin "$b" >/dev/null 2>&1 </dev/null || true
     if git rev-parse --verify -q "refs/remotes/origin/$b^{commit}" >/dev/null; then echo "origin/$b"; return; fi
   fi
   echo "origin/main"
+}
+
+dirty() { [ -n "$(git status --porcelain --untracked-files=all --ignore-submodules=none)" ]; }
+
+run_prepush() {
+  local base="" tmo mem cfg list copy tmp rid lr start rc=0 rd cid verdict kind name blob path
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) [ -n "${2:-}" ] || die "--base needs a ref"; base="$2"; shift 2 ;;
+      --base=*) base="${1#--base=}"; shift ;;
+      *) die "usage: prepush [--base <ref>]" ;;
+    esac
+  done
+  command -v jq >/dev/null 2>&1 || die "jq is required for prepush"
+  [ -x "$OQ_BIN" ] || die "OpenQodex is not installed at $OQ_BIN (README: install it, pinned to $OQ_VERSION)"
+  [ "$("$OQ_BIN" --version 2>/dev/null)" = "$OQ_VERSION" ] || die "$OQ_BIN is not OpenQodex $OQ_VERSION, the pinned version"
+  tmo="${REVIEW_GATE_PREPUSH_TIMEOUT:-1800}"; [[ "$tmo" =~ ^[0-9]+$ ]] || die "REVIEW_GATE_PREPUSH_TIMEOUT must be seconds"
+  [ -n "$base" ] || base="$(default_base)"
+  git rev-parse --verify -q "$base^{commit}" >/dev/null || die "base '$base' is not a commit here (fetch it, or pass --base <ref>)"
+  prepush_lock
+  rm -f "${pdir:?}/${head:?}.json"   # a new review of this commit replaces the old one, whatever it said
+  tmp="$(mktemp -d)"; list="$tmp/punch.tsv"
+  fail() { rm -rf "${tmp:?}"; printf '%s\n' "$*" >"$pdir/$head.last"; echo "review-gate: pre-push review of ${head:0:12} FAILED: $*" >&2; exit 4; }
+  # .openqodex/ (OpenQodex's report folder, and the punch-list copies) stays out of git. The tree must be clean:
+  # OpenQodex reviews the work tree, so only a clean tree makes "the change" exactly the commit that is pushed.
+  git check-ignore -q "$top/.openqodex/x" 2>/dev/null || { mkdir -p "$common/info"; echo '/.openqodex/' >>"$common/info/exclude"; }
+  dirty && fail "the work tree is not clean: commit or stash first (the review must be of exactly the commit you push)"
+  # The current punch list, checked against its git blob ids, copied where OpenQodex reads convention files.
+  punch_list "$list" || fail "couldn't list the punch list on $PUNCH_REPO main (no review without it)"
+  copy="$top/.openqodex/punch-list"; rm -rf "${copy:?}"; mkdir -p "$copy"
+  punch_fetch "$list" "$copy" || fail "couldn't download the punch list from $PUNCH_REPO main (no review without it)"
+  cfg="$common/review-gate/openqodex.yaml"   # ours, outside the work tree: a branch can't loosen it
+  {
+    printf 'version: 1\nmin_version: %s\nreview:\n  block_on_severity: %s\n  instructions_files:\n' "$OQ_VERSION" "$BLOCK_ON"
+    while IFS=$'\t' read -r name blob path; do
+      case "$name" in '#'*) ;; *) printf '    - ".openqodex/punch-list/%s"\n' "$name" ;; esac
+    done <"$list"
+  } >"$cfg"
+  local -a cap=() off=(--offline)
+  [ "${REVIEW_GATE_OPENQODEX_OFFLINE:-on}" = off ] && off=()
+  mem="${REVIEW_GATE_OPENQODEX_MEMORY:-2G}"
+  if [ "$mem" != off ]; then
+    command -v systemd-run >/dev/null 2>&1 || fail "systemd-run is missing for the memory cap (REVIEW_GATE_OPENQODEX_MEMORY=off runs uncapped)"
+    cap=(systemd-run --scope --quiet --collect -p "MemoryMax=$mem" -p "MemorySwapMax=${REVIEW_GATE_OPENQODEX_SWAP:-256M}" --)
+  fi
+  rid="$(repo_id "$top")"; lr="$OQ_HOME/last-review/$rid/last-review.json"
+  start="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  echo "review-gate: OpenQodex $OQ_VERSION reviewing ${head:0:12} vs $base (${off[*]:-online}, memory cap $mem, punch list @ $(sed -n 's/^#ref //p' "$list" | cut -c1-12))..." >&2
+  # Never `review --agent` (the coding agent reviewing its own work): only OpenQodex's own reviewer counts.
+  (cd "$top" && OPENQODEX_AUTO_UPDATE=0 ${cap[@]+"${cap[@]}"} bash -c '"$@"; rc=$?
+      p="/sys/fs/cgroup$(cut -d: -f3- /proc/self/cgroup 2>/dev/null | head -n 1)/memory.peak"
+      [ -r "$p" ] && echo "review-gate: OpenQodex peak memory $(( $(cat "$p") / 1048576 )) MiB" >&2
+      exit $rc' _ "$OQ_BIN" review --base "$base" ${off[@]+"${off[@]}"} --reviewer-web off --config "$cfg" \
+      --instructions "$HERE/prompts/openqodex-instructions.md" --block-on-severity "$BLOCK_ON" --timeout "$tmo" </dev/null) || rc=$?
+  { [ "$(git rev-parse HEAD)" = "$head" ] && ! dirty; } || fail "HEAD or the work tree changed while the review ran; review again"
+  case "$rc" in
+    0|1) ;;
+    *) fail "OpenQodex exited $rc: the review did not finish (incomplete, no reviewer that can start, or an error; see above). Fix that (reviewer login, --timeout) and run prepush again; never \`openqodex review --agent\`" ;;
+  esac
+  # The run that just ended: OpenQodex's last-review record (newer than our start), its report, and the receipt.
+  jq -e --arg t "$start" '.version == 2 and .written_at >= $t' "$lr" >/dev/null 2>&1 || fail "OpenQodex recorded no review (nothing to review against $base?)"
+  rd="$(jq -r .dir "$lr")"; cid="$(jq -r .change_id "$lr")"
+  [ "$(sha256 "$rd/report.json" 2>/dev/null)" = "$(jq -r .report_sha256 "$lr")" ] || fail "the report doesn't match OpenQodex's record"
+  verdict="$(jq -r .verdict "$rd/report.json")"; kind="$(jq -r .completion.status "$rd/report.json")"
+  { [ "$kind" = complete ] && { { [ "$rc" = 0 ] && [ "$verdict" = passed ]; } || { [ "$rc" = 1 ] && [ "$verdict" = blocked ]; }; }; } ||
+    fail "OpenQodex exited $rc with a '$kind' review, verdict '$verdict': not a finished review"
+  while IFS=$'\t' read -r name blob path; do
+    case "$name" in '#'*) ;; *) printf '%s\t%s\t%s\n' "$name" "$blob" "$(sha256 "$copy/$name")" ;; esac
+  done <"$list" >"$tmp/files.tsv"
+  PUNCH_REF="$(sed -n 's/^#ref //p' "$list")" jq -n --arg sha "$head" --arg branch "$branch" --arg base "$base" \
+    --arg rid "$rid" --arg root "$top" --arg rd "$rd" --arg cid "$cid" --arg v "$verdict" --arg blk "$BLOCK_ON" \
+    --arg oq "$OQ_VERSION" --arg repo "$PUNCH_REPO" --arg rs "$(sha256 "$rd/report.json")" --arg ms "$(sha256 "$rd/manifest.json")" \
+    --slurpfile r "$rd/report.json" --rawfile pl "$tmp/files.tsv" \
+    '{version: 1, sha: $sha, branch: $branch, base_ref: $base, base_sha: $r[0].base.sha, repo_id: $rid, repo_root: $root,
+      run_dir: $rd, change_id: $cid, verdict: $v, block_on: $blk, openqodex: $oq, report_sha256: $rs, manifest_sha256: $ms,
+      counts: ([$r[0].findings[]?.severity] | group_by(.) | map("\(length) \(.[0])") | join(", ")),
+      reviewer: ($r[0].completion.reviewer.driver // null),
+      punch: {repo: $repo, ref: env.PUNCH_REF, files: ($pl | split("\n") | map(select(length > 0) | split("\t")
+        | {name: .[0], blob: .[1], sha256: .[2], path: (".openqodex/punch-list/" + .[0])}))},
+      accepted: null, written_at: (now | todate)}' >"$tmp/record.json" 2>/dev/null || fail "couldn't write the record"
+  # Fail here rather than at push time when the reviewer wasn't given the whole punch list.
+  jq -e --slurpfile m "$tmp/record.json" "$MANIFEST_MATCHES" "$rd/manifest.json" >/dev/null 2>&1 ||
+    fail "OpenQodex was not given the whole punch list (it skips a file over 32 KB, or past 64 KB in all, whole); see $rd/report.md"
+  mv "$tmp/record.json" "$pdir/$head.json"; rm -f "${pdir:?}/${head:?}.last"; rm -rf "${tmp:?}"
+  if [ "$verdict" = blocked ]; then
+    {
+      echo "review-gate: NOT passed ($(jq -r .counts "$pdir/$head.json")): fix the findings at or above $BLOCK_ON, commit, run \`review-gate prepush\` again."
+      echo "  A finding you decide not to fix: decline it explicitly, for this commit only:"
+      echo "    review-gate prepush-accept --reason \"why each finding is not being fixed\""
+    } >&2
+    exit 1
+  fi
+  echo "review-gate: pre-push review passed for $branch @ ${head:0:12} (OpenQodex vs $base)"
+}
+
+run_accept() {
+  local reason m="$pdir/$head.json"
+  [ "${1:-}" = "--reason" ] || die "usage: prepush-accept --reason \"why the findings are not being fixed\""
+  reason="$(printf '%s' "${2:-}" | tr '\n\r' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ "${#reason}" -ge 10 ] || die "--reason must say why each finding is not being fixed (10+ characters)"
+  prepush_lock
+  [ -f "$m" ] || die "no finished pre-push review of ${head:0:12} to accept (an unfinished review can't be accepted): run \`review-gate prepush\`"
+  [ "$(jq -r .verdict "$m")" = blocked ] || die "the pre-push review of ${head:0:12} has no blocking findings; nothing to accept"
+  jq --arg r "$reason" '.accepted = {reason: $r, at: (now | todate)}' "$m" >"$m.tmp" && mv "$m.tmp" "$m"
+  echo "review-gate: recorded ACCEPTED pre-push findings ($(jq -r .counts "$m")) for $branch @ ${head:0:12} — $reason"
+  echo "review-gate: every check of this commit announces it; report: $(jq -r .run_dir "$m")/report.html"
 }
 
 case "${1:-help}" in
@@ -251,9 +342,9 @@ case "${1:-help}" in
       has "$r" ${passes[@]+"${passes[@]}"} ${skips[@]+"${skips[@]}"} ||
         problems+=("primary reviewer $r has no pass or skip")
     done
-    # Nothing reaches "ready" without a pre-push review of that exact commit (passed, or findings accepted).
-    if [ "$(prepush_rev)" = "$rev" ]; then prepush_note "$rev"
-    else problems+=("no pre-push review for this commit (review-gate prepush)"); fi
+    # Nothing reaches "ready" without the pre-push review the git hook requires for that commit.
+    if pp="$(verify_prepush "$rev" 2>&1)"; then [ -z "$pp" ] || echo "$pp" >&2   # accepted findings are announced
+    else problems+=("$pp"); fi
     if [ "${#counted[@]}" -lt "$MIN" ]; then
       problems+=("${#counted[@]} of $MIN review passes (${counted[*]:-none})")
       [ "$self_ignored" = 1 ] &&
@@ -277,26 +368,16 @@ case "${1:-help}" in
       req=""; case " ${PRIMARY[*]-} " in *" $r "*) req=" [primary]";; esac
       printf '  %-11s %s%s\n' "$r" "$s" "$req"
     done
-    ph="$(prepush_rev)"
-    if [ -n "$ph" ] && [ "$ph" = "$head" ]; then
-      if [ "$(prepush_field 4)" = accepted ]; then s="ACCEPTED @ ${ph:0:12} ($(prepush_field 6) vs $(prepush_field 5)) — $(prepush_field 7-)"
-      else s="green @ ${ph:0:12} ($(prepush_field 6) vs $(prepush_field 5))"; fi
-    elif [ -n "$ph" ]; then s="STALE @ ${ph:0:12}"
+    if [ -f "$pdir/$head.json" ]; then
+      s="$(jq -r '"\(.verdict) @ \(.sha[:12]) (OpenQodex vs \(.base_ref), punch list @ \(.punch.ref[:12]))"
+        + (if .counts != "" then ": \(.counts)" else "" end) + (if .accepted then "; ACCEPTED — \(.accepted.reason)" else "" end)' "$pdir/$head.json")"
+    elif [ -f "$pdir/$head.last" ]; then s="FAILED: $(head -c 200 "$pdir/$head.last")"
     else s="(none)"; fi
-    res="$dir/prepush-$head.result"
-    if [ "$s" = "(none)" ] || [ "${s#STALE}" != "$s" ]; then
-      if [ -f "$res" ]; then
-        read -r rs rb rt _ <"$res" || true
-        if [ "$rs" = completed ]; then s="$s; last run for HEAD: $rb P0-P2 of $rt findings (fix them, or prepush-accept)"
-        else s="$s; last run for HEAD FAILED: $(cut -d' ' -f2- <"$res")"; fi
-      fi
-    fi
-    printf '  %-11s %s [required before push]\n' prepush "$s"
+    printf '  %-11s %s [required before push; check-prepush also checks the punch list is current]\n' prepush "$s"
     ;;
   clear)
-    take_lock   # never while a review runs: it would publish into what was just cleared
     if [ "${2:-}" = prepush ]; then
-      rm -f "$(marker prepush)"; echo "review-gate: cleared prepush"
+      rm -f "${pdir:?}/${head:?}.json" "${pdir:?}/${head:?}.last"; echo "review-gate: cleared the pre-push review of ${head:0:12}"
     elif [ -n "${2:-}" ]; then
       is_valid "$2" || { echo "review-gate: unknown reviewer '$2' (valid: $VALID)" >&2; exit 2; }
       rm -f "$(marker "$2")" "$(marker "$2").skip"; echo "review-gate: cleared $2"
@@ -304,187 +385,15 @@ case "${1:-help}" in
       rm -rf "$dir"; echo "review-gate: cleared all"
     fi
     ;;
-  check-prepush)   # used by the hook before `git push`: does the commit have a pre-push review?
+  prepush) shift; run_prepush "$@" ;;
+  prepush-accept) shift; run_accept "$@" ;;
+  check-prepush)   # the git pre-push hook: may this commit be pushed?
     rev="$head"
     if [ "${2:-}" = "--rev" ]; then
       rev="$(git rev-parse --verify -q "${3:-}^{commit}" 2>/dev/null)" || {
         echo "review-gate: --rev '${3:-}' is not a commit" >&2; exit 1; }
     fi
-    if [ "$(prepush_rev)" = "$rev" ]; then prepush_note "$rev"; exit 0; fi
-    msg="no pre-push review for ${rev:0:12}"
-    res="$dir/prepush-$rev.result"
-    if [ -f "$res" ]; then
-      read -r rs rb rt _ <"$res" || true
-      if [ "$rs" = completed ]; then msg="$msg: the last review found $rb P0-P2 finding(s) (of $rt), see $dir/prepush-$rev.txt"
-      else msg="$msg: the last review FAILED ($(cut -d' ' -f2- <"$res"))"; fi
-    fi
-    echo "$msg" >&2
-    exit 1
-    ;;
-  prepush)
-    shift; base=""
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --base) [ -n "${2:-}" ] || { echo "review-gate: --base needs a ref" >&2; exit 2; }; base="$2"; shift 2 ;;
-        --base=*) base="${1#--base=}"; shift ;;
-        *) echo "review-gate: usage: prepush [--base <ref>]" >&2; exit 2 ;;
-      esac
-    done
-    [ -n "$base" ] || base="$(default_base)"
-    base_sha="$(git rev-parse --verify -q "$base^{commit}" 2>/dev/null)" || {
-      echo "review-gate: base '$base' is not a commit here (fetch it, or pass --base <ref>)" >&2; exit 2; }
-    mb="$(git merge-base "$base_sha" "$head" 2>/dev/null)" || {
-      echo "review-gate: $base and HEAD have no common history" >&2; exit 2; }
-    [ -r "$PROMPT_FILE" ] || { echo "review-gate: prompt file $PROMPT_FILE is missing" >&2; exit 2; }
-    command -v jq >/dev/null 2>&1 || { echo "review-gate: jq is required for prepush" >&2; exit 2; }
-    take_lock
-    out="$dir/prepush-$head.txt"; res="$dir/prepush-$head.result"
-    # A new review of this commit replaces the old one: its pass (or acceptance) no longer stands until this run
-    # completes clean, so a later run's findings can't hide behind an earlier pass.
-    [ "$(prepush_rev)" = "$head" ] && rm -f "$(marker prepush)"
-    printf 'failed review in progress (started %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$res"
-    work="$(mktemp -d)"; WORK="$work"
-    # The reviewed commit is fixed now: a commit made while the review runs doesn't get this review.
-    # The whole change, from the repo root, whatever the config or cwd says: no diff.relative (a subdirectory would
-    # only show its own files), no external diff or textconv, every submodule change, no color.
-    git -C "$(git rev-parse --show-toplevel)" -c diff.relative=false -c diff.noprefix=false diff --no-relative \
-      --no-ext-diff --no-textconv --no-color --ignore-submodules=none --submodule=short "$mb" "$head" >"$work/diff"
-    if [ ! -s "$work/diff" ]; then
-      echo "review-gate: no changes between $base and ${head:0:12}: nothing to review (is --base the PR's base?)" >&2
-      printf 'failed no changes against %s\n' "$base" >"$res"; exit 4
-    fi
-    max="${REVIEW_GATE_PREPUSH_MAX_DIFF:-600000}"
-    if [ "$(wc -c <"$work/diff")" -gt "$max" ]; then
-      echo "review-gate: the diff against $base is over $max bytes; a partial review is no review. Split the change." >&2
-      printf 'failed diff over %s bytes\n' "$max" >"$res"; exit 4
-    fi
-    # Prompt: instructions, the punch list (if the repo has one), then the diff in a fence it can't close.
-    fence='```'; while grep -qF -- "$fence" "$work/diff"; do fence="$fence\`"; done
-    top="$(git rev-parse --show-toplevel)"
-    {
-      cat "$PROMPT_FILE"
-      printf '\nThe change: `git diff %s...%s` (base %s).\n' "$base" "${head:0:12}" "${mb:0:12}"
-      if [ -f "$top/review/PUNCH_LIST.md" ]; then
-        printf '\n## Punch list (review/PUNCH_LIST.md): check every item\n\n'; cat "$top/review/PUNCH_LIST.md"
-      else
-        printf '\n(No review/PUNCH_LIST.md in this repo.)\n'
-      fi
-      printf '\n## Diff\n\n%sdiff\n' "$fence"; cat "$work/diff"; printf '%s\n' "$fence"
-    } >"$work/prompt"
-    tmo="${REVIEW_GATE_PREPUSH_TIMEOUT:-1500}"
-    case "$tmo" in ''|*[!0-9]*) echo "review-gate: REVIEW_GATE_PREPUSH_TIMEOUT must be seconds" >&2; exit 2;; esac
-    reviewer=""; verdict=""; why=""
-    {
-      printf 'review-gate prepush: %s @ %s vs %s (%s), %s\n' "$branch" "$head" "$base" "$mb" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    } >"$out"
-    # 1. Codex. Prompt mode (`codex review -`): `--base` can't carry the punch list or the answer format.
-    echo "review-gate: reviewing ${head:0:12} vs $base with Codex (time limit ${tmo}s)..." >&2
-    rc=0; (cd "$top" && run_limited "$tmo" codex review -c 'sandbox_mode="read-only"' - <"$work/prompt" >"$work/co" 2>"$work/ce") || rc=$?
-    { printf '\n===== codex review (exit %s): stdout =====\n' "$rc"; cat "$work/co"; printf '\n===== codex stderr =====\n'; cat "$work/ce"; } >>"$out"
-    codex_err="$(grep -h -E '^ERROR:' "$work/co" "$work/ce" | head -n 1 | cut -c1-200 || true)"
-    codex_final_text "$work/co" >"$work/cv"
-    if [ "$rc" -ne 0 ]; then why="codex exited $rc"
-    elif [ -n "$codex_err" ]; then why="codex reported: $codex_err"
-    elif ! grep -q '[^[:space:]]' "$work/cv"; then why="codex printed no final message"
-    fi
-    # Findings Codex did print stay findings even when the run failed: an error never hides a blocker.
-    codex_partial=""; codex_unread=""
-    if [ -n "$why" ]; then
-      # Every well-formed finding line, whatever else the answer holds (a truncated or malformed line after a
-      # good finding must not discard it); a tagged line we can't read means a finding could be lost.
-      codex_partial="$(classify_tags "$work/cv" | sed -n 's/^G[0-3] //p')"
-      codex_unread="$(classify_tags "$work/cv" | sed -n 's/^B //p' | head -n 1 | cut -c1-160)"
-      echo "review-gate: Codex can't review ($why); falling back to a read-only Claude review..." >&2
-      if ! command -v claude >/dev/null 2>&1; then
-        verdict="unreadable"; why="$why; claude is not installed"
-      else
-        rc=0
-        (cd "$top" && run_limited "$tmo" claude -p --output-format json --max-turns 40 --no-session-persistence \
-          --restricted --strict-mcp-config --tools "$CLAUDE_REVIEW_TOOLS" \
-          --permission-mode dontAsk --allowedTools "$CLAUDE_REVIEW_TOOLS" \
-          --disallowedTools "$CLAUDE_DENIED_TOOLS" <"$work/prompt" >"$work/lo" 2>"$work/le") || rc=$?
-        { printf '\n===== claude -p (exit %s): stdout =====\n' "$rc"; cat "$work/lo"; printf '\n===== claude stderr =====\n'; cat "$work/le"; } >>"$out"
-        jq -r 'if .is_error == false and .subtype == "success" and (.result | type) == "string" then .result else empty end' \
-          <"$work/lo" >"$work/cv" 2>/dev/null || : >"$work/cv"
-        if [ "$rc" -ne 0 ]; then why="$why; claude exited $rc"
-        elif ! grep -q '[^[:space:]]' "$work/cv"; then why="$why; claude gave no successful result (error, max turns or no answer)"
-        else why=""; reviewer=claude; fi
-      fi
-    else
-      reviewer=codex
-    fi
-    # Codex failed after printing a [Pn] line we can't read: a finding may be lost, so no fallback can clear it.
-    [ -z "$why" ] && [ -n "$codex_unread" ] && why="Codex failed after printing a [Pn] line not in the finding format: $codex_unread"
-    if [ -n "$why" ]; then
-      {
-        echo "review-gate: pre-push review FAILED for ${head:0:12}: $why"
-        echo "  Nothing was recorded. Full output: $out"
-        [ -z "$codex_partial" ] || { echo "  Codex printed these findings before failing (fix them too):"; printf '%s\n' "$codex_partial" | sed 's/^/    /'; }
-        echo "  Run \`review-gate prepush\` again once a reviewer can run (Codex usage limits reset; Claude needs a login)."
-      } >&2
-      printf 'failed %s\n' "$why" >"$res"; exit 4
-    fi
-    parse_verdict "$work/cv" >"$work/pv"
-    read -r kind nblk ntot _ <"$work/pv" || true
-    { printf '\n===== verdict (%s) =====\n' "$reviewer"; cat "$work/pv"; } >>"$out"
-    if [ -n "$codex_partial" ] && { [ "$kind" = clean ] || [ "$kind" = findings ]; }; then
-      # Codex's findings from a failed run count against the commit too: an error never hides a blocker.
-      [ "$kind" = findings ] || { kind=findings; nblk=0; ntot=0; : >"$work/pv"; }
-      tail -n +2 "$work/pv" >"$work/pf" 2>/dev/null || :
-      printf '%s\n' "$codex_partial" >>"$work/pf"
-      nblk=$((nblk + $(printf '%s\n' "$codex_partial" | grep -cE '\[P[0-2]\]' || true)))
-      ntot=$((ntot + $(printf '%s\n' "$codex_partial" | grep -c . || true)))
-      { echo "findings $nblk $ntot"; cat "$work/pf"; } >"$work/pv"
-    fi
-    case "$kind" in
-      clean)
-        printf 'completed 0 0 %s %s\n' "$reviewer" "$base" >"$res"
-        printf '%s %s %s pass %s %s\n' "$head" "$branch" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$base" "$reviewer" >"$(marker prepush)"
-        echo "review-gate: pre-push review ($reviewer vs $base): No findings. Recorded prepush pass for $branch @ ${head:0:12}"
-        exit 0 ;;
-      findings)
-        printf 'completed %s %s %s %s\n' "$nblk" "$ntot" "$reviewer" "$base" >"$res"
-        echo "review-gate: pre-push review ($reviewer vs $base) of ${head:0:12}: $ntot finding(s), $nblk of them P0-P2:"
-        tail -n +2 "$work/pv" | sed 's/^[[:space:]]*/  /'
-        echo "  Full review: $out"
-        if [ "$nblk" -eq 0 ]; then
-          printf '%s %s %s pass %s %s\n' "$head" "$branch" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$base" "$reviewer" >"$(marker prepush)"
-          echo "review-gate: only P3 findings: recorded prepush pass for $branch @ ${head:0:12} (fix the nits if cheap)"
-          exit 0
-        fi
-        {
-          echo "review-gate: NOT recorded: fix the P0-P2 findings, commit, and run \`review-gate prepush\` again."
-          echo "  A finding you decide not to fix: decline it explicitly, for this commit only:"
-          echo "    review-gate prepush-accept --reason \"why each P0-P2 finding above is not being fixed\""
-          echo "  (every later check of this commit announces the accepted findings and the reason)"
-        } >&2
-        exit 1 ;;
-      *)
-        why="$reviewer's answer is unreadable: $(cut -d' ' -f2- <"$work/pv")"
-        printf 'failed %s\n' "$why" >"$res"
-        {
-          echo "review-gate: pre-push review FAILED for ${head:0:12}: $why. Nothing was recorded. Full output: $out"
-          [ -z "$codex_partial" ] || { echo "  Codex printed these findings before failing (fix them too):"; printf '%s\n' "$codex_partial" | sed 's/^/    /'; }
-        } >&2
-        exit 4 ;;
-    esac
-    ;;
-  prepush-accept)
-    [ "${2:-}" = "--reason" ] || { echo "review-gate: usage: prepush-accept --reason \"why the P0-P2 findings are not being fixed\"" >&2; exit 2; }
-    reason="$(printf '%s' "${3:-}" | tr '\n\r' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-    [ "${#reason}" -ge 10 ] || { echo "review-gate: --reason must say why each finding is not being fixed (10+ characters)" >&2; exit 2; }
-    take_lock
-    res="$dir/prepush-$head.result"
-    [ -f "$res" ] || { echo "review-gate: no pre-push review of ${head:0:12} to accept; run \`review-gate prepush\` first" >&2; exit 2; }
-    read -r rs rb rt rr rbase _ <"$res" || true
-    if [ "$rs" != completed ]; then
-      echo "review-gate: the last pre-push review of ${head:0:12} did not complete ($(cut -d' ' -f2- <"$res")): a failed review can't be accepted. Run \`review-gate prepush\` again." >&2
-      exit 2
-    fi
-    [ "${rb:-0}" -gt 0 ] || { echo "review-gate: that review had no P0-P2 findings; nothing to accept" >&2; exit 2; }
-    printf '%s %s %s accepted %s %s %s\n' "$head" "$branch" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rbase" "$rr" "$reason" >"$(marker prepush)"
-    echo "review-gate: recorded ACCEPTED pre-push findings ($rb P0-P2 of $rt, $rr vs $rbase) for $branch @ ${head:0:12} — $reason"
-    echo "review-gate: every check of this commit will announce it; findings: $dir/prepush-$head.txt"
+    verify_prepush "$rev" || exit 1
     ;;
   *)
     {
@@ -493,7 +402,7 @@ case "${1:-help}" in
       echo "  reviewers: $VALID"
       echo "  primary  : ${PRIMARY[*]-}  (override with REVIEW_GATE_PRIMARY=\"kodus greptile\")"
       echo "  passes   : $MIN different reviewers (REVIEW_GATE_MIN); self counts only after codex passed or was skipped"
-      echo "  prepush  : a pre-push review of the commit (passed, or findings accepted) is required by check and before git push"
+      echo "  prepush  : OpenQodex $OQ_VERSION review of the commit (passed, or findings accepted) with the current punch list"
     } >&2
     exit 2
     ;;

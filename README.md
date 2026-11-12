@@ -105,8 +105,9 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
    `kodus greptile` (CodeRabbit was retired on 2026-11-12);
    override with `REVIEW_GATE_PRIMARY` (`REVIEW_GATE_REQUIRED` is read as a legacy alias);
 3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback);
-4. the commit has a **pre-push review** (`review-gate prepush` passed, or its findings were
-   declined with `prepush-accept`, which every check announces). See the next section.
+4. the commit has a **pre-push review**, the same check the git pre-push hook makes: a finished OpenQodex review
+   of exactly that commit that passed (or whose findings were declined with `prepush-accept`, which every check
+   announces), given the punch list that is on main now. See the next section.
 
 Reviewers: `kodus`, `greptile` (primaries; `coderabbit` stays valid for old records), `codex` (fallback), `self`
 (the agent's own thorough review, last resort). `agy` stays valid for old records. `kimi`
@@ -231,104 +232,145 @@ and prints "no output produced". Neither case is a review.
 **`kimi` (retired).** The `kimi-review` helper and its `kimi` pass were removed with the
 in-repo `ollama-review` workflow (job_bot_ai#228); Kodus runs DeepSeek on every PR instead.
 
-Scope/safety: only `gh pr create`, `gh pr ready`, the GraphQL ready mutation and `git push`
-are gated (not other clients or the web UI). The hook requires `jq` (to extract the command from the payload) and
+Scope/safety: only `gh pr create`, `gh pr ready` and the GraphQL ready mutation are gated here (not other clients
+or the web UI); `git push` is gated by git's pre-push hook (next section). The hook requires `jq` (to extract the command from the payload) and
 hands any command containing the words `gh pr create` to the resolver above, which
 gates real invocations wherever they run and lets data-only mentions (echo, grep,
 commit messages, heredocs) through. Without `node`, it falls back to gating only
 `gh pr create` in **command position** of the session cwd. It is
-**fail-open** — any internal error, or a missing `jq`, lets the command through
-rather than wedging your shell — so it is a strong speed-bump, not a hard security
-boundary.
+**fail-open** — a missing `jq`, or `review-gate` saying there is nothing to gate (exit 3), lets the command
+through rather than wedging your shell; any other unexpected `review-gate check` exit code blocks — so it is a
+strong speed-bump, not a hard security boundary.
 
-Tests: `npm test` (resolver unit tests, and hook and `prepush` integration tests against throwaway
-repos with stub `codex`/`claude` binaries).
+Tests: `npm test` (resolver unit tests, hook integration tests, and pre-push tests on real `git push`es to a local
+bare remote, with stub `openqodex` and `gh` binaries in `test/stub/` that write OpenQodex's real record shapes).
 
-## Pre-push review — review the whole change before every push
+## Pre-push review — OpenQodex reviews the whole change before every push
 
-Fixes pushed one at a time let the PR bots find the next problem on the next push (one PR took
-44 review threads). So before **every** push to a PR branch the whole change is reviewed against
-the repo's punch list, and what it finds is fixed first:
+Fixes pushed one at a time let the PR bots find the next problem on the next push (one PR took 44 review threads).
+So before **every** push to a PR branch the whole change is reviewed against our punch list, and what it finds is
+fixed first. The reviewer is [OpenQodex](https://github.com/openqodex/openqodex) (Apache-2.0, no telemetry, runs
+locally, starts its own read-only Claude Code or Codex reviewer); the push gate is **git's own pre-push hook**.
+This repo only adds glue: fetching the punch list, binding a review to a commit, and failing closed.
 
 ```bash
 review-gate prepush [--base <ref>]   # default base: the PR's base (gh pr view), else origin/main
-# fix every P0-P2 finding (and the same bug class elsewhere), commit, run it again, then push
-review-gate prepush-accept --reason "why each P0-P2 finding is not being fixed"   # declining, for this commit only
-review-gate status                   # shows the prepush state of HEAD
+# fix every finding at minor or above (and the same bug class elsewhere), commit, run it again, then push
+review-gate prepush-accept --reason "why each finding is not being fixed"   # declining, for this commit only
+review-gate status                   # shows the pre-push review of HEAD
 ```
 
-`prepush` reviews `git diff <base>...HEAD` (the diff, the instructions in
-`prompts/prepush-review.md` and `review/PUNCH_LIST.md` when the repo has one all go into the
-prompt) with **Codex** (`codex review -c sandbox_mode="read-only" -`, prompt mode: `codex review --base` can't take custom
-instructions, so it could carry neither the punch list nor the answer format). If Codex can't run
-(non-zero exit or timeout, any `ERROR:` line such as the usage limit, quota or login error, or no
-final message), it falls back to a **read-only Claude** review: `claude -p --output-format json`
-with `--tools Read,Glob,Grep` (the only built-in tools that exist in the run), `--restricted`,
-`--strict-mcp-config` (no MCP servers), `--permission-mode dontAsk`, and
-`Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch` disallowed. The diff is in the prompt, so it needs no git commands; `Bash(git diff:*)` would still
-allow `git diff --output=<file>`, which writes. Time limit per reviewer:
-`REVIEW_GATE_PREPUSH_TIMEOUT` seconds (default 1500), enforced by a watchdog on the reviewer's
-own process group (TERM, then KILL after `REVIEW_GATE_KILL_GRACE`, default 30 s), so nothing it
-started outlives the run.
+**What `prepush` does.** On a **clean** work tree (OpenQodex reviews the work tree, so only a clean tree makes the
+reviewed change exactly the commit you push) it:
 
-A run only counts as **completed** when the reviewer exited 0 (Claude: `is_error` false and
-`subtype` success) and its answer is either well-formed findings (each `[P0]`..`[P3]` on its own
-line, one tag per line, optionally after `- `; a cut-off `[P1` or a stray `P1]` anywhere fails the
-run) or a final `No findings.` with no P0-P3 mention.
-Anything else (an error, the usage-limit text, an empty or cut-off answer, a `**[P1]**` or two
-tags on a line) is **FAILED**: nothing is recorded, the reason is printed and it exits 4. A failed
-run can't be accepted either. Findings Codex printed before it failed still count, and a failed
-Codex run that printed a tagged line in the wrong format fails the review whatever the fallback says.
+1. fetches the punch list from `j-bot-ai/pr-orchestrator` `main` (with `GH_TOKEN="$(gh auth token --user
+   job-bot-ai)"` when `GH_TOKEN` is unset; the token is never printed): `review/punch-list/NN-*.md` when that
+   folder exists (not `log.md`), else `review/PUNCH_LIST.md`. Each file is pinned to one `main` commit and checked
+   against its git blob id. A failed fetch fails the review; it never means "review without the list";
+2. copies it to `.openqodex/punch-list/` in the checkout (git-ignored: `prepush` adds `/.openqodex/` to
+   `.git/info/exclude`), and names those copies in `review.instructions_files` of **our own** OpenQodex config,
+   `$GIT_COMMON_DIR/review-gate/openqodex.yaml`, outside the work tree so a branch can't loosen it. OpenQodex's
+   limits: 32 KB per file, 64 KB in all; a file past either is skipped whole, and `prepush` then fails. (Not
+   `--instructions`: it takes one file of at most 32 KB, and the split list is up to 56 KB. `--instructions` gets
+   `prompts/openqodex-instructions.md`, so a repo's own `.openqodex/custom-instructions.md` is not used.)
+3. runs `openqodex review --base <base> --offline --reviewer-web off --config <ours> --instructions <ours>
+   --block-on-severity minor --timeout 1800` under `systemd-run --scope -p MemoryMax=2G -p MemorySwapMax=256M`
+   (panda is RAM-fragile: a runaway is killed inside its scope instead of swap-thrashing the host). Never
+   `review --agent`: that is the coding agent reviewing its own work;
+4. records the result in `$GIT_COMMON_DIR/review-gate/prepush/<sha>.json` (shared by all worktrees, keyed by
+   commit), only for a review that **finished**: exit 0 with verdict `passed`, or exit 1 with `blocked`, OpenQodex's
+   `last-review` record written by this run, the report matching its sha256, and the manifest showing every
+   punch-list file supplied whole with the hashes we fetched. Exit 2 (incomplete, no reviewer that can start,
+   OpenQodex failing), "Nothing to review", HEAD moving during the run: nothing passes, exit 4, and the reason is
+   kept in `<sha>.last`.
 
-- No P0-P2 findings: a `prepush` marker is recorded for HEAD (bound to the commit like every other
-  marker; a new commit needs a new review), exit 0.
-- P0-P2 findings: nothing is recorded, exit 1. Fix them, or decline them explicitly with
-  `prepush-accept --reason "..."` (it needs a completed review of HEAD with findings; the marker
-  keeps the reason, and `check`, `check-prepush` and the hook announce it with the findings file).
-- Running `prepush` again on the same commit first withdraws that commit's earlier pass or
-  acceptance: only the newest review of a commit stands. One `prepush`/`prepush-accept` runs at a
-  time per worktree, and `clear` waits for them too (a second one exits 5). The lock is `flock` on
-  `$GIT_DIR/review-gate.lock`, outside the directory `clear` removes (released by the kernel however
-  the run ends); without `flock` (macOS) a pid symlink is used, and a link left by a dead process is
-  taken over, one taker at a time.
-- The full output of every run is kept in `$GIT_DIR/review-gate/prepush-<sha>.txt`.
+**Findings.** A `blocked` review exits 1. Fix the findings, or decline them for that commit with
+`prepush-accept --reason "..."` (only after a finished review with findings; an unfinished review can't be
+accepted). Every check of that commit announces the reason.
 
-**The hook blocks `git push`** until each commit it publishes to a branch has a `prepush` marker.
-The same resolver as the PR gate finds the push wherever it runs: `cd`/`git -C <dir>`, chained
-commands, env prefixes, runners (`timeout`, `env`, `sudo`), `bash -c`, heredocs, and the
-credential-helper form `git -c credential.helper= -c credential.helper='!f(){ ...; }; f' push -q -u origin HEAD`.
-It checks the commit actually pushed (`git push origin feat/other` checks `feat/other`, in the
-worktree that has it checked out). Not gated: `--delete`/`-d`/`:branch`, tags only (`--tags`,
-`tag v1`, `refs/tags/...`), `--dry-run`, `--help`, and outside a git repo. Blocked outright:
-`--all`/`--mirror`/wildcard refspecs, non-literal refspecs or `cd`/`-C` targets, `GIT_DIR`/
-`GIT_CONFIG*` (incl. `GIT_CONFIG_GLOBAL`/`_SYSTEM`)/`HOME`/`XDG_CONFIG_HOME`/`--git-dir` (as a
-prefix, an `env` assignment, or exported earlier in the command, including into `bash -c`),
-`--config-env`, `-c include.path`/`includeIf.*.path` and non-literal `-c` values or option values
-(`--repo $R`, `-o $X`), a push without a refspec when config may make it
-publish more than the current branch (`remote.<name>.push`/`.mirror`, `push.default=matching`,
-or a `-c` override of those: name the refspec, `git push origin HEAD`), submodule-recursing
-pushes (`--recurse-submodules=on-demand|only`, `push.recurseSubmodules`, `submodule.recurse=true`),
-git aliases that push (followed through alias chains, in the checkout git runs in), and a push
-launched by `xargs`/`parallel` (its arguments come from stdin).
+**Severity: `minor`, not `major`.** OpenQodex's scale: `critical` (data loss, security, a crash on a common path),
+`major` (wrong behaviour under realistic conditions), `minor` ("a real bug that will rarely surface"), `nitpick`
+(style). Our old gate blocked P0-P2 and let only P3 nits through; P2 ("should fix before merge") is where the
+rarely-surfacing real bugs our punch list is about sit, so `minor` maps P2 and blocking at `major` would let them
+through. Nitpicks and observations never block.
 
-**A push runs on its own.** The gate resolves what a push publishes from the refs and config as
-they are *before* the command runs, so in the same command a push may only follow read-only git
-commands (`status`, `log`, `diff`, `show`, `rev-parse`, listing `branch`/`tag`, `config --get`, ...),
-in their plain form (no `--output`/`--out=`, `--ext-diff`, `grep -O`/`-nO`, `-c` or env prefix, which can
-write files or run programs).
-Push options must be spelled out in full: git accepts abbreviations (`--al` is `--all`), so an option
-the gate doesn't know by its exact name is refused.
-A commit, fetch, config write, ref change (`branch -f`, `update-ref`, `checkout -B`), stash or alias
-before it blocks: run that first, re-run `review-gate prepush` if HEAD changed, then push. A tag
-pushed to a branch (`v1:release`) is checked like a branch push. A push handed to something the
-gate can't follow (`ssh host 'git push'`, `python -c`) is checked against HEAD of the directory it
-runs from.
+**The git hook.** `githooks/pre-push`, installed with `core.hooksPath`, reads git's ref lines and, for each pushed
+branch commit, runs `review-gate check-prepush --rev <sha>`, the same function (`verify_prepush`) `review-gate check`
+uses for `gh pr ready`. It passes only when all of these hold:
 
-**Escape hatch (Tim only).** `REVIEW_GATE_PREPUSH=off` in the environment Claude Code itself runs
-in (e.g. `env` in `~/.claude/settings.json`, or exported before starting `claude`) turns the push
-gate off. As a command prefix (`REVIEW_GATE_PREPUSH=off git push`) it does nothing. Every push it
-lets through is logged to `${XDG_STATE_HOME:-~/.local/state}/review-gate/prepush-bypass.log` and
-announced in the session. The block message never mentions it.
+- the record for that commit exists and OpenQodex's own receipt (`~/.openqodex/receipts/<repo id>/<change id>.json`)
+  says `kind: complete` with the same change, verdict, base and `block_on_severity`;
+- `report.json` and `manifest.json` still have the sha256 recorded, the report is `complete`, and the manifest shows
+  the whole punch list supplied;
+- the verdict is `passed`, or `blocked` with an accepted reason;
+- the punch list on `main` **now** has the same files and blob ids as the one reviewed (one or two `gh api` calls; a
+  failed fetch blocks).
+
+Anything else blocks, including `review-gate` exiting with any other code. Not gated: deletes, tags, and
+`--dry-run` (git runs the hook for a dry run too; the hook reads the push's own arguments from `/proc`, last of
+`--dry-run`/`--no-dry-run` wins). The repo's own `.git/hooks/*` keep running: every hook in `githooks/` chains to
+it (`core.hooksPath` would otherwise switch them off).
+
+*How a review is bound to a commit.* OpenQodex identifies a review by a change id, sha256 of the base commit and
+the diff of the work tree (uncommitted and untracked files included), not by a commit. `prepush` requires a clean
+tree and the same HEAD before and after the run, so that diff is exactly `<merge base>..<HEAD>`; the record ties
+that change id to the HEAD sha. Pushing another commit needs its own review.
+
+**Ways around a git hook** are blocked by the Claude Code PreToolUse hook with a short fixed list matched anywhere
+in the command (no parsing): `--no-verify` with `push`; `core.hooksPath` in a `git` command (`-c`, `--config-env`,
+`git config` writes; `git config --get core.hooksPath` is fine); `-c include.*` / `includeIf`; `GIT_CONFIG*`,
+`GIT_DIR`, `GIT_COMMON_DIR`, `HOME` or `XDG_CONFIG_HOME` assignments, `env -i`/`-u` or `unset` of them, with `git`;
+any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the gate's settings are Tim's); `install-githooks --uninstall`.
+It is a speed bump against an agent working around the gate, not a sandbox.
+
+**Escape hatch (Tim only).** `REVIEW_GATE_PREPUSH=off` in the environment Claude Code itself runs in (e.g. `env` in
+`~/.claude/settings.json`, or exported before starting `claude`) lets both hooks through; git inherits it from
+Claude Code. As a command prefix it is blocked. Every use is logged to
+`${XDG_STATE_HOME:-~/.local/state}/review-gate/prepush-bypass.log`. By hand, outside Claude Code, the same variable
+works (and `git push --no-verify` is git's own).
+
+### Installing
+
+```bash
+# OpenQodex, pinned (no npx, no auto-update: an npm install has no launcher, and the gate passes
+# OPENQODEX_AUTO_UPDATE=0 and --offline anyway)
+npm i -g --prefix /opt/openqodex --ignore-scripts openqodex@0.18.0
+/opt/openqodex/bin/openqodex --version            # 0.18.0
+# the hook, for every repository root pushes from on panda:
+./install-githooks --global
+# or for one repository:  ./install-githooks --repo /path/to/checkout
+```
+
+**Global or per repo:** `--global` (root's `~/.gitconfig`) is the setup for panda: the agents push from many
+clones and worktrees, created all the time, and a per-repo setting misses every new clone. Its cost is that it
+applies to every repository of root; `githooks/` therefore chains every client hook to the repo's own
+`.git/hooks/<name>`, so husky/OpenQodex/other local hooks keep running. `install-githooks` refuses to replace a
+different `core.hooksPath` (`--force` does) and `--uninstall` removes only its own.
+
+The reviewer needs Claude Code (or Codex) installed and logged in for root; OpenQodex has no account of its own.
+`--offline` keeps semgrep, osv-scanner and the other network scanners off and stops scanner downloads (the
+reviewer itself still sends the change to its model service). Scanners not installed are listed in the report and
+never change the verdict; `openqodex doctor --install` (online, once) would fetch the pinned ones.
+
+### Settings (Tim's; the PreToolUse hook blocks an agent setting them)
+
+- `REVIEW_GATE_BLOCK_ON` — `block_on_severity` (default `minor`); a review run with another value doesn't count
+- `REVIEW_GATE_OPENQODEX_OFFLINE=off` — let OpenQodex's network scanners run (default: `--offline`)
+- `REVIEW_GATE_OPENQODEX_MEMORY` — the scope's `MemoryMax` (default `2G`; `off` runs uncapped),
+  `REVIEW_GATE_OPENQODEX_SWAP` — its `MemorySwapMax` (default `256M`)
+- `REVIEW_GATE_PREPUSH_TIMEOUT` — OpenQodex's `--timeout` in seconds (default 1800)
+- `REVIEW_GATE_OPENQODEX` — the binary (default `/opt/openqodex/bin/openqodex`); it must report the pinned version
+- `REVIEW_GATE_PUNCH_REPO` — where the punch list lives (default `j-bot-ai/pr-orchestrator`, branch `main`)
+- `OPENQODEX_HOME` — OpenQodex's record folder (default `~/.openqodex`)
+- `REVIEW_GATE_PREPUSH=off` — the escape hatch above
+
+### Upgrading OpenQodex
+
+The version is pinned in `review-gate` (`OQ_VERSION`); `prepush` refuses any other. To upgrade: read the
+[changelog](https://github.com/openqodex/openqodex/blob/main/packages/cli/CHANGELOG.md) for changes to `review`'s
+flags, exit codes, `report.json`, `manifest.json` or the `receipts/` and `last-review/` records (`review-gate`
+reads them, and `test/stub/openqodex` mirrors their shapes); install the new version under the same prefix; run one
+real review on a throwaway repo; then bump `OQ_VERSION` (and the stub) in a reviewed PR.
 
 ## Env overrides
 
@@ -336,9 +378,7 @@ announced in the session. The block message never mentions it.
 - `CODERABBIT_TIMEOUT_SECONDS` (default 600) / `CODEX_TIMEOUT_SECONDS` (default 900)
 - `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus greptile`; valid: `kodus coderabbit greptile codex self agy`)
 - `REVIEW_GATE_MIN` — how many different reviewers must pass (default 2)
-- `REVIEW_GATE_PREPUSH_TIMEOUT` — seconds per pre-push reviewer run (default 1500);
-  `REVIEW_GATE_PREPUSH_MAX_DIFF` — largest diff `prepush` reviews in one prompt (default 600000 bytes)
-- `REVIEW_GATE_PREPUSH=off` — see the escape hatch above
+- the pre-push settings are listed above
 
 ## Headless / remote auth (CodeRabbit)
 
