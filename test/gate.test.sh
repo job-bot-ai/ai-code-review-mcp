@@ -610,11 +610,13 @@ done
 # whose arity isn't known makes the destination unknown, so any protected path counts.
 for c in "cp /tmp/x .git/hooks/pre-push --suffix .bak" "install -m 755 /tmp/x .git/hooks/pre-push" "cp /tmp/x .git/hooks/pre-push --weird .bak" \
   "cp /tmp/x .git/hooks/pre-push -S .bak" "cp /tmp/x .git/hooks/pre-push -Q .bak" \
-  "mv -S .bak /tmp/x githooks/pre-push" "install -o root -g root /tmp/x ~/.gitconfig"; do
+  "mv -S .bak /tmp/x githooks/pre-push" "install -o root -g root /tmp/x ~/.gitconfig" "rsync /tmp/x .git/hooks/ --weird .bak"; do
   run "$T/a" "$c"
   expect "bypass blocked (a copier's option values): $c" 2 stderr "BLOCKED by the pre-push review gate"
 done
-for c in "cp --suffix=.bak ~/.gitconfig /tmp/b" "install -m 755 githooks/pre-push /tmp/x" "cp -S .bak githooks/pre-push /tmp/y"; do
+for c in "cp --suffix=.bak ~/.gitconfig /tmp/b" "install -m 755 githooks/pre-push /tmp/x" "cp -S .bak githooks/pre-push /tmp/y" \
+  "rsync -a --info=progress2 githooks/ /tmp/gh/" "rsync -a --size-only githooks/ /tmp/gh/" "rsync -a --no-perms githooks/ /tmp/gh/" \
+  "cp --unknown-opt=1 githooks/pre-push /tmp/x"; do
   run "$T/a" "$c"
   expect "not a bypass (a copier with option values only reads it): $c" 0
 done

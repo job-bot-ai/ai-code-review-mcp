@@ -287,7 +287,11 @@ reviewed change exactly the commit you push) it:
    their own, so "the run" is also every process carrying the run's `REVIEW_GATE_RUN_ID` in its environment (Linux
    `/proc`) and, under the memory cap, everything in its systemd scope (which also holds a reviewer that cleared its
    environment). The same TERM-then-KILL stops all of it at the deadline, when `review-gate` is interrupted, and for
-   whatever a finished review left running, before the lock is released. Uncapped (`REVIEW_GATE_OPENQODEX_MEMORY=off`),
+   whatever a finished review left running, before the lock is released. If part of it survives even KILL (a
+   process stuck in the kernel, a scope that won't stop), `prepush` exits 5 naming the survivors (in `<sha>.last` and
+   `review-gate-prepush/survivors`, pid and start time, or the scope), and the next `prepush` refuses to start while
+   any of them is alive. After `wait` has reaped the run's leader, its process group is no longer signalled (the
+   number may have been reused); the marker and the scope still are. Uncapped (`REVIEW_GATE_OPENQODEX_MEMORY=off`),
    a detached reviewer that also clears its environment is not contained; the lock's file
    descriptor is closed for it, so a hung run or a leftover reviewer never holds the lock. Never `review --agent`:
    that is the coding agent reviewing its own work;
@@ -361,7 +365,8 @@ gate's settings are Tim's); `review-gate prepush-accept` (Tim's waiver, above); 
 a write (a redirect to it; `tee`, `sed -i`, `rm`, `chmod`, ... on it in the same command; for `cp`, `ln`,
 `install` and `rsync` only their destination (the last operand, or `-t DIR`; option values such as
 `--suffix .bak` or `-m 755` are not operands, and an option whose arity isn't known counts every path; redirects such
-as `2>/dev/null` are not operands either), so `cp ~/.gitconfig /tmp/backup` is a
+as `2>/dev/null` are not operands either; `--name=value` is self-contained even when the option is unknown, and
+rsync's table comes from its own `--help`), so `cp ~/.gitconfig /tmp/backup` is a
 read, and for `mv` its sources too, since moving one away removes it; any path in the command when the copy is hidden
 behind `xargs`, `bash -c` or a word built at run time; or a `cd` into it or a variable holding it plus any write) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`, `githooks/`,
 the pre-push records (`review-gate-prepush/`) or OpenQodex's (`.openqodex/`, `~/.openqodex/`);
@@ -455,7 +460,9 @@ never change the verdict; `openqodex doctor --install` (online, once) would fetc
 - `REVIEW_GATE_OPENQODEX_MEMORY` — the scope's `MemoryMax` (default `2G`; `off` runs uncapped),
   `REVIEW_GATE_OPENQODEX_SWAP` — its `MemorySwapMax` (default `256M`)
 - `REVIEW_GATE_PREPUSH_TIMEOUT` — OpenQodex's `--timeout` in seconds (default 1800); `REVIEW_GATE_PREPUSH_GRACE` —
-  how much longer the watchdog waits before TERM (default 120); `REVIEW_GATE_PREPUSH_KILL_AFTER` — then KILL (default 30)
+  how much longer the watchdog waits before TERM (default 120); `REVIEW_GATE_PREPUSH_KILL_AFTER` — then KILL (default 30);
+  `REVIEW_GATE_PREPUSH_KILL_SIGNAL` — the signal sent as "KILL" (default `KILL`; the tests use `CONT` to simulate a
+  process that survives it)
 - `REVIEW_GATE_BYPASS_LOG` — where bypasses and `prepush-accept`s are logged (default
   `~<user>/.local/state/review-gate/prepush-bypass.log`)
 - `REVIEW_GATE_SYSTEMD_RUN`, `REVIEW_GATE_GH` — the `systemd-run` and `gh` to use (tests; default: the fixed `PATH`'s)

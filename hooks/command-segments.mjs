@@ -37,14 +37,31 @@ const COPIER_OPTS = {
     flagLong: [...BACKUP, '--directory', '--logical', '--no-dereference', '--physical', '--relative', '--symbolic'] },
   install: { flags: 'bcCdDpsTvZ', args: 'gmoSt', argLong: ['--group', '--mode', '--owner', '--suffix', '--target-directory', '--strip-program'],
     flagLong: [...BACKUP, '--compare', '--directory', '--preserve-timestamps', '--strip', '--preserve-context'] },
-  rsync: { flags: 'avrlptgoDzhPnucHAXxSqiWKkLEmIOJRbd', args: 'efBTM',
-    argLong: ['--exclude', '--include', '--rsh', '--filter', '--exclude-from', '--include-from', '--files-from', '--chmod',
-      '--chown', '--suffix', '--backup-dir', '--temp-dir', '--partial-dir', '--log-file', '--bwlimit', '--timeout', '--max-size',
-      '--min-size', '--compare-dest', '--copy-dest', '--link-dest', '--out-format', '--password-file', '--port', '--block-size'],
-    flagLong: ['--archive', '--verbose', '--recursive', '--delete', '--delete-after', '--delete-before', '--dry-run', '--progress',
-      '--partial', '--checksum', '--compress', '--human-readable', '--update', '--remove-source-files', '--times', '--perms',
-      '--links', '--hard-links', '--acls', '--xattrs', '--itemize-changes', '--stats', '--quiet', '--inplace', '--whole-file',
-      '--existing', '--ignore-existing', '--mkpath', '--backup', '--relative', '--no-perms', '--no-owner', '--no-group'] },
+  // rsync 3.4's own `rsync --help` (plus -P, -D, -F, listed there in another form); `--no-<flag>` too.
+  rsync: { flags: 'vqcarRbudlLkKHpEAXogtUNOJSnWxmIyzC0s8hi46VhPDF', args: 'BeTfM',
+    argLong: [
+      '--address', '--backup-dir', '--block-size', '--bwlimit', '--checksum-choice', '--checksum-seed', '--chmod',
+      '--chown', '--compare-dest', '--compress-choice', '--compress-level', '--contimeout', '--copy-as',
+      '--copy-dest', '--debug', '--early-input', '--exclude', '--exclude-from', '--files-from', '--filter',
+      '--groupmap', '--iconv', '--include', '--include-from', '--info', '--link-dest', '--log-file',
+      '--log-file-format', '--max-alloc', '--max-delete', '--max-size', '--min-size', '--only-write-batch',
+      '--out-format', '--outbuf', '--partial-dir', '--password-file', '--port', '--protocol', '--read-batch',
+      '--remote-option', '--rsh', '--rsync-path', '--skip-compress', '--sockopts', '--stderr', '--stop-after',
+      '--stop-at', '--suffix', '--temp-dir', '--timeout', '--usermap', '--write-batch'],
+    flagLong: [
+      '--8-bit-output', '--acls', '--append', '--append-verify', '--archive', '--atimes', '--backup',
+      '--blocking-io', '--checksum', '--compress', '--copy-devices', '--copy-dirlinks', '--copy-links',
+      '--copy-unsafe-links', '--crtimes', '--cvs-exclude', '--del', '--delay-updates', '--delete', '--delete-after',
+      '--delete-before', '--delete-delay', '--delete-during', '--delete-excluded', '--delete-missing-args',
+      '--devices', '--dirs', '--dry-run', '--executability', '--existing', '--fake-super', '--force', '--from0',
+      '--fsync', '--fuzzy', '--group', '--hard-links', '--help', '--human-readable', '--ignore-errors',
+      '--ignore-existing', '--ignore-missing-args', '--ignore-times', '--inplace', '--ipv4', '--ipv6',
+      '--itemize-changes', '--keep-dirlinks', '--links', '--list-only', '--mkpath', '--munge-links',
+      '--no-implied-dirs', '--no-motd', '--numeric-ids', '--old-args', '--omit-dir-times', '--omit-link-times',
+      '--one-file-system', '--open-noatime', '--owner', '--partial', '--perms', '--preallocate', '--progress',
+      '--prune-empty-dirs', '--quiet', '--recursive', '--relative', '--remove-source-files', '--safe-links',
+      '--secluded-args', '--size-only', '--sparse', '--specials', '--stats', '--super', '--times', '--trust-sender',
+      '--update', '--verbose', '--version', '--whole-file', '--write-devices', '--xattrs'] },
 };
 
 const REDIRECT = /^(?:&>>?|>&|<&|>>?\|?|<<?<?|<>)/; // the operator at the start of a tokenizer word
@@ -89,8 +106,10 @@ function copierWrites(words, k) {
       let value = eq < 0 ? null : v.slice(eq + 1);
       if (spec.argLong.includes(name)) {
         if (value === null) { value = args[a + 1]?.value ?? ''; a += 1; } // `--suffix .bak`: the value is not an operand
-      } else if (!spec.flagLong.includes(name)) {
-        return [[], false]; // an option we don't know the arity of: can't tell the destination
+      } else if (value === null && !spec.flagLong.includes(name) && !spec.flagLong.includes(name.replace(/^--no-/, '--'))) {
+        // A bare long option we don't know: it might take the next word, so the destination can't be told. (With
+        // `=value` attached it can't take another word: `--info=progress2` is self-contained.)
+        return [[], false];
       }
       if (name === '--target-directory') target = value;
       continue;

@@ -38,7 +38,7 @@ if [ "$mode" = leaves ]; then mkdir -p "$home"; setsid sleep 33 </dev/null >/dev
 if [ "$mode" = stubborn ]; then
   echo $$ >"$home/stubborn.pid"; trap '' TERM
   setsid sleep 32 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan3.pid"   # a detached reviewer
-  sleep 60 & wait
+  while :; do sleep 1; done   # only KILL ends it
 fi   # ignores TERM (and so does its child)
 # hang: reviewers that outlive their parent, detached as OpenQodex starts them: one keeping the environment, one that
 # cleared it (only a cgroup holds that one); then a run that never returns.

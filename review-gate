@@ -256,9 +256,21 @@ run_prepush() {
   [ -n "$base" ] || base="$(default_base)"
   git rev-parse --verify -q "$base^{commit}" >/dev/null || die "base '$base' is not a commit here (fetch it, or pass --base <ref>)"
   prepush_lock
+  # Survivors of an earlier run that outlived KILL: no new review while any of them is alive.
+  if [ -f "$pdir/survivors" ]; then
+    local kind id st alive=""
+    while read -r kind id st; do
+      case "$kind" in
+        pid) [ "$(cut -d' ' -f22 "/proc/$id/stat" 2>/dev/null)" = "$st" ] && alive="$alive pid $id" ;;
+        unit) systemctl is-active --quiet "$id" 2>/dev/null && alive="$alive $id" ;;
+      esac
+    done <"$pdir/survivors"
+    [ -z "$alive" ] || die "parts of an earlier review are still running after KILL:$alive. Stop them first (README: Pre-push review)"
+    rm -f "$pdir/survivors"
+  fi
   rm -f "${pdir:?}/${head:?}.json"   # a new review of this commit replaces the old one, whatever it said
   tmp="$(mktemp -d)"; list="$tmp/punch.tsv"
-  fail() { rm -rf "${tmp:?}"; printf '%s\n' "$*" >"$pdir/$head.last"; echo "review-gate: pre-push review of ${head:0:12} FAILED: $*" >&2; exit 4; }
+  fail() { rm -rf "${tmp:?}"; printf '%s\n' "$1" >"$pdir/$head.last"; echo "review-gate: pre-push review of ${head:0:12} FAILED: $1" >&2; exit "${2:-4}"; }
   # .openqodex/ (OpenQodex's report folder, and the punch-list copies) stays out of git. The tree must be clean:
   # OpenQodex reviews the work tree, so only a clean tree makes "the change" exactly the commit that is pushed.
   git check-ignore -q "$top/.openqodex/x" 2>/dev/null || { mkdir -p "$common/info"; echo '/.openqodex/' >>"$common/info/exclude"; }
@@ -306,8 +318,9 @@ run_prepush() {
   # gets its own process group (set -m), which gets TERM at --timeout + grace and KILL $killafter s later (a reviewer
   # that ignores TERM can't hold on), with OpenQodex's detached reviewers found by an environment marker and the scope. Not timeout(1): uutils' timeout (Ubuntu's default) neither escalates nor exits
   # 124 with -k. The lock's fd is closed for the run, so a leftover reviewer in a session of its own never holds it.
-  local pid t0 fired=0 killafter="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}"
+  local pid t0 fired=0 reaped=0 killafter="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}" killsig="${REVIEW_GATE_PREPUSH_KILL_SIGNAL:-KILL}"
   [[ "$killafter" =~ ^[0-9]+$ ]] || fail "REVIEW_GATE_PREPUSH_KILL_AFTER must be seconds"
+  [[ "$killsig" =~ ^[A-Z]+$ ]] || fail "REVIEW_GATE_PREPUSH_KILL_SIGNAL must be a signal name"   # a test seam: KILL
   # The run is the process group $pid, every process carrying REVIEW_GATE_RUN_ID=$runid in its environment (OpenQodex
   # starts its reviewers detached, in groups of their own; they inherit the environment), and, under the memory cap,
   # the systemd scope $unit (which also holds a reviewer that cleared its environment).
@@ -319,24 +332,39 @@ run_prepush() {
       grep -qzx "REVIEW_GATE_RUN_ID=$runid" "$e" 2>/dev/null && echo "$p"
     done
   }
+  # The group is signalled only until `wait` has reaped its leader: until then the leader's pid (a zombie at worst)
+  # can't be reused, after it the number may name someone else's group (punch list 4.16).
   signal_run() {
     local p
-    kill -"$1" -- "-$pid" 2>/dev/null || true
+    [ "$reaped" = 1 ] || kill -"$1" -- "-$pid" 2>/dev/null || true
     [ -z "$unit" ] || systemctl kill --kill-whom=all --signal="$1" "$unit.scope" >/dev/null 2>&1 || true
     for p in $(run_members); do kill -"$1" "$p" 2>/dev/null || true; done
   }
   run_alive() {
-    kill -0 -- "-$pid" 2>/dev/null || [ -n "$(run_members)" ] ||
+    { [ "$reaped" = 0 ] && kill -0 -- "-$pid" 2>/dev/null; } || [ -n "$(run_members)" ] ||
       { [ -n "$unit" ] && systemctl is-active --quiet "$unit.scope" 2>/dev/null; }
   }
   # stop_run: TERM all of the run, KILL what is left after $killafter s (a leader or a member that ignores TERM), and
   # wait until it is gone, so nothing of it outlives the lock. At the deadline, on INT/TERM/HUP, and for leftovers.
+  # Returns 1 when part of the run survives even KILL (a process stuck in the kernel, a scope that won't stop).
   stop_run() {
     local term_end=$((SECONDS + killafter)) gone=$((SECONDS + killafter + 10))
     signal_run TERM
     while run_alive && [ "$SECONDS" -lt "$term_end" ]; do sleep 1; done
-    signal_run KILL
+    signal_run "$killsig"
     while run_alive && [ "$SECONDS" -lt "$gone" ]; do sleep 1; done
+    ! run_alive
+  }
+  # survivors: part of the run outlived KILL. The lock goes with this process, so leave a marker naming what survives
+  # (pid and start time, the scope): the next prepush refuses to start while any of it is alive. Never a finished run.
+  survivors() {
+    local p st list=""
+    for p in $( { [ "$reaped" = 1 ] || pgrep -g "$pid" 2>/dev/null; run_members; } | sort -u); do
+      st="$(cut -d' ' -f22 "/proc/$p/stat" 2>/dev/null)" && list="${list}pid $p $st"$'\n'
+    done
+    [ -n "$unit" ] && systemctl is-active --quiet "$unit.scope" 2>/dev/null && list="${list}unit $unit.scope"$'\n'
+    printf '%s' "$list" >"$pdir/survivors"
+    fail "parts of the review are still running after KILL: $(printf '%s' "$list" | tr '\n' ';' | sed 's/;$//'). The review did not finish. Stop them (kill -9, systemctl stop), then run prepush again; it refuses while they are alive (exit 5)" 5
   }
   set -m
   (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && export REVIEW_GATE_RUN_ID="$runid" &&
@@ -348,16 +376,17 @@ run_prepush() {
       --instructions "$HERE/prompts/openqodex-instructions.md" --block-on-severity "$BLOCK_ON" --timeout "$tmo") </dev/null 9>&- &
   pid=$!
   set +m
-  trap 'stop_run; exit 130' INT TERM HUP   # our run is in its own group: take it down with us, all of it
+  trap 'stop_run || survivors; exit 130' INT TERM HUP   # our run is in its own group: take it down with us, all of it
   t0=$SECONDS
   while kill -0 "$pid" 2>/dev/null; do
-    if [ $((SECONDS - t0)) -ge $((tmo + grace)) ]; then stop_run; fired=1; break; fi
+    if [ $((SECONDS - t0)) -ge $((tmo + grace)) ]; then stop_run || survivors; fired=1; break; fi
     sleep 1
   done
   wait "$pid" 2>/dev/null || rc=$?
+  reaped=1
   # A reviewer left behind by a run that ended (detached, so not in the group): stopped too, before the lock goes.
   if [ "$fired" = 0 ] && run_alive; then
-    echo "review-gate: stopping processes the review left running" >&2; stop_run
+    echo "review-gate: stopping processes the review left running" >&2; stop_run || survivors
   fi
   trap - INT TERM HUP
   [ "$fired" = 0 ] || rc=124   # we stopped it: a timeout, whatever signal it died of

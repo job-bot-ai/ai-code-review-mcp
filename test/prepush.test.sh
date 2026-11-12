@@ -400,6 +400,23 @@ sp="$(cat "$OPENQODEX_HOME/stubborn.pid" 2>/dev/null)"
 expect "TERM to review-gate prepush stops a TERM-ignoring reviewer too (exit 130), before the lock is released" 130
 prepush
 expect "and the next prepush runs" 0 "pre-push review passed"
+# Parts of the run that outlive KILL (stand-in review of dba81db; simulated with the KILL-signal seam set to CONT):
+# exit 5 naming them, never a finished run, and the next prepush refuses while they are alive.
+fresh
+# (Output to a file, not $(...): the survivors keep the pipe open.)
+(cd "$W" && STUB_OQ=stubborn REVIEW_GATE_PREPUSH_TIMEOUT=1 REVIEW_GATE_PREPUSH_GRACE=1 REVIEW_GATE_PREPUSH_KILL_AFTER=1 \
+  REVIEW_GATE_PREPUSH_KILL_SIGNAL=CONT bash "$gate" prepush --base origin/main) >"$T/sv.out" 2>&1; rc=$?; out="$(cat "$T/sv.out")"
+sv="$W/$(git -C "$W" rev-parse --git-common-dir)/review-gate-prepush/survivors"
+grep -q "^pid $(cat "$OPENQODEX_HOME/stubborn.pid") " "$sv" 2>/dev/null || rc=98
+expect "survivors of KILL: exit 5, named (pid and start time) in the marker, the review not finished" 5 "still running after KILL: pid"
+prepush
+expect "the next prepush refuses while they are alive" 2 "still running after KILL"
+while read -r kind id _; do [ "$kind" = pid ] && kill -9 "$id" 2>/dev/null; done <"$sv"
+sleep 1
+prepush
+expect "once they are gone, prepush runs again (and clears the marker)" 0 "pre-push review passed"
+[ ! -e "$sv" ]; rc=$?
+expect "the survivors marker is gone" 0
 STUB_OQ=killed prepush
 expect "a SIGKILL (the memory cap) is reported as that, naming MemoryMax" 4 "MemoryMax"
 fresh; STUB_OQ=leaves prepush
