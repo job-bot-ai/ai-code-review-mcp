@@ -352,11 +352,17 @@ PUNCH_FIXTURE="$T/punch-big" prepush
 expect "a list close to the 64 KB cap is reviewed, with a warning" 0 "WARNING: the punch list is 58000 of"
 
 # ── a hung OpenQodex: an outer timeout, and the lock is free again ──
-STUB_OQ=hang REVIEW_GATE_PREPUSH_TIMEOUT=1 REVIEW_GATE_PREPUSH_GRACE=1 prepush
+# gone <pid file>: the stub wrote it (this run: each test deletes the old ones first) and that process has ended.
+gone() { local p; p="$(cat "$OPENQODEX_HOME/$1" 2>/dev/null)"; [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; }
+fresh() { rm -f "$OPENQODEX_HOME"/orphan*.pid "$OPENQODEX_HOME/stubborn.pid"; }
+fresh
+STUB_OQ=hang REVIEW_GATE_PREPUSH_TIMEOUT=1 REVIEW_GATE_PREPUSH_GRACE=1 REVIEW_GATE_PREPUSH_KILL_AFTER=1 prepush
 expect "an OpenQodex that never returns is stopped (exit 4)" 4 "didn't finish within 2s"
+gone orphan.pid; rc=$?
+expect "and the detached reviewer it started (in a group of its own) is stopped too (Codex on bf0ade0)" 0
+kill "$(cat "$OPENQODEX_HOME/orphan2.pid")" 2>/dev/null   # cleared its environment: only a cgroup holds it (below)
 prepush
-expect "and the next prepush is not locked out, though a reviewer it started still runs" 0 "pre-push review passed"
-kill "$(cat "$OPENQODEX_HOME/orphan.pid")" 2>/dev/null
+expect "and the next prepush is not locked out" 0 "pre-push review passed"
 # A reviewer that ignores TERM (Codex on 0a62a5e): the watchdog escalates to KILL, and the run ends in bounded time.
 s0=$SECONDS
 STUB_OQ=stubborn REVIEW_GATE_PREPUSH_TIMEOUT=1 REVIEW_GATE_PREPUSH_GRACE=1 REVIEW_GATE_PREPUSH_KILL_AFTER=1 prepush
@@ -371,20 +377,34 @@ STUB_OQ=hang REVIEW_GATE_SYSTEMD_RUN="$T/bin/sdrun-stubborn" REVIEW_GATE_OPENQOD
   REVIEW_GATE_PREPUSH_GRACE=1 REVIEW_GATE_PREPUSH_KILL_AFTER=1 prepush
 [ $((SECONDS - s0)) -le 20 ] || { out="$out (took $((SECONDS - s0))s)"; rc=99; }
 expect "a group leader that ignores TERM is killed after the grace too" 4 "didn't finish within 2s"
-kill "$(cat "$OPENQODEX_HOME/orphan.pid")" 2>/dev/null
+kill "$(cat "$OPENQODEX_HOME/orphan.pid")" "$(cat "$OPENQODEX_HOME/orphan2.pid")" 2>/dev/null
+# Under the real memory cap (a systemd scope; skipped where systemd-run can't make one), even a detached reviewer that
+# cleared its environment is stopped: the scope's cgroup holds it.
+if /usr/bin/systemd-run --scope --quiet --collect -- /bin/true >/dev/null 2>&1; then
+  fresh
+  REVIEW_GATE_SYSTEMD_RUN=/usr/bin/systemd-run STUB_OQ=hang REVIEW_GATE_OPENQODEX_MEMORY=1G REVIEW_GATE_PREPUSH_TIMEOUT=1 \
+    REVIEW_GATE_PREPUSH_GRACE=1 REVIEW_GATE_PREPUSH_KILL_AFTER=1 prepush
+  { gone orphan.pid && gone orphan2.pid; } || { out="$out (a detached reviewer is still running)"; rc=99; }
+  expect "in a real scope, every detached reviewer (also one that cleared its environment) is stopped" 4 "didn't finish"
+  kill "$(cat "$OPENQODEX_HOME/orphan.pid")" "$(cat "$OPENQODEX_HOME/orphan2.pid")" 2>/dev/null
+else echo "skip - systemd-run can't make a scope here (real-scope cleanup)"; fi
 # Cancelling review-gate (Codex on 078af19): the run is taken down whole, TERM then KILL, before the lock is released.
-rm -f "$OPENQODEX_HOME/stubborn.pid"
+fresh
 ( cd "$W" && STUB_OQ=stubborn REVIEW_GATE_PREPUSH_TIMEOUT=600 REVIEW_GATE_PREPUSH_KILL_AFTER=1 exec bash "$gate" prepush --base origin/main ) >"$T/cancel.out" 2>&1 &
 gp=$!
 for _ in $(seq 1 40); do [ -s "$OPENQODEX_HOME/stubborn.pid" ] && break; sleep 0.5; done
 s0=$SECONDS; kill -TERM "$gp"; wait "$gp"; rc=$?; out="$(cat "$T/cancel.out")"
 sp="$(cat "$OPENQODEX_HOME/stubborn.pid" 2>/dev/null)"
-{ [ -n "$sp" ] && ! kill -0 "$sp" 2>/dev/null && [ $((SECONDS - s0)) -le 15 ]; } || { out="$out (stub ${sp:-never started} still running, or took $((SECONDS - s0))s)"; rc=99; }
+{ [ -n "$sp" ] && ! kill -0 "$sp" 2>/dev/null && gone orphan3.pid && [ $((SECONDS - s0)) -le 15 ]; } ||
+  { out="$out (stub ${sp:-never started} or its detached reviewer still running, or took $((SECONDS - s0))s)"; rc=99; }
 expect "TERM to review-gate prepush stops a TERM-ignoring reviewer too (exit 130), before the lock is released" 130
 prepush
 expect "and the next prepush runs" 0 "pre-push review passed"
 STUB_OQ=killed prepush
 expect "a SIGKILL (the memory cap) is reported as that, naming MemoryMax" 4 "MemoryMax"
+fresh; STUB_OQ=leaves prepush
+gone orphan4.pid || { out="$out (the detached reviewer is still running)"; rc=99; }
+expect "a review that finishes but leaves a detached reviewer running: it is stopped before the lock goes" 0 "stopping processes the review left running"
 
 # ── prepush-accept is logged with the bypasses ──
 change ten; STUB_OQ=blocked prepush

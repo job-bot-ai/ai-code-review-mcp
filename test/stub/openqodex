@@ -5,7 +5,7 @@
 # $OPENQODEX_HOME. STUB_OQ picks the outcome: passed (default), blocked, incomplete, noreviewer, nothing, omit
 # (a punch-list file skipped as over the cap), badhash (manifest hash that isn't the file's), lie (exit 0 with a
 # blocked verdict), commit (HEAD moves while it runs), badreport (last-review's report hash
-# isn't the report's), wrongid (a change id that isn't OpenQodex's formula), hang (never returns), stubborn (ignores TERM), killed (SIGKILL, as the memory cap does). Arguments are appended to $STUB_OQ_ARGS when set.
+# isn't the report's), wrongid (a change id that isn't OpenQodex's formula), hang (never returns), stubborn (ignores TERM), leaves (passes but leaves a detached reviewer running), killed (SIGKILL, as the memory cap does). Arguments are appended to $STUB_OQ_ARGS when set.
 set -euo pipefail
 [ "${1:-}" = --version ] && { echo 0.18.0; exit 0; }
 [ "${1:-}" = review ] || { echo "stub openqodex: only review" >&2; exit 2; }
@@ -34,8 +34,20 @@ cid="$( { printf '%s\n' "$bsha"; git diff --no-color --no-ext-diff --no-textconv
 [ "$mode" = wrongid ] && cid="$( { printf '%s\n' "$bsha"; git diff "$bsha"; } | sha256sum | cut -d' ' -f1)"
 # hang: a reviewer that outlives its parent (its own session) and a run that never returns.
 [ "$mode" = killed ] && kill -KILL $$
-if [ "$mode" = stubborn ]; then echo $$ >"$home/stubborn.pid"; trap '' TERM; sleep 60 & wait; fi   # ignores TERM (and so does its child)
-if [ "$mode" = hang ]; then setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan.pid"; exec sleep 60; fi
+if [ "$mode" = leaves ]; then mkdir -p "$home"; setsid sleep 33 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan4.pid"; mode=passed; fi
+if [ "$mode" = stubborn ]; then
+  echo $$ >"$home/stubborn.pid"; trap '' TERM
+  setsid sleep 32 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan3.pid"   # a detached reviewer
+  sleep 60 & wait
+fi   # ignores TERM (and so does its child)
+# hang: reviewers that outlive their parent, detached as OpenQodex starts them: one keeping the environment, one that
+# cleared it (only a cgroup holds that one); then a run that never returns.
+if [ "$mode" = hang ]; then
+  mkdir -p "$home"
+  setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan.pid"
+  env -i /usr/bin/setsid /usr/bin/sleep 31 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan2.pid"
+  exec sleep 60
+fi
 if [ "$mode" = nothing ]; then echo "Nothing to review: no changes against $base"; exit 0; fi
 rd="$top/.openqodex/reviews/$(date -u +%Y%m%d-%H%M%S)-${cid:0:12}"; mkdir -p "$rd"
 if [ "$mode" = noreviewer ]; then

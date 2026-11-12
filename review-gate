@@ -240,7 +240,7 @@ dirty() {   # a git status that fails counts as dirty
 }
 
 run_prepush() {
-  local base="" tmo grace mem cfg list copy tmp rid lr start rc=0 rd cid verdict kind name blob path sz total=0 big=""
+  local base="" unit="" runid tmo grace mem cfg list copy tmp rid lr start rc=0 rd cid verdict kind name blob path sz total=0 big=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --base) [ -n "${2:-}" ] || die "--base needs a ref"; base="$2"; shift 2 ;;
@@ -295,7 +295,8 @@ run_prepush() {
   mem="${REVIEW_GATE_OPENQODEX_MEMORY:-2G}"
   if [ "$mem" != off ]; then
     command -v "$SDRUN" >/dev/null 2>&1 || fail "systemd-run is missing for the memory cap (REVIEW_GATE_OPENQODEX_MEMORY=off runs uncapped)"
-    cap=("$SDRUN" --scope --quiet --collect -p "MemoryMax=$mem" -p "MemorySwapMax=${REVIEW_GATE_OPENQODEX_SWAP:-256M}" --)
+    unit="review-gate-prepush-$$-$RANDOM"   # a known name: stop_run kills everything in its cgroup
+    cap=("$SDRUN" --scope --quiet --collect --unit="$unit" -p "MemoryMax=$mem" -p "MemorySwapMax=${REVIEW_GATE_OPENQODEX_SWAP:-256M}" --)
   fi
   rid="$(repo_id "$top")"; lr="$OQ_HOME/last-review/$rid/last-review.json"
   start="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"   # OpenQodex writes ms; a record of an earlier run never counts
@@ -303,21 +304,43 @@ run_prepush() {
   # Never `review --agent` (the coding agent reviewing its own work): only OpenQodex's own reviewer counts.
   # No GitHub token reaches OpenQodex or its reviewer. A watchdog of our own stops a run that ignores --timeout: the run
   # gets its own process group (set -m), which gets TERM at --timeout + grace and KILL $killafter s later (a reviewer
-  # that ignores TERM can't hold on). Not timeout(1): uutils' timeout (Ubuntu's default) neither escalates nor exits
+  # that ignores TERM can't hold on), with OpenQodex's detached reviewers found by an environment marker and the scope. Not timeout(1): uutils' timeout (Ubuntu's default) neither escalates nor exits
   # 124 with -k. The lock's fd is closed for the run, so a leftover reviewer in a session of its own never holds it.
   local pid t0 fired=0 killafter="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}"
   [[ "$killafter" =~ ^[0-9]+$ ]] || fail "REVIEW_GATE_PREPUSH_KILL_AFTER must be seconds"
-  # stop_run: TERM the run's whole group, KILL what is left of it after $killafter s (a leader or a member that ignores
-  # TERM), and wait until the group is gone, so nothing of it outlives the lock. Used at the deadline and on INT/TERM/HUP.
+  # The run is the process group $pid, every process carrying REVIEW_GATE_RUN_ID=$runid in its environment (OpenQodex
+  # starts its reviewers detached, in groups of their own; they inherit the environment), and, under the memory cap,
+  # the systemd scope $unit (which also holds a reviewer that cleared its environment).
+  runid="$$-$RANDOM-$SECONDS"
+  run_members() {   # the marked processes (Linux /proc); never this script, which doesn't carry the marker
+    local e p
+    for e in /proc/[0-9]*/environ; do
+      p="${e#/proc/}"; p="${p%/environ}"
+      grep -qzx "REVIEW_GATE_RUN_ID=$runid" "$e" 2>/dev/null && echo "$p"
+    done
+  }
+  signal_run() {
+    local p
+    kill -"$1" -- "-$pid" 2>/dev/null || true
+    [ -z "$unit" ] || systemctl kill --kill-whom=all --signal="$1" "$unit.scope" >/dev/null 2>&1 || true
+    for p in $(run_members); do kill -"$1" "$p" 2>/dev/null || true; done
+  }
+  run_alive() {
+    kill -0 -- "-$pid" 2>/dev/null || [ -n "$(run_members)" ] ||
+      { [ -n "$unit" ] && systemctl is-active --quiet "$unit.scope" 2>/dev/null; }
+  }
+  # stop_run: TERM all of the run, KILL what is left after $killafter s (a leader or a member that ignores TERM), and
+  # wait until it is gone, so nothing of it outlives the lock. At the deadline, on INT/TERM/HUP, and for leftovers.
   stop_run() {
     local term_end=$((SECONDS + killafter)) gone=$((SECONDS + killafter + 10))
-    kill -TERM -- "-$pid" 2>/dev/null || true
-    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$term_end" ]; do sleep 1; done
-    kill -KILL -- "-$pid" 2>/dev/null || true
-    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$gone" ]; do sleep 1; done
+    signal_run TERM
+    while run_alive && [ "$SECONDS" -lt "$term_end" ]; do sleep 1; done
+    signal_run KILL
+    while run_alive && [ "$SECONDS" -lt "$gone" ]; do sleep 1; done
   }
   set -m
-  (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && OPENQODEX_AUTO_UPDATE=0 exec ${cap[@]+"${cap[@]}"} \
+  (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && export REVIEW_GATE_RUN_ID="$runid" &&
+    OPENQODEX_AUTO_UPDATE=0 exec ${cap[@]+"${cap[@]}"} \
     bash -c '"$@"; rc=$?
       p="/sys/fs/cgroup$(cut -d: -f3- /proc/self/cgroup 2>/dev/null | head -n 1)/memory.peak"
       [ -r "$p" ] && echo "review-gate: OpenQodex peak memory $(( $(cat "$p") / 1048576 )) MiB" >&2
@@ -332,6 +355,10 @@ run_prepush() {
     sleep 1
   done
   wait "$pid" 2>/dev/null || rc=$?
+  # A reviewer left behind by a run that ended (detached, so not in the group): stopped too, before the lock goes.
+  if [ "$fired" = 0 ] && run_alive; then
+    echo "review-gate: stopping processes the review left running" >&2; stop_run
+  fi
   trap - INT TERM HUP
   [ "$fired" = 0 ] || rc=124   # we stopped it: a timeout, whatever signal it died of
   { [ "$(git rev-parse HEAD)" = "$head" ] && ! dirty; } || fail "HEAD or the work tree changed while the review ran; review again"

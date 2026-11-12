@@ -283,7 +283,12 @@ reviewed change exactly the commit you push) it:
    reported as that kill, naming `MemoryMax`, not as a timeout), watched by a
    watchdog of its own: the run gets its own process group, which gets TERM at `--timeout` + 120 s and KILL 30 s
    later, so a reviewer that ignores `--timeout` and TERM can't hold on (not `timeout(1)`: uutils' timeout, Ubuntu's
-   default, neither escalates nor exits 124 with `-k`); the lock's file
+   default, neither escalates nor exits 124 with `-k`). OpenQodex starts its reviewers detached, in process groups of
+   their own, so "the run" is also every process carrying the run's `REVIEW_GATE_RUN_ID` in its environment (Linux
+   `/proc`) and, under the memory cap, everything in its systemd scope (which also holds a reviewer that cleared its
+   environment). The same TERM-then-KILL stops all of it at the deadline, when `review-gate` is interrupted, and for
+   whatever a finished review left running, before the lock is released. Uncapped (`REVIEW_GATE_OPENQODEX_MEMORY=off`),
+   a detached reviewer that also clears its environment is not contained; the lock's file
    descriptor is closed for it, so a hung run or a leftover reviewer never holds the lock. Never `review --agent`:
    that is the coding agent reviewing its own work;
 4. records the result in `$GIT_COMMON_DIR/review-gate-prepush/<sha>.json` (shared by all worktrees, keyed by
