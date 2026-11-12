@@ -34,7 +34,7 @@ cid="$( { printf '%s\n' "$bsha"; git diff --no-color --no-ext-diff --no-textconv
 [ "$mode" = wrongid ] && cid="$( { printf '%s\n' "$bsha"; git diff "$bsha"; } | sha256sum | cut -d' ' -f1)"
 # hang: a reviewer that outlives its parent (its own session) and a run that never returns.
 [ "$mode" = killed ] && kill -KILL $$
-if [ "$mode" = stubborn ]; then trap '' TERM; sleep 60 & wait; fi   # ignores TERM (and so does its child)
+if [ "$mode" = stubborn ]; then echo $$ >"$home/stubborn.pid"; trap '' TERM; sleep 60 & wait; fi   # ignores TERM (and so does its child)
 if [ "$mode" = hang ]; then setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan.pid"; exec sleep 60; fi
 if [ "$mode" = nothing ]; then echo "Nothing to review: no changes against $base"; exit 0; fi
 rd="$top/.openqodex/reviews/$(date -u +%Y%m%d-%H%M%S)-${cid:0:12}"; mkdir -p "$rd"

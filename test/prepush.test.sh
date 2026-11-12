@@ -372,6 +372,17 @@ STUB_OQ=hang REVIEW_GATE_SYSTEMD_RUN="$T/bin/sdrun-stubborn" REVIEW_GATE_OPENQOD
 [ $((SECONDS - s0)) -le 20 ] || { out="$out (took $((SECONDS - s0))s)"; rc=99; }
 expect "a group leader that ignores TERM is killed after the grace too" 4 "didn't finish within 2s"
 kill "$(cat "$OPENQODEX_HOME/orphan.pid")" 2>/dev/null
+# Cancelling review-gate (Codex on 078af19): the run is taken down whole, TERM then KILL, before the lock is released.
+rm -f "$OPENQODEX_HOME/stubborn.pid"
+( cd "$W" && STUB_OQ=stubborn REVIEW_GATE_PREPUSH_TIMEOUT=600 REVIEW_GATE_PREPUSH_KILL_AFTER=1 exec bash "$gate" prepush --base origin/main ) >"$T/cancel.out" 2>&1 &
+gp=$!
+for _ in $(seq 1 40); do [ -s "$OPENQODEX_HOME/stubborn.pid" ] && break; sleep 0.5; done
+s0=$SECONDS; kill -TERM "$gp"; wait "$gp"; rc=$?; out="$(cat "$T/cancel.out")"
+sp="$(cat "$OPENQODEX_HOME/stubborn.pid" 2>/dev/null)"
+{ [ -n "$sp" ] && ! kill -0 "$sp" 2>/dev/null && [ $((SECONDS - s0)) -le 15 ]; } || { out="$out (stub ${sp:-never started} still running, or took $((SECONDS - s0))s)"; rc=99; }
+expect "TERM to review-gate prepush stops a TERM-ignoring reviewer too (exit 130), before the lock is released" 130
+prepush
+expect "and the next prepush runs" 0 "pre-push review passed"
 STUB_OQ=killed prepush
 expect "a SIGKILL (the memory cap) is reported as that, naming MemoryMax" 4 "MemoryMax"
 

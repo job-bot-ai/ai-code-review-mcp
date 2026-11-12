@@ -305,8 +305,17 @@ run_prepush() {
   # gets its own process group (set -m), which gets TERM at --timeout + grace and KILL $killafter s later (a reviewer
   # that ignores TERM can't hold on). Not timeout(1): uutils' timeout (Ubuntu's default) neither escalates nor exits
   # 124 with -k. The lock's fd is closed for the run, so a leftover reviewer in a session of its own never holds it.
-  local pid t0 fired=0 kill_at=0 killafter="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}"
+  local pid t0 fired=0 killafter="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}"
   [[ "$killafter" =~ ^[0-9]+$ ]] || fail "REVIEW_GATE_PREPUSH_KILL_AFTER must be seconds"
+  # stop_run: TERM the run's whole group, KILL what is left of it after $killafter s (a leader or a member that ignores
+  # TERM), and wait until the group is gone, so nothing of it outlives the lock. Used at the deadline and on INT/TERM/HUP.
+  stop_run() {
+    local term_end=$((SECONDS + killafter)) gone=$((SECONDS + killafter + 10))
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$term_end" ]; do sleep 1; done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$gone" ]; do sleep 1; done
+  }
   set -m
   (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && OPENQODEX_AUTO_UPDATE=0 exec ${cap[@]+"${cap[@]}"} \
     bash -c '"$@"; rc=$?
@@ -316,21 +325,12 @@ run_prepush() {
       --instructions "$HERE/prompts/openqodex-instructions.md" --block-on-severity "$BLOCK_ON" --timeout "$tmo") </dev/null 9>&- &
   pid=$!
   set +m
-  trap 'kill -TERM -- "-$pid" 2>/dev/null; exit 130' INT TERM HUP   # our run is in its own group: take it down with us
+  trap 'stop_run; exit 130' INT TERM HUP   # our run is in its own group: take it down with us, all of it
   t0=$SECONDS
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$fired" = 0 ] && [ $((SECONDS - t0)) -ge $((tmo + grace)) ]; then
-      kill -TERM -- "-$pid" 2>/dev/null || true; fired=1; kill_at=$((SECONDS + killafter))
-    elif [ "$fired" = 1 ] && [ "$SECONDS" -ge "$kill_at" ]; then
-      kill -KILL -- "-$pid" 2>/dev/null || true; fired=2
-    fi
+    if [ $((SECONDS - t0)) -ge $((tmo + grace)) ]; then stop_run; fired=1; break; fi
     sleep 1
   done
-  # The leader can die of TERM while a member that ignores it lives on: once we fired, KILL what is left of the group.
-  if [ "$fired" = 1 ]; then
-    while kill -0 -- "-$pid" 2>/dev/null && [ "$SECONDS" -lt "$kill_at" ]; do sleep 1; done
-    kill -KILL -- "-$pid" 2>/dev/null || true
-  fi
   wait "$pid" 2>/dev/null || rc=$?
   trap - INT TERM HUP
   [ "$fired" = 0 ] || rc=124   # we stopped it: a timeout, whatever signal it died of
