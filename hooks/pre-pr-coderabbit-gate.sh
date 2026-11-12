@@ -68,7 +68,7 @@ bypass_check() {
     why="it clears HOME/XDG_CONFIG_HOME/GIT_* for git: git would read another config, without the hook."
   elif m 'install-githooks' && m '--uninstall'; then
     why="it uninstalls the pre-push hook."
-  elif m '(\.gitconfig|\.git/config|git/config|\.git/hooks|(^|[^[:alnum:]_.-])githooks(/|$|[[:space:]]))' && m '(>|(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod)([^[:alnum:]_-]|$))'; then
+  elif m '(\.gitconfig|\.git/config|git/config|\.git/hooks|(^|[^[:alnum:]_.-])githooks(/|$|[[:space:]]))' && m '((^|[^0-9&>])>|(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod)([^[:alnum:]_-]|$))'; then
     why="it writes a git config file or a hooks folder directly."
   elif m "$git" && m "$push"; then
     # A repo-local core.hooksPath (husky sets one) wins over the global one: the gate's hook would not run there.
@@ -78,7 +78,7 @@ bypass_check() {
     case "$got" in "~/"*) got="$HOME/${got#\~/}" ;; esac
     [ -n "$got" ] && case "$got" in /*) ;; *) got="$(git -C "$session_cwd" rev-parse --show-toplevel 2>/dev/null)/$got" ;; esac
     [ -n "$got" ] && got="$(realpath -m "$got")"
-    [ "$got" = "$want" ] ||
+    [ -n "$want" ] && [ "$got" = "$want" ] ||
       why="core.hooksPath in $session_cwd is ${got:-unset}, not $want, so git's pre-push review hook would not run (install-githooks --global; a repo-local core.hooksPath, as husky sets, overrides it)."
   fi
   [ -z "$why" ] && return 0

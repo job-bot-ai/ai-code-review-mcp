@@ -406,7 +406,7 @@ case "${1:-help}" in
   *)
     {
       echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer|prepush]}"
-      echo "       review-gate {prepush [--base <ref>]|prepush-accept --reason \"...\"|check-prepush [--rev <commit>]}"
+      echo "       review-gate {prepush [--base <ref>]|prepush-accept --reason \"...\"|check-prepush [--rev <commit> [--branch <name>]]}"
       echo "  reviewers: $VALID"
       echo "  primary  : ${PRIMARY[*]-}  (override with REVIEW_GATE_PRIMARY=\"kodus greptile\")"
       echo "  passes   : $MIN different reviewers (REVIEW_GATE_MIN); self counts only after codex passed or was skipped"

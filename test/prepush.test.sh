@@ -54,6 +54,7 @@ change base-a; push -q --no-verify origin feat; change base-b
 out="$(cd "$W" && bash "$gate" prepush --base origin/feat 2>&1)"; rc=$?
 push -q origin feat
 expect "a review against the branch's own remote tip (not the PR base) doesn't count" 1 "not on a remote branch other than feat"
+change base-c   # base-b, HEAD~1 now, was never pushed
 out="$(cd "$W" && bash "$gate" prepush --base HEAD~1 2>&1)"; rc=$?
 push -q origin feat
 expect "a review against an unpushed HEAD~1 doesn't count" 1 "not on a remote branch other than feat"

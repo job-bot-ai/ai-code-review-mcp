@@ -493,7 +493,7 @@ for c in "echo '[core] hooksPath = /x' >> .git/config" "rm githooks/pre-push" "m
   run "$T/a" "$c"
   expect "bypass blocked: $c" 2 stderr "writes a git config file or a hooks folder"
 done
-run "$T/a" "cat .git/config; grep url ~/.gitconfig"
+run "$T/a" "cat .git/config 2>/dev/null; grep url ~/.gitconfig 2>&1"
 expect "reading git config files is fine" 0
 git -C "$T/a" config core.hooksPath .husky
 run "$T/a" "git push"
@@ -504,6 +504,10 @@ expect "a repo-local core.hooksPath that is the gate's is fine" 0
 git -C "$T/a" config --unset core.hooksPath
 GIT_CONFIG_GLOBAL=/dev/null run "$T/a" "git push origin HEAD"
 expect "no core.hooksPath at all (gate not installed) blocks the push" 2 stderr "is unset"
+mkdir -p "$T/nohooks/hooks" && cp "$hook" "$T/nohooks/hooks/" && cp "$root/hooks/resolve-pr-target.mjs" "$T/nohooks/hooks/" && cp "$gate" "$T/nohooks/"
+payload="$(jq -cn --arg c "git push" --arg d "$T/np" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | GIT_CONFIG_GLOBAL=/dev/null bash "$T/nohooks/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "with no githooks/ next to the hook and no core.hooksPath, a push is still blocked" 2 stderr "would not run"
 REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
 expect "Tim's REVIEW_GATE_PREPUSH=off (the hook's own environment) lets a bypass through" 0
 grep -q 'claude-hook' "$XDG_STATE_HOME/review-gate/prepush-bypass.log"; rc=$?
