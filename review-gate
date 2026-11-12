@@ -36,6 +36,16 @@ set -euo pipefail
 # OpenQodex-shaped records without a review. Test seams are REVIEW_GATE_* variables, which are Tim's (README).
 PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"; export PATH
 
+# The bypass log is at a fixed place, from the user's passwd entry (~user), never from HOME or XDG_STATE_HOME: a
+# caller must not be able to send a waiver to a throwaway file. REVIEW_GATE_BYPASS_LOG (Tim's, like every
+# REVIEW_GATE_* setting) moves it. `review-gate bypass-log`
+# prints it (read-only, outside a repo too); both hooks take it from there.
+bypass_log() {
+  local h; eval "h=~$(id -un)"
+  printf '%s' "${REVIEW_GATE_BYPASS_LOG:-$h/.local/state/review-gate/prepush-bypass.log}"
+}
+if [ "${1:-}" = bypass-log ]; then bypass_log; echo; exit 0; fi
+
 VALID="kodus coderabbit greptile codex self agy"
 MIN="${REVIEW_GATE_MIN:-2}"
 case "$MIN" in ''|*[!0-9]*) echo "review-gate: REVIEW_GATE_MIN must be a number" >&2; exit 2;; esac
@@ -92,13 +102,6 @@ oq_change_id() {
   { printf '%s\n' "$1" && GIT_NO_REPLACE_OBJECTS=1 git diff --no-color --no-ext-diff --no-textconv --no-relative --find-renames \
       --inter-hunk-context=0 --ignore-submodules=none --submodule=short --raw -z --no-abbrev "$1" "$2" -- ':(top,exclude).openqodex'
   } | sha256sum | cut -d' ' -f1
-}
-# The bypass log is at a fixed place, from the user's passwd entry (~user), never from HOME or XDG_STATE_HOME: a
-# caller must not be able to send a waiver to a throwaway file. REVIEW_GATE_BYPASS_LOG (Tim's, like every
-# REVIEW_GATE_* setting) moves it.
-bypass_log() {
-  local h; eval "h=~$(id -un)"
-  printf '%s' "${REVIEW_GATE_BYPASS_LOG:-$h/.local/state/review-gate/prepush-bypass.log}"
 }
 # Files under the top-level .openqodex/ are outside OpenQodex's change id and its review (its STATE_PATHSPEC): a
 # change that commits any is never a reviewed change.
@@ -489,7 +492,7 @@ case "${1:-help}" in
   *)
     {
       echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer|prepush]}"
-      echo "       review-gate {prepush [--base <ref>]|prepush-accept --reason \"...\"|check-prepush [--rev <commit> [--branch <name>]]|change-id <base> [<commit>]}"
+      echo "       review-gate {prepush [--base <ref>]|prepush-accept --reason \"...\"|check-prepush [--rev <commit> [--branch <name>]]|change-id <base> [<commit>]|bypass-log}"
       echo "  reviewers: $VALID"
       echo "  primary  : ${PRIMARY[*]-}  (override with REVIEW_GATE_PRIMARY=\"kodus greptile\")"
       echo "  passes   : $MIN different reviewers (REVIEW_GATE_MIN); self counts only after codex passed or was skipped"

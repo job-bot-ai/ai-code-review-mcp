@@ -263,6 +263,18 @@ expect "and the bypass is logged" 0
 : >"$T/notadir"
 REVIEW_GATE_BYPASS_LOG="$T/notadir/x.log" REVIEW_GATE_PREPUSH=off push -q origin HEAD:refs/heads/unlogged
 expect "the switch doesn't work when the bypass can't be logged" 1 "can't be logged"
+# The default log path (review of 824e18c): never from HOME/XDG_STATE_HOME, and the git hook takes it from review-gate.
+want="$(getent passwd "$(id -un)" | cut -d: -f6)/.local/state/review-gate/prepush-bypass.log"
+out="$(cd "$T" && env -u REVIEW_GATE_BYPASS_LOG HOME="$T/h" XDG_STATE_HOME="$T/x" bash "$gate" bypass-log 2>&1)"; rc=$?
+[ "$out" = "$want" ] || rc=9
+expect "review-gate bypass-log: <passwd home>/.local/state/review-gate/prepush-bypass.log, whatever HOME/XDG_STATE_HOME say" 0
+mkdir -p "$T/sg/githooks" && cp "$root/githooks/pre-push" "$T/sg/githooks/"
+printf '#!/bin/sh\n[ "$1" = bypass-log ] && { echo "%s"; exit 0; }\nexit 1\n' "$T/sg-log" >"$T/sg/review-gate"
+git -C "$W" config core.hooksPath "$T/sg/githooks"
+out="$(cd "$W" && env -u REVIEW_GATE_BYPASS_LOG HOME="$T/h" XDG_STATE_HOME="$T/x" REVIEW_GATE_PREPUSH=off git push -q origin HEAD:refs/heads/sg 2>&1)"; rc=$?
+grep -q 'git-hook' "$T/sg-log" 2>/dev/null && [ ! -e "$T/x" ] || rc=9
+expect "the git hook logs a bypass where review-gate bypass-log says, not under XDG_STATE_HOME" 0
+git -C "$W" config core.hooksPath "$root/githooks"; git -C "$W" push -q --no-verify origin --delete sg >/dev/null 2>&1
 mkdir -p "$T/broken/githooks" && cp "$root/githooks/pre-push" "$T/broken/githooks/"
 printf '#!/bin/sh\nexit 7\n' >"$T/broken/review-gate"
 change eight; prepush
@@ -301,10 +313,13 @@ out="$(cd "$W" && BASH_ENV="$T/benv.sh" git push -q origin feat 2>&1)"; rc=$?
 expect "BASH_ENV=<a file that exits 0> git push still blocks an unreviewed commit" 1 "BLOCKED"
 out="$(cd "$W" && cat() { :; } && export -f cat && git push -q origin feat 2>&1)"; rc=$?
 expect "an exported cat function (the hook reads no refs) still blocks" 1 "BLOCKED"
-out="$(cd "$W" && jq() { return 0; } && export -f jq && GIT_TRACE= /bin/bash -c "printf '%s\n' 'refs/heads/feat $(git rev-parse HEAD) refs/heads/feat 0000000000000000000000000000000000000000' | '$root/githooks/pre-push' origin x" 2>&1)"; rc=$?
-expect "an exported jq function doesn't reach review-gate" 1 "BLOCKED"
 out="$(cd "$W" && BASH_ENV="$T/benv.sh" "$gate" check-prepush 2>&1)"; rc=$?
 expect "review-gate run directly ignores BASH_ENV (#!/bin/bash -p)" 1 "run \`review-gate prepush\`"
+# A record whose only failing check is a jq one (blocked findings, none accepted): an exported jq that passes that
+# check would let the push through if review-gate imported it (review of 824e18c).
+change jqfn; STUB_OQ=blocked prepush
+out="$(cd "$W" && jq() { case "$*" in *accepted*) return 0 ;; esac; command jq "$@"; } && export -f jq && git push -q origin feat 2>&1)"; rc=$?
+expect "an exported jq function (one that waives the findings) doesn't reach review-gate" 1 "OpenQodex blocked it"
 
 # ── files under .openqodex/ are outside OpenQodex's review and change id (review of 97a58fa) ──
 git -C "$W" reset -q --hard HEAD~1; prepush   # HEAD reviewed again

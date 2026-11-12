@@ -19,9 +19,8 @@ gate="$here/../review-gate"
 input="$(cat)"
 
 if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then
-  eval "uhome=~$(id -un)"   # the passwd entry, not HOME/XDG_STATE_HOME (review-gate's bypass_log)
-  log="${REVIEW_GATE_BYPASS_LOG:-$uhome/.local/state/review-gate/prepush-bypass.log}"
-  { mkdir -p "$(dirname "$log")" && printf '%s\tgit-hook\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" \
+  log="$(/bin/bash -p "$gate" bypass-log 2>/dev/null)" || log=""   # a fixed place, never HOME/XDG_STATE_HOME
+  { [ -n "$log" ] && mkdir -p "$(dirname "$log")" && printf '%s\tgit-hook\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" \
     "$(printf '%s' "$input" | tr '\n' ' ' | cut -c1-300)" >>"$log"; } 2>/dev/null ||
     { echo "BLOCKED: REVIEW_GATE_PREPUSH=off, but the bypass can't be logged to $log (a bypass is never silent)" >&2; exit 1; }
   echo "review-gate: pre-push gate is OFF (REVIEW_GATE_PREPUSH=off); push not checked, logged to $log" >&2

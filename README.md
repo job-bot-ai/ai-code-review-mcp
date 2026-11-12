@@ -355,10 +355,15 @@ it or a variable holding it plus any write) to `.gitconfig`, `.git/config`, `git
 the pre-push records (`review-gate-prepush/`) or OpenQodex's (`.openqodex/`, `~/.openqodex/`);
 `git config --remove-section`/`--rename-section`/`--edit`; `git send-pack`/`http-push` (they run no hook); on a
 push, any `-c` but `credential.helper=...`, and `--config-env`. Quotes and backslashes are removed before matching,
-and two conditions that belong to one command must hold in the same `;`/`&`/`|`-separated part of it, so
-`git -c user.name=x commit && git push` or `git log > f; cat .git/hooks/x` aren't read as one command. A command
-with `$(` or a backtick anywhere builds words at run time, so it is matched as a whole (and any write plus any
-protected path in it counts). `githooks/pre-push` and `review-gate` run as `#!/bin/bash -p` (the hook calls
+and two conditions that belong to one command must hold in the same command. The command line is split by the
+hook's own shell tokenizer (`hooks/command-segments.mjs`, on `resolve-pr-target.mjs`'s `tokenize`): at `;`, `&`,
+`|`, `&&`, `||`, parentheses and newlines **outside** quotes, heredocs, `$(...)` and backticks, with the body of each
+substitution checked as a command of its own and redirect targets read as whole words. So
+`git -c user.name=x commit && git push`, `git log > f; cat .git/hooks/x` and Claude Code's usual heredoc commit
+message (`git commit -m "$(cat <<'EOF' ... -> .git/hooks ... EOF)" && git push`) aren't read as writes, while
+`> "$(pwd)/githooks/pre-push"` and `echo $(cp x ~/.gitconfig)` are. Without node, or when the tokenizer can't read
+the command, a cruder split errs toward blocking (a command with `$(` or a backtick is matched whole, and any
+`HOME=`/`PATH=`/... assignment with git counts). `githooks/pre-push` and `review-gate` run as `#!/bin/bash -p` (the hook calls
 `/bin/bash -p review-gate`), which ignores `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS` and exported functions, and
 set a fixed `PATH` themselves, so neither a `PATH` prefix nor bash's startup inputs can hand them a look-alike
 `bash`, `cat`, `git`, `jq` or `systemd-run`. And a command with `git` and `push` is blocked unless `core.hooksPath` in the session's checkout
@@ -401,7 +406,8 @@ after its own review (pr-orchestrator #22, round 0). This hook stays as the earl
 `~/.claude/settings.json`, or exported before starting `claude`) lets both hooks through; git inherits it from
 Claude Code. As a command prefix it is blocked. Every use is logged to
 `~<user>/.local/state/review-gate/prepush-bypass.log`, a fixed place from the user's passwd entry, never from `HOME`
-or `XDG_STATE_HOME` (`REVIEW_GATE_BYPASS_LOG`, Tim's, moves it); when that log can't be written, the switch
+or `XDG_STATE_HOME` (`REVIEW_GATE_BYPASS_LOG`, Tim's, moves it). `review-gate bypass-log` prints it, and both hooks
+take the path from there; when that log can't be written, the switch
 doesn't work (a bypass is never silent). The same log gets every `prepush-accept` (repo, commit, finding counts,
 reason). By hand, outside Claude Code, the same variable
 works (and `git push --no-verify` is git's own).

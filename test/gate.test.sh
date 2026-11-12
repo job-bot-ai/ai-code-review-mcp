@@ -532,6 +532,41 @@ for c in "echo \$(git rev-parse HEAD) > /tmp/h" "XDG_STATE_HOME=/tmp/q npm test;
   run "$T/a" "$c"
   expect "not a bypass: $c" 0
 done
+# Review of 824e18c: substitutions stay inside the command that holds them (false positives of the whole-command mode).
+hd="git add -A && git commit -qm \"\$(cat <<'EOF'
+fix(gate): the hook -> now reads .git/hooks/pre-push; githooks/pre-push > the old one
+rm and cp of githooks/ are blocked
+EOF
+)\" && git push origin feat"
+for c in "$hd" "git -c user.email=a@b commit -qm \"\$(date)\" && git push origin feat" \
+  "git diff \$(git merge-base HEAD origin/main) -- .openqodex/ > /tmp/d" \
+  "cp README.md /tmp/r && git log \"\$(git merge-base HEAD origin/main)\"..HEAD -- githooks/" \
+  "git log --format=%s -1 \`git rev-parse HEAD\` > /tmp/m; cat githooks/pre-push"; do
+  run "$T/a" "$c"
+  expect "not a bypass: $c" 0
+done
+for c in "echo \$(echo 'exit 0' > .git/hooks/pre-push)" "git push \$(cp x ~/.gitconfig)" "echo x >> ~/.gitconfig 2>&1" \
+  "echo 'exit 0' > \"\$(pwd)/my dir/githooks/pre-push\"" "c=git; HOME=/tmp \$c push" "HOME=\"/a b\"; git push"; do
+  run "$T/a" "$c"
+  expect "bypass blocked (nested or appended write): $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+# Without node (or when the tokenizer fails) the hook falls back to a cruder split that errs toward blocking.
+mkdir -p "$T/crude/hooks" && cp "$hook" "$root/hooks/resolve-pr-target.mjs" "$T/crude/hooks/" && cp "$gate" "$T/crude/"
+for c in "echo 'exit 0' > \"\$(echo /x)/githooks/pre-push\"" "git -c core.hooks\$(true; echo Path)=/dev/null push" "BASH_ENV=/tmp/x git push"; do
+  payload="$(jq -cn --arg c "$c" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+  out="$(printf '%s' "$payload" | bash "$T/crude/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+  expect "without the tokenizer, still blocked: $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+payload="$(jq -cn --arg c "HOME=/tmp npm test; git status" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | bash "$T/crude/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+expect "without the tokenizer, any HOME/PATH/... assignment with git counts (it can't tell HOME=\"/a b\"; from a prefix)" 2 stderr "overrides"
+# The Claude Code hook logs a bypass where review-gate bypass-log says, never under HOME/XDG_STATE_HOME.
+mkdir -p "$T/sg/hooks" && cp "$hook" "$root/hooks/resolve-pr-target.mjs" "$root/hooks/command-segments.mjs" "$T/sg/hooks/"
+printf '#!/bin/sh\n[ "$1" = bypass-log ] && { echo "%s"; exit 0; }\nexit 1\n' "$T/sg-log" >"$T/sg/review-gate"
+payload="$(jq -cn --arg c "git push --no-verify" --arg d "$T/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+out="$(printf '%s' "$payload" | env -u REVIEW_GATE_BYPASS_LOG HOME="$T/h" XDG_STATE_HOME="$T/x" REVIEW_GATE_PREPUSH=off bash "$T/sg/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?
+grep -q 'claude-hook' "$T/sg-log" 2>/dev/null && [ ! -e "$T/x" ] || rc=9
+expect "the Claude Code hook logs a bypass where review-gate bypass-log says, not under XDG_STATE_HOME" 0
 REVIEW_GATE_PREPUSH=off run "$T/a" "bash review-gate prepush-accept --reason 'declined by Tim: covered elsewhere'"
 expect "prepush-accept goes through when Tim set REVIEW_GATE_PREPUSH=off" 0
 git -C "$T/a" config core.hooksPath .husky
