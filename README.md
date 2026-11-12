@@ -3,7 +3,7 @@
 A thin [MCP](https://modelcontextprotocol.io) stdio server that wraps local
 AI **code-review CLIs** so any MCP client (Claude Code, etc.) can run reviews as
 tool calls — no PR required — plus a **PR gate**: open the PR as a draft, let the PR
-reviewers (Kodus + CodeRabbit, then Kodus + Greptile from 2026-11-19) review it, and
+reviewers (Kodus + Greptile; CodeRabbit was retired on 2026-11-12) review it, and
 `gh pr ready` is blocked until two reviews are green on the PR's final commit.
 
 Reviewers wrapped (each shells out to its CLI; no review logic reimplemented):
@@ -102,11 +102,11 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
 1. at least **two different reviewers** have a pass recorded for the commit
    (`REVIEW_GATE_MIN`, default 2);
 2. every **primary** reviewer has a pass **or** an announced skip. Primaries are
-   `kodus coderabbit` until 2026-11-19 and `kodus greptile` from then (UTC);
+   `kodus greptile` (CodeRabbit was retired on 2026-11-12);
    override with `REVIEW_GATE_PRIMARY` (`REVIEW_GATE_REQUIRED` is read as a legacy alias);
 3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback).
 
-Reviewers: `kodus`, `coderabbit`, `greptile` (primaries), `codex` (fallback), `self`
+Reviewers: `kodus`, `greptile` (primaries; `coderabbit` stays valid for old records), `codex` (fallback), `self`
 (the agent's own thorough review, last resort). `agy` stays valid for old records. `kimi`
 (the retired `kimi-review` pass) is no longer a reviewer: a leftover kimi marker is ignored
 and never counts.
@@ -181,7 +181,7 @@ Workflow:
 gh pr create --draft ...                 # always allowed; Kodus reviews it automatically
 # CodeRabbit skips drafts by default: comment `@coderabbitai review` (Greptile: `@greptileai review`)
 # fix high findings, fix medium ones or say why not, push, request a re-review; then for each clean pass:
-./review-gate record kodus               # and: record coderabbit (until 2026-11-19) / record greptile (from then)
+./review-gate record kodus               # and: record greptile
 gh pr ready                              # now allowed
 ```
 
@@ -245,8 +245,7 @@ Tests: `npm test` (resolver unit tests and hook integration tests against throwa
 
 - `CODERABBIT_BIN` / `CODEX_BIN` — explicit binary paths (if not on `PATH`)
 - `CODERABBIT_TIMEOUT_SECONDS` (default 600) / `CODEX_TIMEOUT_SECONDS` (default 900)
-- `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus coderabbit`
-  until 2026-11-19, `kodus greptile` from then; valid: `kodus coderabbit greptile codex self agy`)
+- `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus greptile`; valid: `kodus coderabbit greptile codex self agy`)
 - `REVIEW_GATE_MIN` — how many different reviewers must pass (default 2)
 
 ## Headless / remote auth (CodeRabbit)

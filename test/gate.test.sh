@@ -112,15 +112,14 @@ expect "agy stays a valid reviewer for old records" 0
 (cd "$T/d2" && bash "$gate" record bogus >/dev/null 2>&1); rc=$?
 expect "an unknown reviewer is refused" 2
 
-# Date-based primaries: CodeRabbit until 2026-11-19, Greptile from then.
+# Default primaries: Kodus + Greptile, whatever the date (CodeRabbit retired 2026-11-12).
 mkdir -p "$T/fakebin"
 printf '#!/bin/sh\ncase "$*" in *+%%Y%%m%%d*) echo "${FAKE_DAY}";; *) exec /bin/date "$@";; esac\n' >"$T/fakebin/date"; chmod +x "$T/fakebin/date"
-(cd "$T/d2" && FAKE_DAY=20261118 PATH="$T/fakebin:$PATH" REVIEW_GATE_PRIMARY= bash "$gate" status) >"$T/st" 2>&1
-grep -q 'coderabbit .*\[primary\]' "$T/st" && ! grep -q 'greptile .*\[primary\]' "$T/st"; rc=$?
-expect "before 2026-11-19 the primaries are kodus + coderabbit" 0
-(cd "$T/d2" && FAKE_DAY=20261119 PATH="$T/fakebin:$PATH" REVIEW_GATE_PRIMARY= bash "$gate" status) >"$T/st" 2>&1
-grep -q 'greptile .*\[primary\]' "$T/st" && ! grep -q 'coderabbit .*\[primary\]' "$T/st"; rc=$?
-expect "from 2026-11-19 the primaries are kodus + greptile" 0
+for day in 20261112 20261118 20261119; do
+  (cd "$T/d2" && FAKE_DAY=$day PATH="$T/fakebin:$PATH" REVIEW_GATE_PRIMARY= bash "$gate" status) >"$T/st" 2>&1
+  grep -q 'greptile .*\[primary\]' "$T/st" && grep -q 'kodus .*\[primary\]' "$T/st" && ! grep -q 'coderabbit .*\[primary\]' "$T/st"; rc=$?
+  expect "on $day the default primaries are kodus + greptile" 0
+done
 
 # ── Draft PRs and gh pr ready ──
 mkrepo "$T/r" acme/ready
