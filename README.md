@@ -306,10 +306,11 @@ uses for `gh pr ready`. It passes only when all of these hold:
 - the punch list on `main` **now** has the same files and blob ids as the one reviewed (one or two `gh api` calls; a
   failed fetch blocks).
 
-Anything else blocks, including `review-gate` exiting with any other code. Not gated: deletes, tags, and
-`--dry-run` (git runs the hook for a dry run too; the hook reads the push's own arguments from `/proc`, last of
-`--dry-run`/`--no-dry-run` wins). The repo's own `.git/hooks/*` keep running: every hook in `githooks/` chains to
-it (`core.hooksPath` would otherwise switch them off).
+Anything else blocks, including `review-gate` exiting with any other code. Not gated: deletes and tags. A
+`--dry-run` *is* checked like a push: git runs the pre-push hook for it and doesn't tell the hook, and finding out
+would mean parsing the push's arguments again. The repo's own `.git/hooks/*` keep running: every hook name in
+githooks(5), client and server side, is a link in `githooks/` to `chain`, which runs the repo's own hook
+(`core.hooksPath` would otherwise switch them off).
 
 *How a review is bound to a commit.* OpenQodex identifies a review by a change id, sha256 of the base commit and
 the diff of the work tree (uncommitted and untracked files included), not by a commit. `prepush` requires a clean
@@ -320,8 +321,16 @@ that change id to the HEAD sha. Pushing another commit needs its own review.
 in the command (no parsing): `--no-verify` with `push`; `core.hooksPath` in a `git` command (`-c`, `--config-env`,
 `git config` writes; `git config --get core.hooksPath` is fine); `-c include.*` / `includeIf`; `GIT_CONFIG*`,
 `GIT_DIR`, `GIT_COMMON_DIR`, `HOME` or `XDG_CONFIG_HOME` assignments, `env -i`/`-u` or `unset` of them, with `git`;
-any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the gate's settings are Tim's); `install-githooks --uninstall`.
-It is a speed bump against an agent working around the gate, not a sandbox.
+any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the gate's settings are Tim's); `install-githooks --uninstall`;
+a write (`>`, `tee`, `sed -i`, `cp`, `mv`, `ln`, `rm`, ...) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`
+or `githooks/`. And a command with `git` and `push` is blocked unless `core.hooksPath` in the session's checkout
+is this repo's `githooks/`: a repo-local `core.hooksPath` (husky sets one) wins over the global one and would
+switch the gate off there, and with nothing installed no push passes. It is a speed bump against an agent
+working around the gate, not a sandbox: it sees only Bash commands (not Edit/Write), and only the session's
+checkout for the `core.hooksPath` check.
+
+**Deploying:** once this hook is live, every `git push` from Claude Code needs `install-githooks --global` (or
+`--repo`) to have been run and OpenQodex installed; until then pushes are blocked, which is the point.
 
 **Escape hatch (Tim only).** `REVIEW_GATE_PREPUSH=off` in the environment Claude Code itself runs in (e.g. `env` in
 `~/.claude/settings.json`, or exported before starting `claude`) lets both hooks through; git inherits it from

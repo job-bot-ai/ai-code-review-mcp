@@ -10,7 +10,8 @@ T="$(cd "$(mktemp -d)" && pwd -P)"   # physical path: macOS /var is a symlink to
 trap 'rm -rf "$T"' EXIT
 unset REVIEW_GATE_REQUIRED REVIEW_GATE_MIN
 export REVIEW_GATE_PRIMARY="kodus coderabbit"   # the date-based default is tested separately
-export GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+printf '[core]\n\thooksPath = %s\n' "$root/githooks" >"$T/gitconfig"   # the gate's hook, installed --global
+export GIT_CONFIG_GLOBAL="$T/gitconfig" GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
 pass=0; fail=0
 mkrepo() { # mkrepo <dir> <owner/repo>
@@ -473,6 +474,22 @@ for c in "git push" "git push -u origin feat" "git push --force-with-lease origi
   run "$T/a" "$c"
   expect "not a bypass: $c" 0
 done
+for c in "echo '[core] hooksPath = /x' >> .git/config" "sed -i 's/x/y/' ~/.gitconfig" "rm -rf .git/hooks" "cp x ~/.config/git/config" \
+  "ln -sf /dev/null /opt/x/githooks/pre-push"; do
+  run "$T/a" "$c"
+  expect "bypass blocked: $c" 2 stderr "writes a git config file or a hooks folder"
+done
+run "$T/a" "cat .git/config; grep url ~/.gitconfig"
+expect "reading git config files is fine" 0
+git -C "$T/a" config core.hooksPath .husky
+run "$T/a" "git push"
+expect "a repo-local core.hooksPath (husky) overriding the gate blocks the push" 2 stderr "would not run"
+git -C "$T/a" config core.hooksPath "$root/githooks"
+run "$T/a" "git push"
+expect "a repo-local core.hooksPath that is the gate's is fine" 0
+git -C "$T/a" config --unset core.hooksPath
+GIT_CONFIG_GLOBAL=/dev/null run "$T/a" "git push origin HEAD"
+expect "no core.hooksPath at all (gate not installed) blocks the push" 2 stderr "is unset"
 REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
 expect "Tim's REVIEW_GATE_PREPUSH=off (the hook's own environment) lets a bypass through" 0
 grep -q 'claude-hook' "$XDG_STATE_HOME/review-gate/prepush-bypass.log"; rc=$?

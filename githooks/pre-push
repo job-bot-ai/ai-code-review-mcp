@@ -2,8 +2,9 @@
 # git pre-push hook, installed with core.hooksPath (install-githooks). For every ref git is about to push it allows
 # the push only when `review-gate check-prepush` passes for the pushed commit: a finished OpenQodex review of exactly
 # that commit that passed (or whose findings were accepted with `prepush-accept`), given the current punch list.
-# Anything else blocks, review-gate failing in any way included. Not gated: deletes, tags and --dry-run. Tim's
-# switch: REVIEW_GATE_PREPUSH=off in the environment, logged. The repo's own .git/hooks/pre-push (which
+# Anything else blocks, review-gate failing in any way included. Not gated: deletes and tags. git runs this hook
+# for `git push --dry-run` too and doesn't say it is one; telling would mean parsing the push's arguments, which
+# this design avoids, so a dry run is checked like a push (it sends nothing either way). Tim's switch: REVIEW_GATE_PREPUSH=off in the environment, logged. The repo's own .git/hooks/pre-push (which
 # core.hooksPath would otherwise switch off) still runs after the checks pass.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
 set -uo pipefail
@@ -12,25 +13,7 @@ here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 gate="$here/../review-gate"
 input="$(cat)"
 
-# git runs this hook for `git push --dry-run` too, which sends nothing: read the push's own arguments (Linux /proc;
-# elsewhere a dry run is gated like a push). Only options before `--` count.
-# The last of --dry-run/-n (or an abbreviation) and --no-dry-run wins, as in git; anything else is a real push.
-dry_run() {
-  local a d=1
-  [ -r "/proc/$PPID/cmdline" ] || return 1
-  while IFS= read -r -d '' a; do
-    case "$a" in
-      --) break ;;
-      -n|--d|--dr|--dry|--dry-|--dry-r|--dry-ru|--dry-run) d=0 ;;
-      --no-d*) d=1 ;;
-    esac
-  done <"/proc/$PPID/cmdline"
-  return "$d"
-}
-
-if dry_run; then
-  :   # nothing is sent
-elif [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then
+if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then
   log="${XDG_STATE_HOME:-$HOME/.local/state}/review-gate/prepush-bypass.log"
   mkdir -p "$(dirname "$log")" && printf '%s\tgit-hook\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" \
     "$(printf '%s' "$input" | tr '\n' ' ' | cut -c1-300)" >>"$log"

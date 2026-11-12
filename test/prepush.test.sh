@@ -61,13 +61,7 @@ expect "a delete is not gated" 0
 git -C "$W" tag v1 && push -q origin v1
 expect "a tag is not gated" 0
 push -q --dry-run origin feat
-expect "--dry-run is not gated (git runs the hook for it; nothing is sent)" 0
-push -q -n origin feat
-expect "-n is not gated either" 0
-push -q --dry-run --no-dry-run origin feat
-expect "--dry-run undone by a later --no-dry-run is a real push (gated)" 1 "BLOCKED"
-push -q --dry-run origin -- feat
-expect "--dry-run before -- still counts" 0
+expect "--dry-run is checked like a push (git runs the hook and doesn't say it's a dry run)" 1 "BLOCKED"
 
 # ── blocked, and prepush-accept ──
 STUB_OQ=blocked prepush

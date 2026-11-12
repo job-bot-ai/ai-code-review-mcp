@@ -13,8 +13,8 @@
 # with existing settings.json entries.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
 #
-# Fail-open by design: any unexpected error exits non-2 so it never wedges the shell;
-# only a genuine "no green light" condition returns exit 2 (which blocks the tool call).
+# Fail-open where it can't tell (no jq, review-gate's "nothing to gate"), so it never wedges the shell; a genuine
+# "no green light", a bypass, and any unexpected review-gate exit code return exit 2 (which blocks the tool call).
 
 input="$(cat)"
 
@@ -33,6 +33,9 @@ fi
 [ -n "$cmd" ] || exit 0
 
 # ── Ways around the git pre-push hook: a fixed list, matched anywhere in the command (no parsing) ──
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+session_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)"
+[ -n "$session_cwd" ] && [ -d "$session_cwd" ] || session_cwd="$PWD"
 bypass_check() {
   local why="" log
   if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then   # Tim's switch, set in Claude Code's own environment
@@ -58,6 +61,18 @@ bypass_check() {
     why="it clears HOME/XDG_CONFIG_HOME/GIT_* for git: git would read another config, without the hook."
   elif m 'install-githooks' && m '--uninstall'; then
     why="it uninstalls the pre-push hook."
+  elif m '(\.gitconfig|\.git/config|git/config|\.git/hooks|/githooks/)' && m '(>|(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod)([^[:alnum:]_-]|$))'; then
+    why="it writes a git config file or a hooks folder directly."
+  elif m "$git" && m "$push"; then
+    # A repo-local core.hooksPath (husky sets one) wins over the global one: the gate's hook would not run there.
+    local want got
+    want="$(realpath "$here/../githooks" 2>/dev/null)"
+    got="$(git -C "$session_cwd" config --get core.hooksPath 2>/dev/null || true)"
+    case "$got" in "~/"*) got="$HOME/${got#\~/}" ;; esac
+    [ -n "$got" ] && case "$got" in /*) ;; *) got="$(git -C "$session_cwd" rev-parse --show-toplevel 2>/dev/null)/$got" ;; esac
+    [ -n "$got" ] && got="$(realpath -m "$got")"
+    [ "$got" = "$want" ] ||
+      why="core.hooksPath in $session_cwd is ${got:-unset}, not $want, so git's pre-push review hook would not run (install-githooks --global; a repo-local core.hooksPath, as husky sets, overrides it)."
   fi
   [ -z "$why" ] && return 0
   echo "BLOCKED by the pre-push review gate: $why Push with a plain \`git push\`: the git hook checks the OpenQodex review (review-gate prepush). If the gate is wrong, stop and ask Tim." >&2
@@ -76,7 +91,6 @@ bypass_check
 # (`\n`/`\t` escapes count as separators: `printf 'cd x\ngh pr create' | bash`.)
 printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new|ready)([^[:alnum:]_-]|$)|markPullRequestReadyForReview' || exit 0
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"
 
 # Fail-open if the gate helper is missing/unreadable — never wedge the shell.
@@ -85,8 +99,6 @@ gate="$here/../review-gate"
 # Which checkout(s) do the PR(s) come from? Not necessarily the session's cwd: the
 # resolver follows `cd` before each `gh pr create`, checks `--repo` against that checkout's
 # remotes and prefers the worktree holding `--head` (resolve-pr-target.mjs).
-session_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)"
-[ -n "$session_cwd" ] && [ -d "$session_cwd" ] || session_cwd="$PWD"
 # The session's checkout (its toplevel), so a session in a subdirectory or via a symlink
 # isn't told it was "gated on another repo".
 session_top="$(git -C "$session_cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$session_cwd")"

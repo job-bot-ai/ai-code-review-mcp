@@ -1,5 +1,5 @@
 #!/bin/sh
-# Every other client hook in this core.hooksPath folder is a link to this file: it runs the repo's own
+# Every other hook githooks(5) lists (client and server side) is a link to this file: it runs the repo's own
 # .git/hooks/<name>, which setting core.hooksPath would otherwise switch off.
 h="$(git rev-parse --git-common-dir)/hooks/$(basename "$0")"
 [ -x "$h" ] && exec "$h" "$@"

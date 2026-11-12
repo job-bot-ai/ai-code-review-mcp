@@ -224,7 +224,7 @@ run_prepush() {
     cap=(systemd-run --scope --quiet --collect -p "MemoryMax=$mem" -p "MemorySwapMax=${REVIEW_GATE_OPENQODEX_SWAP:-256M}" --)
   fi
   rid="$(repo_id "$top")"; lr="$OQ_HOME/last-review/$rid/last-review.json"
-  start="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+  start="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"   # OpenQodex writes ms; a record of an earlier run never counts
   echo "review-gate: OpenQodex $OQ_VERSION reviewing ${head:0:12} vs $base (${off[*]:-online}, memory cap $mem, punch list @ $(sed -n 's/^#ref //p' "$list" | cut -c1-12))..." >&2
   # Never `review --agent` (the coding agent reviewing its own work): only OpenQodex's own reviewer counts.
   (cd "$top" && OPENQODEX_AUTO_UPDATE=0 ${cap[@]+"${cap[@]}"} bash -c '"$@"; rc=$?
