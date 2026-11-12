@@ -73,7 +73,7 @@ bypass_check() {
   elif m "$git" && m "$push"; then
     # A repo-local core.hooksPath (husky sets one) wins over the global one: the gate's hook would not run there.
     local want got
-    want="$(realpath "$here/../githooks" 2>/dev/null)"
+    want="$(realpath -e "$here/../githooks" 2>/dev/null)"   # empty when githooks/ is missing: then nothing passes
     got="$(git -C "$session_cwd" config --get core.hooksPath 2>/dev/null || true)"
     case "$got" in "~/"*) got="$HOME/${got#\~/}" ;; esac
     [ -n "$got" ] && case "$got" in /*) ;; *) got="$(git -C "$session_cwd" rev-parse --show-toplevel 2>/dev/null)/$got" ;; esac
