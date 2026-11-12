@@ -550,6 +550,19 @@ for c in "echo \$(echo 'exit 0' > .git/hooks/pre-push)" "git push \$(cp x ~/.git
   run "$T/a" "$c"
   expect "bypass blocked (nested or appended write): $c" 2 stderr "BLOCKED by the pre-push review gate"
 done
+# Review of 8fe0ae7: code fed to a shell on stdin is checked; >| is a redirect.
+for c in "bash <<EOF
+cp x .git/hooks/pre-push
+EOF" "sh <<'EOF'
+PATH=/x git push
+EOF" "/bin/bash <<< 'echo exit > githooks/pre-push'" "echo x >| ~/.gitconfig"; do
+  run "$T/a" "$c"
+  expect "bypass blocked (shell stdin, >|): $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+run "$T/a" "cat <<EOF > /tmp/notes
+cp x .git/hooks/pre-push is now blocked
+EOF"
+expect "a heredoc for cat (data, not code) that mentions a hooks write is not a bypass" 0
 # Without node (or when the tokenizer fails) the hook falls back to a cruder split that errs toward blocking.
 mkdir -p "$T/crude/hooks" && cp "$hook" "$root/hooks/resolve-pr-target.mjs" "$T/crude/hooks/" && cp "$gate" "$T/crude/"
 for c in "echo 'exit 0' > \"\$(echo /x)/githooks/pre-push\"" "git -c core.hooks\$(true; echo Path)=/dev/null push" "BASH_ENV=/tmp/x git push"; do

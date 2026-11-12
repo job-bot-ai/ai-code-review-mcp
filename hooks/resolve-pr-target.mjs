@@ -287,6 +287,7 @@ export function tokenize(src) {
       // A redirection starts its own word, glued to its target (`>/dev/null`, `>&1`).
       push(); add(c); i += 1;
       if (src[i] === '&') { add('&'); i += 1; }
+      else if (c === '>' && src[i] === '|') { add('|'); i += 1; } // >| (clobber): a redirect, not a pipe
       continue;
     }
     if (c === '~' && word === null) { add('~'); tilde = true; i += 1; continue; }
@@ -302,7 +303,7 @@ export function tokenize(src) {
 const OPENERS = new Set(['if', 'while', 'until', 'for', 'select', 'case']);
 const CLOSERS = new Set(['fi', 'done', 'esac']);
 const CONTINUERS = new Set(['then', 'else', 'elif', 'do', '!', 'time']);
-const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash']);
+export const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh']);
 // git subcommands that can change which commit HEAD is (so the reviewed commit isn't the PR's).
 const HEAD_MOVERS = new Set(['commit', 'merge', 'rebase', 'reset', 'cherry-pick', 'revert', 'pull', 'am', 'checkout', 'switch']);
 const RUNNERS = new Set(['exec', 'env', 'sudo', 'nohup', 'xargs', 'nice', 'timeout']);

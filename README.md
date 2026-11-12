@@ -358,7 +358,8 @@ push, any `-c` but `credential.helper=...`, and `--config-env`. Quotes and backs
 and two conditions that belong to one command must hold in the same command. The command line is split by the
 hook's own shell tokenizer (`hooks/command-segments.mjs`, on `resolve-pr-target.mjs`'s `tokenize`): at `;`, `&`,
 `|`, `&&`, `||`, parentheses and newlines **outside** quotes, heredocs, `$(...)` and backticks, with the body of each
-substitution checked as a command of its own and redirect targets read as whole words. So
+substitution, and of code fed to a shell on stdin (`bash <<EOF`, `sh <<< ...`, `eval`/`source`), checked as
+commands of their own, and redirect targets (`>`, `>>`, `>|`, `&>`) read as whole words. So
 `git -c user.name=x commit && git push`, `git log > f; cat .git/hooks/x` and Claude Code's usual heredoc commit
 message (`git commit -m "$(cat <<'EOF' ... -> .git/hooks ... EOF)" && git push`) aren't read as writes, while
 `> "$(pwd)/githooks/pre-push"` and `echo $(cp x ~/.gitconfig)` are. Without node, or when the tokenizer can't read
