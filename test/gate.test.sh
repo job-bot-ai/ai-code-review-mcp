@@ -21,7 +21,7 @@ mkrepo() { # mkrepo <dir> <owner/repo>
 # `check` also needs the pre-push review the git hook needs (test/prepush.test.sh tests it): a stubbed OpenQodex
 # review of HEAD, with the punch list from a stubbed gh.
 export OPENQODEX_HOME="$T/oqhome" REVIEW_GATE_OPENQODEX="$root/test/stub/openqodex" REVIEW_GATE_OPENQODEX_MEMORY=off
-export PUNCH_FIXTURE="$T/punch" XDG_STATE_HOME="$T/state"; unset GH_TOKEN STUB_OQ PUNCH_FAIL REVIEW_GATE_PREPUSH
+export PUNCH_FIXTURE="$T/punch" REVIEW_GATE_BYPASS_LOG="$T/state/review-gate/prepush-bypass.log"; unset GH_TOKEN STUB_OQ PUNCH_FAIL REVIEW_GATE_PREPUSH
 mkdir -p "$T/punch/review" && echo '- 1.1 an item' >"$T/punch/review/PUNCH_LIST.md"
 stubgh="$root/test/stub/gh"; export REVIEW_GATE_GH="$stubgh"
 prepushed() { # the default branch on origin holds the base commit
@@ -518,6 +518,20 @@ for c in "HOME=/tmp npm test; git status" "git log --oneline > /tmp/x; cat .git/
   run "$T/a" "$c"
   expect "not a bypass: $c" 0
 done
+# Review of 97a58fa: words built with $( or backticks span segments; bash startup inputs; where a waiver is logged.
+for c in "git -c core.hooks\$(echo Path)=/dev/null push" "git -c core.hooks\$(true; echo Path)=/dev/null push" "echo 'exit 0' > \"\$(pwd)/githooks/pre-push\"" \
+  "cp /tmp/x \"\$(pwd)/githooks/pre-push\"" "chmod -x \$(pwd)/githooks/pre-push" "cp x \"\$(echo ~)/.gitconfig\"" \
+  "echo 'exit 0' > \"\$(echo /root/ai-code-review-mcp)/githooks/pre-push\"" "cp x \`pwd\`/githooks/pre-push" \
+  "BASH_ENV=/tmp/x.sh git push" "ENV=/tmp/x.sh git push" "cat(){ :; }; export -f cat; git push" "declare -fx cat; git push" \
+  "SHELLOPTS=xtrace git push" "BASHOPTS=x git push" "BASH_FUNC_cat%%='() { :; }' git push" "LD_PRELOAD=/tmp/x.so git push" \
+  "a=accept; XDG_STATE_HOME=/tmp/q bash review-gate prepush-\$a --reason 'false positive here'" "export XDG_STATE_HOME=/tmp/q; git push"; do
+  run "$T/a" "$c"
+  expect "bypass blocked: $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+for c in "echo \$(git rev-parse HEAD) > /tmp/h" "XDG_STATE_HOME=/tmp/q npm test; git status" "declare -f cat; git status"; do
+  run "$T/a" "$c"
+  expect "not a bypass: $c" 0
+done
 REVIEW_GATE_PREPUSH=off run "$T/a" "bash review-gate prepush-accept --reason 'declined by Tim: covered elsewhere'"
 expect "prepush-accept goes through when Tim set REVIEW_GATE_PREPUSH=off" 0
 git -C "$T/a" config core.hooksPath .husky
@@ -535,10 +549,10 @@ out="$(printf '%s' "$payload" | GIT_CONFIG_GLOBAL=/dev/null bash "$T/nohooks/hoo
 expect "with no githooks/ next to the hook and no core.hooksPath, a push is still blocked" 2 stderr "would not run"
 REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
 expect "Tim's REVIEW_GATE_PREPUSH=off (the hook's own environment) lets a bypass through" 0
-grep -q 'claude-hook' "$XDG_STATE_HOME/review-gate/prepush-bypass.log"; rc=$?
+grep -q 'claude-hook' "$REVIEW_GATE_BYPASS_LOG"; rc=$?
 expect "and logs it" 0
 : >"$T/notadir"
-XDG_STATE_HOME="$T/notadir" REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
+REVIEW_GATE_BYPASS_LOG="$T/notadir/x.log" REVIEW_GATE_PREPUSH=off run "$T/a" "git push --no-verify"
 expect "the switch doesn't work when the bypass can't be logged" 2 stderr "--no-verify skips"
 
 # An unexpected exit code from review-gate check never passes the PR gate.

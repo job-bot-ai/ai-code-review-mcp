@@ -8,7 +8,7 @@ gate="$root/review-gate"
 T="$(mktemp -d)" && T="$(cd "$T" && pwd -P)" && [ -n "$T" ] || exit 1
 trap 'rm -rf "$T"' EXIT
 export GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
-export OPENQODEX_HOME="$T/oqhome" XDG_STATE_HOME="$T/state"
+export OPENQODEX_HOME="$T/oqhome" REVIEW_GATE_BYPASS_LOG="$T/state/review-gate/prepush-bypass.log"
 export REVIEW_GATE_OPENQODEX="$root/test/stub/openqodex" REVIEW_GATE_GH="$root/test/stub/gh"
 export REVIEW_GATE_OPENQODEX_MEMORY=off PUNCH_FIXTURE="$T/punch" STUB_OQ_ARGS="$T/oq-args"
 unset GH_TOKEN STUB_OQ PUNCH_FAIL PUNCH_CORRUPT PUNCH_REF REVIEW_GATE_PREPUSH REVIEW_GATE_BLOCK_ON REVIEW_GATE_PUNCH_REPO \
@@ -258,10 +258,10 @@ expect "the review runs in a systemd scope with a memory cap" 0
 change seven
 REVIEW_GATE_PREPUSH=off push -q origin feat
 expect "REVIEW_GATE_PREPUSH=off lets an unreviewed push through, announced" 0 "pre-push gate is OFF"
-grep -q 'git-hook' "$XDG_STATE_HOME/review-gate/prepush-bypass.log"; rc=$?
+grep -q 'git-hook' "$REVIEW_GATE_BYPASS_LOG"; rc=$?
 expect "and the bypass is logged" 0
 : >"$T/notadir"
-XDG_STATE_HOME="$T/notadir" REVIEW_GATE_PREPUSH=off push -q origin HEAD:refs/heads/unlogged
+REVIEW_GATE_BYPASS_LOG="$T/notadir/x.log" REVIEW_GATE_PREPUSH=off push -q origin HEAD:refs/heads/unlogged
 expect "the switch doesn't work when the bypass can't be logged" 1 "can't be logged"
 mkdir -p "$T/broken/githooks" && cp "$root/githooks/pre-push" "$T/broken/githooks/"
 printf '#!/bin/sh\nexit 7\n' >"$T/broken/review-gate"
@@ -295,6 +295,28 @@ expect "and nothing from that PATH ran (the hook's #!/bin/bash and fixed PATH)" 
 out="$(cd "$W" && PATH="$T/evil:$PATH" /bin/bash "$gate" check-prepush 2>&1)"; rc=$?
 [ ! -e "$T/evil-ran" ] || rc=9
 expect "review-gate itself ignores PATH (its fixed PATH)" 1 "run \`review-gate prepush\`"
+# bash's own startup inputs (review of 97a58fa): #!/bin/bash -p and /bin/bash -p for review-gate ignore them.
+printf 'exit 0\n' >"$T/benv.sh"
+out="$(cd "$W" && BASH_ENV="$T/benv.sh" git push -q origin feat 2>&1)"; rc=$?
+expect "BASH_ENV=<a file that exits 0> git push still blocks an unreviewed commit" 1 "BLOCKED"
+out="$(cd "$W" && cat() { :; } && export -f cat && git push -q origin feat 2>&1)"; rc=$?
+expect "an exported cat function (the hook reads no refs) still blocks" 1 "BLOCKED"
+out="$(cd "$W" && jq() { return 0; } && export -f jq && GIT_TRACE= /bin/bash -c "printf '%s\n' 'refs/heads/feat $(git rev-parse HEAD) refs/heads/feat 0000000000000000000000000000000000000000' | '$root/githooks/pre-push' origin x" 2>&1)"; rc=$?
+expect "an exported jq function doesn't reach review-gate" 1 "BLOCKED"
+out="$(cd "$W" && BASH_ENV="$T/benv.sh" "$gate" check-prepush 2>&1)"; rc=$?
+expect "review-gate run directly ignores BASH_ENV (#!/bin/bash -p)" 1 "run \`review-gate prepush\`"
+
+# ── files under .openqodex/ are outside OpenQodex's review and change id (review of 97a58fa) ──
+git -C "$W" reset -q --hard HEAD~1; prepush   # HEAD reviewed again
+reviewed="$(git -C "$W" rev-parse HEAD)"; pd="$W/$(git -C "$W" rev-parse --git-common-dir)/review-gate-prepush"
+mkdir -p "$W/.openqodex" && echo 'echo unreviewed' >"$W/.openqodex/run.sh"
+git -C "$W" add -f .openqodex/run.sh && git -C "$W" commit -q -m state
+prepush
+expect "prepush refuses a change that commits files under .openqodex/" 4 "files under .openqodex/"
+jq --arg s "$(git -C "$W" rev-parse HEAD)" '.sha = $s' "$pd/$reviewed.json" >"$pd/$(git -C "$W" rev-parse HEAD).json"
+push -q origin feat
+expect "a record moved onto it (same change id) still blocks the push" 1 "files under .openqodex/"
+rm -f "$pd/$(git -C "$W" rev-parse HEAD).json"; git -C "$W" reset -q --hard HEAD~1; change nine-again
 
 # ── the punch list must fit OpenQodex's limits: checked before the review (deep review #26) ──
 mkdir -p "$T/punch-big/review"; head -c 33000 /dev/zero | tr '\0' 'x' >"$T/punch-big/review/PUNCH_LIST.md"
@@ -320,16 +342,19 @@ expect "an OpenQodex that never returns is stopped (exit 4)" 4 "didn't finish wi
 prepush
 expect "and the next prepush is not locked out, though a reviewer it started still runs" 0 "pre-push review passed"
 kill "$(cat "$OPENQODEX_HOME/orphan.pid")" 2>/dev/null
+STUB_OQ=killed prepush
+expect "a SIGKILL (the memory cap) is reported as that, naming MemoryMax" 4 "MemoryMax"
 
 # ── prepush-accept is logged with the bypasses ──
 change ten; STUB_OQ=blocked prepush
-XDG_STATE_HOME="$T/notadir" bash -c "cd '$W' && bash '$gate' prepush-accept --reason 'declined: covered by an upstream check'" >"$T/acc" 2>&1; rc=$?; out="$(cat "$T/acc")"
+REVIEW_GATE_BYPASS_LOG="$T/notadir/x.log" bash -c "cd '$W' && bash '$gate' prepush-accept --reason 'declined: covered by an upstream check'" >"$T/acc" 2>&1; rc=$?; out="$(cat "$T/acc")"
 expect "prepush-accept refuses when it can't log the acceptance" 2 "never silent"
 push -q origin feat
 expect "so the findings still block" 1 "OpenQodex blocked it"
-out="$(cd "$W" && bash "$gate" prepush-accept --reason "declined: covered by an upstream check" 2>&1)"; rc=$?
-grep -q $'\tprepush-accept\t.*declined: covered by an upstream check' "$XDG_STATE_HOME/review-gate/prepush-bypass.log" || rc=9
-expect "prepush-accept writes the acceptance to the bypass log" 0 "logged to"
+out="$(cd "$W" && XDG_STATE_HOME="$T/q" HOME="$T/q" bash "$gate" prepush-accept --reason "declined: covered by an upstream check" 2>&1)"; rc=$?
+grep -q $'\tprepush-accept\t.*declined: covered by an upstream check' "$REVIEW_GATE_BYPASS_LOG" || rc=9
+[ ! -e "$T/q" ] || rc=8
+expect "prepush-accept writes the acceptance to the bypass log, wherever XDG_STATE_HOME/HOME point" 0 "logged to"
 
 # ── install-githooks ──
 git init -q "$T/inst"

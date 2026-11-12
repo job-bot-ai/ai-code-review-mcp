@@ -39,7 +39,8 @@ session_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)
 bypass_check() {
   local why="" log
   if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then   # Tim's switch, set in Claude Code's own environment
-    log="${XDG_STATE_HOME:-$HOME/.local/state}/review-gate/prepush-bypass.log"
+    local uhome; eval "uhome=~$(id -un)"   # the passwd entry, not HOME/XDG_STATE_HOME (review-gate's bypass_log)
+    log="${REVIEW_GATE_BYPASS_LOG:-$uhome/.local/state/review-gate/prepush-bypass.log}"
     # A bypass is never silent: when it can't be logged, the checks below apply.
     { mkdir -p "$(dirname "$log")" &&
       printf '%s\tclaude-hook\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%s' "$cmd" | tr '\n\t' '  ' | cut -c1-300)" >>"$log"; } 2>/dev/null &&
@@ -50,9 +51,12 @@ bypass_check() {
   m() { printf '%s' "$c" | grep -Eq -- "$1"; }
   mi() { printf '%s' "$c" | grep -Eqi -- "$1"; }
   local git='(^|[^[:alnum:]_.-])git([^[:alnum:]_-]|$)' push='(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'
-  # Segments: the command cut at ; & | ( ) ` and newlines (still no parsing). Two things that must hold in the same
+  # Segments: the command cut at ; & | and newlines (still no parsing). Two things that must hold in the same
   # segment, so `git -c x=y commit && git push` or `git log > f; cat .git/hooks/x` aren't read as one command.
-  local segs; segs="$(printf '%s' "$c" | tr ';&|()`' '\n\n\n\n\n\n')"
+  # With a $( or a backtick anywhere, words are built at run time across segments: the whole command is one segment.
+  local segs dyn=0
+  if printf '%s' "$c" | grep -q '\$(\|`'; then dyn=1; segs="$(printf '%s' "$c" | tr '\n' ' ')"
+  else segs="$(printf '%s' "$c" | tr ';&|' '\n\n\n')"; fi
   seg2() { local l; while IFS= read -r l; do printf '%s' "$l" | grep -Eq -- "$1" && printf '%s' "$l" | grep -Eq -- "$2" && return 0; done <<<"$segs"; return 1; }
   seg_push_c() { local l; while IFS= read -r l; do printf '%s' "$l" | grep -Eq -- "$git" && printf '%s' "$l" | grep -Eq -- "$push" &&
     printf '%s' "$l" | grep -Pq -- '(^|[^\w.-])git(\s+(-C\s+\S+|-c\s+credential\.helper=\S*(\s+[^-\s]\S*)*|--?[\w-]+(=\S*)?))*\s+(-c\s+(?!credential\.helper=)|--config-env)' &&
@@ -61,7 +65,9 @@ bypass_check() {
   # (or another bash for the hook). An assignment to one of them counts unless it is plainly temporary, for one
   # command that is not git or the gate (`HOME=/tmp npm test; git status`). Cut at ; & | only, on the command as
   # written: quotes, escapes, $( and backticks in that segment mean it can't tell, so it counts.
-  local ev='(GIT_CONFIG[[:alnum:]_]*|GIT_DIR|GIT_COMMON_DIR|HOME|XDG_CONFIG_HOME|PATH)'
+  # Also bash's own startup inputs (the hooks run bash -p, which ignores most of them; this is the second line), the
+  # dynamic loader, and XDG_STATE_HOME (where a waiver used to be logged).
+  local ev='(GIT_CONFIG[[:alnum:]_]*|GIT_DIR|GIT_COMMON_DIR|HOME|XDG_CONFIG_HOME|XDG_STATE_HOME|PATH|BASH_ENV|ENV|BASH_FUNC_[^[:space:]=]*|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH)'
   env_reaches_git() {
     local l lc
     while IFS= read -r l; do
@@ -95,12 +101,15 @@ bypass_check() {
   elif m "$git" && m '(^|[^[:alnum:]_-])config([[:space:]]+[^;&|]*)?[[:space:]](--remove-section|--rename-section|--edit|-e)([[:space:]]|$)'; then
     why="it edits or removes git config sections, which can drop core.hooksPath."
   elif { m "$git" || m 'review.gate'; } && env_reaches_git; then
-    why="it overrides GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME, XDG_CONFIG_HOME or PATH for git or the gate: another config or another git/bash, without the hook."
+    why="it overrides GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME, XDG_*, PATH, BASH_ENV/ENV/SHELLOPTS/BASHOPTS/BASH_FUNC_* or LD_* for git or the gate: another config, another git/bash, or code run before the hook."
+  elif { m "$git" || m 'review.gate'; } && m '(^|[^[:alnum:]_])(export[[:space:]]+-[[:alnum:]]*f|(declare|typeset)[[:space:]]+-[[:alnum:]]*(fx|xf))'; then
+    why="it exports a shell function (export -f): bash would run it in place of a command the hooks call."
   elif m "$git" && m '(^|[^[:alnum:]_-])(env[[:space:]]+(-[[:alpha:]]*[iu]|--ignore-environment|--unset)|unset[[:space:]]+[^;&|]*(HOME|XDG_CONFIG_HOME|GIT_))'; then
     why="it clears HOME/XDG_CONFIG_HOME/GIT_* for git: git would read another config, without the hook."
   elif m 'install-githooks' && m '--uninstall'; then
     why="it uninstalls the pre-push hook."
-  elif seg2 "(^|[^0-9&>])>>?\|?[[:space:]]*[^[:space:]]*$protp" . || seg2 "$prot" "$tool" ||
+  elif { [ "$dyn" = 1 ] && m "$prot" && m "((^|[^0-9&>])>|$tool)"; } ||   # a built word: any write, any protected path
+       seg2 "(^|[^0-9&>])>>?\|?[[:space:]]*[^[:space:]]*$protp" . || seg2 "$prot" "$tool" ||
        { m "((^|[^0-9&>])>|$tool)" && { seg2 "$prot" '(^|[^[:alnum:]_])(cd|pushd)[[:space:]]' || seg2 "[[:alnum:]_]\+?=[^[:space:]]*$protp" .; }; }; then
     # a redirect or a writing tool on the path in the same segment; or a cd into it / a variable holding it, and a write
     why="it writes a git config file, a hooks folder, or a pre-push review record (review-gate-prepush/, .openqodex/) directly."

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # review-gate — record/verify per-reviewer "green light" passes bound to the current git HEAD.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
 #
@@ -31,6 +31,7 @@
 # `agy` stays valid for old records. `kimi` (the retired DeepSeek/kimi-review pass) is no longer a
 # reviewer: a leftover kimi marker is ignored by `check`/`status` and never counts as a pass.
 set -euo pipefail
+# bash -p (the #! line): BASH_ENV, ENV, SHELLOPTS, BASHOPTS and exported functions from the caller are ignored.
 # A fixed PATH: a `PATH=` prefix must not swap git, jq, gh, systemd-run or timeout for look-alikes that write
 # OpenQodex-shaped records without a review. Test seams are REVIEW_GATE_* variables, which are Tim's (README).
 PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"; export PATH
@@ -92,7 +93,16 @@ oq_change_id() {
       --inter-hunk-context=0 --ignore-submodules=none --submodule=short --raw -z --no-abbrev "$1" "$2" -- ':(top,exclude).openqodex'
   } | sha256sum | cut -d' ' -f1
 }
-bypass_log() { printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/review-gate/prepush-bypass.log"; }
+# The bypass log is at a fixed place, from the user's passwd entry (~user), never from HOME or XDG_STATE_HOME: a
+# caller must not be able to send a waiver to a throwaway file. REVIEW_GATE_BYPASS_LOG (Tim's, like every
+# REVIEW_GATE_* setting) moves it.
+bypass_log() {
+  local h; eval "h=~$(id -un)"
+  printf '%s' "${REVIEW_GATE_BYPASS_LOG:-$h/.local/state/review-gate/prepush-bypass.log}"
+}
+# Files under the top-level .openqodex/ are outside OpenQodex's change id and its review (its STATE_PATHSPEC): a
+# change that commits any is never a reviewed change.
+oq_state_files() { git diff --name-only "$1" "$2" -- ':(top).openqodex'; }
 # gh for the punch list, as job-bot-ai. The token lives in a variable that is not exported: it reaches gh's
 # environment only, never a command line, the output, or the OpenQodex reviewer.
 PUNCH_TOKEN="${GH_TOKEN:-}"
@@ -173,6 +183,8 @@ verify_prepush() {
   git merge-base --is-ancestor "$b" "$sha" 2>/dev/null || { bad "the reviewed base is not an ancestor of it"; return 1; }
   # The record names a change id; it must be OpenQodex's id of exactly <base>..<this commit>, worked out again here,
   # so a record copied or edited onto another commit never matches.
+  local st; st="$(oq_state_files "$b" "$sha" 2>/dev/null)" || st="(git diff failed)"
+  [ -z "$st" ] || { bad "it changes files under .openqodex/, which OpenQodex neither reviews nor counts in its change id: $(printf '%s' "$st" | head -n 3 | tr '\n' ' ')"; return 1; }
   local want; want="$(oq_change_id "$b" "$sha" 2>/dev/null)" || want=""
   [ -n "$want" ] && [ "$want" = "$(jq -r .change_id "$m")" ] ||
     { bad "the record's review (change $(jq -r .change_id "$m" | cut -c1-12)) is not of ${b:0:12}..${sha:0:12}, whose change id is ${want:0:12}"; return 1; }
@@ -248,6 +260,8 @@ run_prepush() {
   # OpenQodex reviews the work tree, so only a clean tree makes "the change" exactly the commit that is pushed.
   git check-ignore -q "$top/.openqodex/x" 2>/dev/null || { mkdir -p "$common/info"; echo '/.openqodex/' >>"$common/info/exclude"; }
   dirty && fail "the work tree is not clean: commit or stash first (the review must be of exactly the commit you push)"
+  local st mb; mb="$(git merge-base "$base" "$head")" && st="$(oq_state_files "$mb" "$head")" || fail "couldn't diff $base..HEAD"
+  [ -z "$st" ] || fail "the change commits files under .openqodex/, which OpenQodex neither reviews nor counts in its change id (remove them): $(printf '%s' "$st" | head -n 3 | tr '\n' ' ')"
   # The current punch list, checked against its git blob ids, copied where OpenQodex reads convention files.
   punch_list "$list" || fail "couldn't list the punch list on $PUNCH_REPO main (no review without it)"
   copy="$top/.openqodex/punch-list"; rm -rf "${copy:?}"; mkdir -p "$copy"
@@ -296,7 +310,8 @@ run_prepush() {
   { [ "$(git rev-parse HEAD)" = "$head" ] && ! dirty; } || fail "HEAD or the work tree changed while the review ran; review again"
   case "$rc" in
     0|1) ;;
-    124|137) fail "OpenQodex didn't finish within $((tmo + grace))s (--timeout $tmo plus $grace) and was stopped: the review did not finish" ;;
+    124) fail "OpenQodex didn't finish within $((tmo + grace))s (--timeout $tmo plus $grace) and was stopped: the review did not finish" ;;
+    137) fail "OpenQodex was killed (SIGKILL): most likely the memory cap, MemoryMax=$mem (REVIEW_GATE_OPENQODEX_MEMORY; see the peak memory above), or a kill from outside. The review did not finish" ;;
     *) fail "OpenQodex exited $rc: the review did not finish (incomplete, no reviewer that can start, or an error; see above). Fix that (reviewer login, --timeout) and run prepush again; never \`openqodex review --agent\`" ;;
   esac
   # The run that just ended: OpenQodex's last-review record (newer than our start), its report, and the receipt.
