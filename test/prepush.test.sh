@@ -12,7 +12,8 @@ export OPENQODEX_HOME="$T/oqhome" XDG_STATE_HOME="$T/state"
 export REVIEW_GATE_OPENQODEX="$root/test/stub/openqodex" REVIEW_GATE_GH="$root/test/stub/gh"
 export REVIEW_GATE_OPENQODEX_MEMORY=off PUNCH_FIXTURE="$T/punch" STUB_OQ_ARGS="$T/oq-args"
 unset GH_TOKEN STUB_OQ PUNCH_FAIL PUNCH_CORRUPT PUNCH_REF REVIEW_GATE_PREPUSH REVIEW_GATE_BLOCK_ON REVIEW_GATE_PUNCH_REPO \
-  REVIEW_GATE_OPENQODEX_OFFLINE REVIEW_GATE_OPENQODEX_SWAP REVIEW_GATE_PREPUSH_TIMEOUT
+  REVIEW_GATE_OPENQODEX_OFFLINE REVIEW_GATE_OPENQODEX_SWAP REVIEW_GATE_PREPUSH_TIMEOUT REVIEW_GATE_PREPUSH_GRACE \
+  REVIEW_GATE_SYSTEMD_RUN STUB_PR_BASE
 
 pass=0; fail=0
 ok()  { pass=$((pass + 1)); echo "ok   - $1"; }
@@ -58,13 +59,22 @@ expect "review-gate clear (the reviewer passes) leaves pre-push records alone" 0
 change base-a; push -q --no-verify origin feat; change base-b
 out="$(cd "$W" && bash "$gate" prepush --base origin/feat 2>&1)"; rc=$?
 push -q origin feat
-expect "a review against the branch's own remote tip (not the PR base) doesn't count" 1 "not on a remote branch other than feat"
+expect "a review against the branch's own remote tip (not the PR base) doesn't count" 1 "not on origin's default branch or the PR's base"
 change base-c   # base-b, HEAD~1 now, was never pushed
 out="$(cd "$W" && bash "$gate" prepush --base HEAD~1 2>&1)"; rc=$?
 push -q origin feat
-expect "a review against an unpushed HEAD~1 doesn't count" 1 "not on a remote branch other than feat"
+expect "a review against an unpushed HEAD~1 doesn't count" 1 "not on origin's default branch or the PR's base"
 prepush; push -q origin feat
 expect "the whole change against the PR base does" 0
+# Another branch the older commits went to is not a base (deep review #26: --base origin/older reviewed one commit).
+change base-d; push -q --no-verify origin HEAD~1:refs/heads/older2
+out="$(cd "$W" && bash "$gate" prepush --base origin/older2 2>&1)"; rc=$?
+push -q origin feat
+expect "a review against any other remote branch (not the default branch or the PR's base) doesn't count" 1 "not on origin's default branch or the PR's base"
+STUB_PR_BASE=older2 push -q origin feat
+expect "the same review counts when that branch is the PR's base (gh pr view)" 0
+push -q origin --delete older2 >/dev/null 2>&1
+prepush; push -q origin feat
 
 # ── one review at a time ──
 mkdir -p "$W/.git/review-gate-prepush"
@@ -199,6 +209,26 @@ expect "a review run with another block_on_severity doesn't count" 1 "block_on_s
 push -q origin feat
 expect "the untouched record passes" 0
 
+# A record copied to another commit and edited to name it (deep review #26: one jq command) is not that commit's review.
+change forged; reviewed="$(git -C "$W" rev-parse HEAD~1)"; new="$(git -C "$W" rev-parse HEAD)"; pd="${m%/*}"
+jq --arg s "$new" '.sha = $s' "$pd/$reviewed.json" >"$pd/$new.json"
+push -q origin feat
+expect "a record whose .sha was edited to another commit blocks (change id worked out again)" 1 "is not of"
+rm -f "$pd/$new.json"; git -C "$W" reset -q --hard HEAD~1
+
+# The change-id formula is OpenQodex 0.18.0's: real runs of it on this repository's own history (PR #26).
+real="ea23605fbddb58e31fdfb69a5379725caa87fa6f a0d7dc15ae0b1becf26ca9069dbb6398fa73563c 09cf59aa1de46ed069447e9280100790bef45ec76fa67e66700c185f9278cab6
+ea23605fbddb58e31fdfb69a5379725caa87fa6f 0cdd8f86f713054094deb9f97c3660a8643e0802 815c45560241525a2752ce5eba5f82083faa3a9697604c86e763211136ba0f2d
+ea23605fbddb58e31fdfb69a5379725caa87fa6f cf1ee35b577028df0f8642fbf3ef019b062a24b6 68a6ddba2a22c1819156338b5c59be8e0537fee75fafcc85f883ee6441a431bb"
+while read -r rb rh rid; do
+  if git -C "$root" cat-file -e "$rh^{commit}" 2>/dev/null && git -C "$root" cat-file -e "$rb^{commit}" 2>/dev/null; then
+    out="$(cd "$root" && bash "$gate" change-id "$rb" "$rh" 2>&1)"; [ "$out" = "$rid" ]; rc=$?
+    expect "change id of ${rh:0:7} matches a real OpenQodex 0.18.0 run" 0
+  else echo "skip - ${rh:0:7} is not in this clone (real-run change id check)"; fi
+done <<<"$real"
+STUB_OQ=wrongid prepush
+expect "a review OpenQodex recorded under another change id than the commit's fails at once" 4 "change id"
+
 # ── punch-list folder layout ──
 mkdir -p "$T/punch/review/punch-list"
 printf 'a\n' >"$T/punch/review/punch-list/01-check.md"; printf 'b\n' >"$T/punch/review/punch-list/02-errors.md"
@@ -222,7 +252,7 @@ git -C "$W" checkout -q f.txt
 mkdir -p "$T/bin"; printf '#!/bin/sh\necho "$@" >>"%s"\nwhile [ "$1" != -- ]; do shift; done; shift; exec "$@"\n' "$T/sdrun" >"$T/bin/systemd-run"
 chmod +x "$T/bin/systemd-run"
 change six
-PATH="$T/bin:$PATH" REVIEW_GATE_OPENQODEX_MEMORY=1G prepush
+REVIEW_GATE_SYSTEMD_RUN="$T/bin/systemd-run" REVIEW_GATE_OPENQODEX_MEMORY=1G prepush
 grep -q -- '--scope' "$T/sdrun" && grep -q 'MemoryMax=1G' "$T/sdrun" && grep -q 'MemorySwapMax=' "$T/sdrun" && [ "$rc" = 0 ]; rc=$?
 expect "the review runs in a systemd scope with a memory cap" 0
 change seven
@@ -253,6 +283,53 @@ expect "a repo hook linked back into githooks/ doesn't loop" 0
 rm -f "$W/.git/hooks/pre-commit"
 [ ! -e "$root/githooks/push-to-checkout" ]; rc=$?
 expect "no push-to-checkout link (its presence disables updateInstead)" 0
+
+# ── a PATH prefix (deep review #26): neither the hook nor review-gate runs a look-alike from it ──
+mkdir -p "$T/evil"
+for t in bash cat readlink sha256sum jq git systemd-run timeout; do printf '#!/bin/sh\necho %s >>"%s"\nexit 0\n' "$t" "$T/evil-ran" >"$T/evil/$t"; chmod +x "$T/evil/$t"; done
+change nine
+out="$(cd "$W" && PATH="$T/evil:$PATH" /usr/bin/git push -q origin feat 2>&1)"; rc=$?
+expect "PATH=<a bash that exits 0>:\$PATH git push still blocks an unreviewed commit" 1 "BLOCKED"
+[ ! -e "$T/evil-ran" ]; rc=$?; out="$(cat "$T/evil-ran" 2>/dev/null)"
+expect "and nothing from that PATH ran (the hook's #!/bin/bash and fixed PATH)" 0
+out="$(cd "$W" && PATH="$T/evil:$PATH" /bin/bash "$gate" check-prepush 2>&1)"; rc=$?
+[ ! -e "$T/evil-ran" ] || rc=9
+expect "review-gate itself ignores PATH (its fixed PATH)" 1 "run \`review-gate prepush\`"
+
+# ── the punch list must fit OpenQodex's limits: checked before the review (deep review #26) ──
+mkdir -p "$T/punch-big/review"; head -c 33000 /dev/zero | tr '\0' 'x' >"$T/punch-big/review/PUNCH_LIST.md"
+: >"$T/oq-args"
+PUNCH_FIXTURE="$T/punch-big" prepush
+expect "a single PUNCH_LIST.md over 32 KB fails at once, naming pr-orchestrator #21" 4 "pr-orchestrator #21"
+[ ! -s "$T/oq-args" ]; rc=$?
+expect "and OpenQodex never ran" 0
+mkdir -p "$T/punch-big/review/punch-list"
+for i in 01 02 03; do head -c 22000 /dev/zero | tr '\0' 'y' >"$T/punch-big/review/punch-list/$i-s.md"; done
+PUNCH_FIXTURE="$T/punch-big" prepush
+expect "sections over 64 KB in all fail at once" 4 "66000 bytes in all"
+head -c 40000 /dev/zero | tr '\0' 'y' >"$T/punch-big/review/punch-list/01-s.md"; rm -f "$T/punch-big/review/punch-list/"0[23]-s.md
+PUNCH_FIXTURE="$T/punch-big" prepush
+expect "one section over 32 KB fails at once" 4 "over 32 KB: 01-s.md (40000 bytes)"
+for i in 01 02; do head -c 29000 /dev/zero | tr '\0' 'y' >"$T/punch-big/review/punch-list/$i-s.md"; done
+PUNCH_FIXTURE="$T/punch-big" prepush
+expect "a list close to the 64 KB cap is reviewed, with a warning" 0 "WARNING: the punch list is 58000 of"
+
+# ── a hung OpenQodex: an outer timeout, and the lock is free again ──
+STUB_OQ=hang REVIEW_GATE_PREPUSH_TIMEOUT=1 REVIEW_GATE_PREPUSH_GRACE=1 prepush
+expect "an OpenQodex that never returns is stopped (exit 4)" 4 "didn't finish within 2s"
+prepush
+expect "and the next prepush is not locked out, though a reviewer it started still runs" 0 "pre-push review passed"
+kill "$(cat "$OPENQODEX_HOME/orphan.pid")" 2>/dev/null
+
+# ── prepush-accept is logged with the bypasses ──
+change ten; STUB_OQ=blocked prepush
+XDG_STATE_HOME="$T/notadir" bash -c "cd '$W' && bash '$gate' prepush-accept --reason 'declined: covered by an upstream check'" >"$T/acc" 2>&1; rc=$?; out="$(cat "$T/acc")"
+expect "prepush-accept refuses when it can't log the acceptance" 2 "never silent"
+push -q origin feat
+expect "so the findings still block" 1 "OpenQodex blocked it"
+out="$(cd "$W" && bash "$gate" prepush-accept --reason "declined: covered by an upstream check" 2>&1)"; rc=$?
+grep -q $'\tprepush-accept\t.*declined: covered by an upstream check' "$XDG_STATE_HOME/review-gate/prepush-bypass.log" || rc=9
+expect "prepush-accept writes the acceptance to the bypass log" 0 "logged to"
 
 # ── install-githooks ──
 git init -q "$T/inst"

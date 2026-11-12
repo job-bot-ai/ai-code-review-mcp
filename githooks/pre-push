@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # git pre-push hook, installed with core.hooksPath (install-githooks). For every ref git is about to push it allows
 # the push only when `review-gate check-prepush` passes for the pushed commit: a finished OpenQodex review of exactly
 # that commit that passed (or whose findings were accepted with `prepush-accept`), given the current punch list.
@@ -8,6 +8,10 @@
 # core.hooksPath would otherwise switch off) still runs after the checks pass.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
 set -uo pipefail
+# A fixed PATH (and /bin/bash above, not env): a `PATH=` prefix on `git push` must not swap bash, git or review-gate's
+# tools for look-alikes that exit 0. The repo's own hook gets the caller's PATH back.
+caller_path="$PATH"
+PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"; export PATH
 
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 gate="$here/../review-gate"
@@ -29,7 +33,7 @@ else
       blocked="$blocked  $lref -> $rref: not a commit
 "; continue
     fi
-    out="$(bash "$gate" check-prepush --rev "$sha" --branch "${rref#refs/heads/}" 2>&1)"; rc=$?
+    out="$(/bin/bash "$gate" check-prepush --rev "$sha" --branch "${rref#refs/heads/}" 2>&1)"; rc=$?
     if [ "$rc" -eq 0 ]; then
       [ -z "$out" ] || printf '%s\n' "$out" >&2   # accepted findings are announced, never hidden
     else
@@ -51,7 +55,7 @@ fi
 
 own="$(git rev-parse --git-common-dir)/hooks/pre-push"
 if [ -x "$own" ] && [ "$(readlink -f "$own")" != "$(readlink -f "${BASH_SOURCE[0]}")" ]; then
-  "$own" "$@" <<<"$input"   # not a pipe: a hook that exits without reading stdin must not turn into a failure
+  PATH="$caller_path" "$own" "$@" <<<"$input"   # not a pipe: a hook that exits without reading stdin must not turn into a failure
   exit $?
 fi
 exit 0

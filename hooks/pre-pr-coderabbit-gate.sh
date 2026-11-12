@@ -19,7 +19,7 @@
 input="$(cat)"
 
 # Fast path: if the payload can't possibly contain `gh ... pr ... create` or touch git or the gate, allow now.
-printf '%s' "$input" | grep -Eqi 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview|git|review_gate|openqodex|hookspath' || exit 0   # `gh pr new` is an alias
+printf '%s' "$input" | grep -Eqi 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview|git|review.gate|openqodex|hookspath' || exit 0   # `gh pr new` is an alias
 
 # Pull the actual command string out of tool_input.command. jq is required to isolate the
 # command from surrounding JSON reliably; without it, warn (not silent) and fail open
@@ -50,26 +50,60 @@ bypass_check() {
   m() { printf '%s' "$c" | grep -Eq -- "$1"; }
   mi() { printf '%s' "$c" | grep -Eqi -- "$1"; }
   local git='(^|[^[:alnum:]_.-])git([^[:alnum:]_-]|$)' push='(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'
+  # Segments: the command cut at ; & | ( ) ` and newlines (still no parsing). Two things that must hold in the same
+  # segment, so `git -c x=y commit && git push` or `git log > f; cat .git/hooks/x` aren't read as one command.
+  local segs; segs="$(printf '%s' "$c" | tr ';&|()`' '\n\n\n\n\n\n')"
+  seg2() { local l; while IFS= read -r l; do printf '%s' "$l" | grep -Eq -- "$1" && printf '%s' "$l" | grep -Eq -- "$2" && return 0; done <<<"$segs"; return 1; }
+  seg_push_c() { local l; while IFS= read -r l; do printf '%s' "$l" | grep -Eq -- "$git" && printf '%s' "$l" | grep -Eq -- "$push" &&
+    printf '%s' "$l" | grep -Pq -- '(^|[^\w.-])git(\s+(-C\s+\S+|-c\s+credential\.helper=\S*(\s+[^-\s]\S*)*|--?[\w-]+(=\S*)?))*\s+(-c\s+(?!credential\.helper=)|--config-env)' &&
+    return 0; done <<<"$segs"; return 1; }
+  # GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME, XDG_CONFIG_HOME, PATH: git reads another config, or runs another git
+  # (or another bash for the hook). An assignment to one of them counts unless it is plainly temporary, for one
+  # command that is not git or the gate (`HOME=/tmp npm test; git status`). Cut at ; & | only, on the command as
+  # written: quotes, escapes, $( and backticks in that segment mean it can't tell, so it counts.
+  local ev='(GIT_CONFIG[[:alnum:]_]*|GIT_DIR|GIT_COMMON_DIR|HOME|XDG_CONFIG_HOME|PATH)'
+  env_reaches_git() {
+    local l lc
+    while IFS= read -r l; do
+      lc="$(printf '%s' "$l" | tr -d "\"'\\\\")"
+      printf '%s' "$lc" | grep -Eq -- "(^|[^[:alnum:]_])$ev[[:space:]]*\\+?=" || continue
+      printf '%s' "$l" | grep -Eq -- "[\"'\\\\\`]|\\\$\\(" && return 0
+      printf '%s' "$lc" | grep -Eq -- "$git|review.gate" && return 0
+      printf '%s' "$lc" | grep -Eq -- '^[[:space:]]*(export|declare|typeset|readonly|local)([[:space:]]|$)' && return 0
+      printf '%s' "$lc" | grep -Eq -- '^[[:space:]]*([[:alpha:]_][[:alnum:]_]*\+?=[^[:space:]]*[[:space:]]*)+$' && return 0   # set for the rest
+    done <<<"$(printf '%s' "$cmd" | tr ';&|' '\n\n\n')"
+    return 1
+  }
+  # Files that hold git's config and hooks, and the pre-push review's records (the gate's and OpenQodex's own).
+  local prot='(\.gitconfig|\.git/config|git/config|\.git/hooks|(^|[^[:alnum:]_.-])githooks(/|$|[[:space:]])|review-gate-prepush|(^|[^[:alnum:]_-])\.openqodex(/|$|[[:space:]]))'
+  local protp='(\.gitconfig|\.git/config|git/config|\.git/hooks|githooks|review-gate-prepush|\.openqodex)'
+  local tool='(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod|install|rsync|dd)([^[:alnum:]_-]|$)'
   if m '(^|[^[:alnum:]_])(REVIEW_GATE_[[:alnum:]_]*|OPENQODEX_[[:alnum:]_]*)[[:space:]]*=' || m '(^|[^[:alnum:]_])REVIEW_GATE_PREPUSH([^[:alnum:]_]|$)'; then
     why="it sets a REVIEW_GATE_* / OPENQODEX_* variable. The gate's settings, and the REVIEW_GATE_PREPUSH=off switch, are Tim's."
+  elif m '(^|[^[:alnum:]_.-])review.gate([[:space:]]+[^;&|]*)?[[:space:]]prepush-accept([^[:alnum:]_-]|$)'; then
+    why="prepush-accept declines OpenQodex's findings instead of fixing them: that waiver is Tim's call (REVIEW_GATE_PREPUSH=off in Claude Code's environment), never the agent's. Fix the findings and run \`review-gate prepush\` again."
   elif m "$git" && m '--no-ve'; then   # any git command: an alias can be a push
     why="--no-verify skips git's hooks, the pre-push review hook among them."
-  elif m "$git" && m "$push" && printf '%s' "$c" | grep -Pq -- '(^|[^\w.-])git(\s+(-C\s+\S+|-c\s+credential\.helper=\S*(\s+[^-\s]\S*)*|--?[\w-]+(=\S*)?))*\s+(-c\s+(?!credential\.helper=)|--config-env)'; then
+  elif seg_push_c; then
     why="a git push may only take -c credential.helper=...: any other -c or --config-env can switch the pre-push hook off."
   elif m "$git" && mi 'hookspath' && ! mi '^[[:space:]]*git[[:space:]]+(-C[[:space:]]+[^[:space:];&|]+[[:space:]]+)?config([[:space:]]+--(global|local|system|show-origin|show-scope))*[[:space:]]+--get(-all)?[[:space:]]+core\.hookspath[[:space:]]*$'; then
     why="it sets or overrides core.hooksPath (git -c, --config-env, git config): the pre-push hook would not run."
+  elif m "$git" && mi '(^|[^[:alnum:]_])include(if\.[^[:space:]]*)?\.path' && mi '(^|[^[:alnum:]_-])config([^[:alnum:]_-]|$)|(^|[[:space:]])-c[[:space:]]'; then
+    why="it sets include.path/includeIf.*.path: git would read another config file, which can switch the pre-push hook off."
   elif m "$git" && m '(^|[^[:alnum:]_-])(send-pack|http-push)([^[:alnum:]_-]|$)'; then
     why="git send-pack/http-push publish refs without running the pre-push hook."
   elif m "$git" && m '(^|[^[:alnum:]_-])config([[:space:]]+[^;&|]*)?[[:space:]](--remove-section|--rename-section|--edit|-e)([[:space:]]|$)'; then
     why="it edits or removes git config sections, which can drop core.hooksPath."
-  elif m "$git" && m '(^|[^[:alnum:]_])(GIT_CONFIG[[:alnum:]_]*|GIT_DIR|GIT_COMMON_DIR|HOME|XDG_CONFIG_HOME)[[:space:]]*='; then
-    why="it overrides GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME or XDG_CONFIG_HOME for git: another config, without the hook."
+  elif { m "$git" || m 'review.gate'; } && env_reaches_git; then
+    why="it overrides GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME, XDG_CONFIG_HOME or PATH for git or the gate: another config or another git/bash, without the hook."
   elif m "$git" && m '(^|[^[:alnum:]_-])(env[[:space:]]+(-[[:alpha:]]*[iu]|--ignore-environment|--unset)|unset[[:space:]]+[^;&|]*(HOME|XDG_CONFIG_HOME|GIT_))'; then
     why="it clears HOME/XDG_CONFIG_HOME/GIT_* for git: git would read another config, without the hook."
   elif m 'install-githooks' && m '--uninstall'; then
     why="it uninstalls the pre-push hook."
-  elif m '(\.gitconfig|\.git/config|git/config|\.git/hooks|(^|[^[:alnum:]_.-])githooks(/|$|[[:space:]]))' && m '((^|[^0-9&>])>|(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod)([^[:alnum:]_-]|$))'; then
-    why="it writes a git config file or a hooks folder directly."
+  elif seg2 "(^|[^0-9&>])>>?\|?[[:space:]]*[^[:space:]]*$protp" . || seg2 "$prot" "$tool" ||
+       { m "((^|[^0-9&>])>|$tool)" && { seg2 "$prot" '(^|[^[:alnum:]_])(cd|pushd)[[:space:]]' || seg2 "[[:alnum:]_]\+?=[^[:space:]]*$protp" .; }; }; then
+    # a redirect or a writing tool on the path in the same segment; or a cd into it / a variable holding it, and a write
+    why="it writes a git config file, a hooks folder, or a pre-push review record (review-gate-prepush/, .openqodex/) directly."
   elif m "$git" && m "$push"; then
     # A repo-local core.hooksPath (husky sets one) wins over the global one: the gate's hook would not run there.
     local want got

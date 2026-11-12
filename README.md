@@ -270,13 +270,19 @@ reviewed change exactly the commit you push) it:
 2. copies it to `.openqodex/punch-list/` in the checkout (git-ignored: `prepush` adds `/.openqodex/` to
    `.git/info/exclude`), and names those copies in `review.instructions_files` of **our own** OpenQodex config,
    `$GIT_COMMON_DIR/review-gate-prepush/openqodex.yaml`, outside the work tree so a branch can't loosen it. OpenQodex's
-   limits: 32 KB per file, 64 KB in all; a file past either is skipped whole, and `prepush` then fails. (Not
-   `--instructions`: it takes one file of at most 32 KB, and the split list is up to 56 KB. `--instructions` gets
-   `prompts/openqodex-instructions.md`, so a repo's own `.openqodex/custom-instructions.md` is not used.)
+   limits: 32 KB (32,768 bytes) per file, 64 KB (65,536 bytes) in all; a file past either is skipped whole. `prepush`
+   checks both **before** the review and fails at once (exit 4) when the list doesn't fit: it never reviews without
+   the whole list. For the single `review/PUNCH_LIST.md` the message names pr-orchestrator #21, the split into section
+   files. Every run prints the list's size against 64 KB and warns past 56 KB (7/8), so the post-mortems that add to
+   it are seen growing before they hit the cap. (Not `--instructions`: it takes one file of at most 32 KB.
+   `--instructions` gets `prompts/openqodex-instructions.md`, so a repo's own `.openqodex/custom-instructions.md` is
+   not used.)
 3. runs `openqodex review --base <base> --offline --reviewer-web off --config <ours> --instructions <ours>
    --block-on-severity minor --timeout 1800` under `systemd-run --scope -p MemoryMax=2G -p MemorySwapMax=256M`
-   (panda is RAM-fragile: a runaway is killed inside its scope instead of swap-thrashing the host). Never
-   `review --agent`: that is the coding agent reviewing its own work;
+   (panda is RAM-fragile: a runaway is killed inside its scope instead of swap-thrashing the host), inside an outer
+   `timeout` of `--timeout` + 120 s that stops its whole process group if it ignores `--timeout`; the lock's file
+   descriptor is closed for it, so a hung run or a leftover reviewer never holds the lock. Never `review --agent`:
+   that is the coding agent reviewing its own work;
 4. records the result in `$GIT_COMMON_DIR/review-gate-prepush/<sha>.json` (shared by all worktrees, keyed by
    commit; `clear` doesn't touch it, `clear prepush` removes HEAD's), only for a review that **finished**: exit 0 with verdict `passed`, or exit 1 with `blocked`, OpenQodex's
    `last-review` record written by this run, the report matching its sha256, and the manifest showing every
@@ -284,9 +290,11 @@ reviewed change exactly the commit you push) it:
    OpenQodex failing), "Nothing to review", HEAD moving during the run: nothing passes, exit 4, and the reason is
    kept in `<sha>.last`.
 
-**Findings.** A `blocked` review exits 1. Fix the findings, or decline them for that commit with
+**Findings.** A `blocked` review exits 1. Fix the findings. Declining them for that commit with
 `prepush-accept --reason "..."` (only after a finished review with findings; an unfinished review can't be
-accepted). Every check of that commit announces the reason.
+accepted) is a waiver, so it is **Tim's**: Claude Code's hook blocks `review-gate prepush-accept` unless Tim set
+`REVIEW_GATE_PREPUSH=off`, and every acceptance is written to the bypass log below (when the log can't be written,
+nothing is accepted). Every check of that commit announces the reason.
 
 **Severity: `minor`, not `major`.** OpenQodex's scale: `critical` (data loss, security, a crash on a common path),
 `major` (wrong behaviour under realistic conditions), `minor` ("a real bug that will rarely surface"), `nitpick`
@@ -302,8 +310,12 @@ uses for `gh pr ready`. It passes only when all of these hold:
   says `kind: complete` with the same change, verdict, base and `block_on_severity`;
 - `report.json` and `manifest.json` still have the sha256 recorded, the report is `complete`, and the manifest shows
   the whole punch list supplied;
-- the reviewed base is an ancestor of the commit and is on a remote branch other than the one pushed (the PR's
-  base), so a review of only the newest commits (`--base HEAD~1`, or the branch's own remote tip) doesn't count;
+- OpenQodex's change id for `<reviewed base>..<commit>`, worked out again at push time with OpenQodex's own formula
+  (below), is the one in the record, so a record copied or edited onto another commit never matches;
+- the reviewed base is an ancestor of the commit and is on origin's default branch (`origin/HEAD`, else
+  `origin/main`) or on the base branch of the pushed branch's PR (`gh pr view <branch>`), so a review of only the
+  newest commits (`--base HEAD~1`, the branch's own remote tip, any other branch they were pushed to) doesn't count.
+  The first push of a stacked branch, before its PR exists, is therefore reviewed against `main`;
 - the verdict is `passed`, or `blocked` with an accepted reason;
 - the punch list on `main` **now** has the same files and blob ids as the one reviewed (one or two `gh api` calls; a
   failed fetch blocks).
@@ -314,34 +326,60 @@ would mean parsing the push's arguments again. The repo's own `.git/hooks/*` kee
 githooks(5), client and server side, is a link in `githooks/` to `chain`, which runs the repo's own hook
 (`core.hooksPath` would otherwise switch them off).
 
-*How a review is bound to a commit.* OpenQodex identifies a review by a change id, sha256 of the base commit and
-the diff of the work tree (uncommitted and untracked files included), not by a commit. `prepush` requires a clean
-tree and the same HEAD before and after the run, so that diff is exactly `<merge base>..<HEAD>`; the record ties
-that change id to the HEAD sha. Pushing another commit needs its own review.
+*How a review is bound to a commit.* OpenQodex identifies a review by a change id, not by a commit: sha256 of the
+base sha, a newline, and `git diff --raw -z --no-abbrev` (with its `DIFF_FLAGS`, minus its `.openqodex/` folder)
+from the base to the work tree (`changeId`/`diffChange` in its `dist/bin.js`; its own pre-push hook matches a push to
+a review with the same formula from base to commit). `prepush` requires a clean tree and the same HEAD before and
+after the run, so that diff is exactly `<merge base>..<HEAD>`; it checks that the id OpenQodex recorded is the one
+the formula gives for HEAD, and `check-prepush` works it out again for the pushed commit, so the tie can't be
+edited. `review-gate change-id <base> [<commit>]` prints it; the tests pin it against real OpenQodex 0.18.0 runs.
+A repo whose git clean/smudge filters change the bytes (OpenQodex hashes the work tree with filters off) gets
+another id, and `prepush` fails rather than record a review no push can match. Pushing another commit needs its
+own review.
 
-**Ways around a git hook** are blocked by the Claude Code PreToolUse hook with a short fixed list matched anywhere
-in the command (no parsing): `core.hooksPath` in a `git` command (`-c`, `--config-env`,
-`git config` writes; `git config --get core.hooksPath` is fine); `--no-verify` on any git command (an alias can
-push); `GIT_CONFIG*`,
-`GIT_DIR`, `GIT_COMMON_DIR`, `HOME` or `XDG_CONFIG_HOME` assignments, `env -i`/`-u` or `unset` of them, with `git`;
-any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the gate's settings are Tim's); `install-githooks --uninstall`;
-a write (`>`, `tee`, `sed -i`, `cp`, `mv`, `ln`, `rm`, ...) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`
-or `githooks/`; `git config --remove-section`/`--rename-section`/`--edit`; `git send-pack`/`http-push` (they run
-no hook); on a push, any `-c` but `credential.helper=...`, and `--config-env`. Quotes and backslashes are removed
-before matching. And a command with `git` and `push` is blocked unless `core.hooksPath` in the session's checkout
+**Ways around a git hook** are blocked by the Claude Code PreToolUse hook with a short fixed list (no parsing):
+`core.hooksPath` in a `git` command (`-c`, `--config-env`,
+`git config` writes; `git config --get core.hooksPath` is fine); `include.path`/`includeIf.*.path` in a `git config`
+or `-c`; `--no-verify` on any git command (an alias can push); a `GIT_CONFIG*`, `GIT_DIR`, `GIT_COMMON_DIR`,
+`HOME`, `XDG_CONFIG_HOME` or `PATH` assignment in a command with `git` or `review-gate`, unless it is plainly a
+temporary one for a single other command (`HOME=/tmp npm test; git status`; a segment with quotes, `$(` or
+backticks counts), and `env -i`/`-u` or `unset` of them; any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the
+gate's settings are Tim's); `review-gate prepush-accept` (Tim's waiver, above); `install-githooks --uninstall`;
+a write (a redirect to it, or `tee`, `sed -i`, `cp`, `mv`, `ln`, `rm`, ... on it in the same command, or a `cd` into
+it or a variable holding it plus any write) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`, `githooks/`,
+the pre-push records (`review-gate-prepush/`) or OpenQodex's (`.openqodex/`, `~/.openqodex/`);
+`git config --remove-section`/`--rename-section`/`--edit`; `git send-pack`/`http-push` (they run no hook); on a
+push, any `-c` but `credential.helper=...`, and `--config-env`. Quotes and backslashes are removed before matching,
+and two conditions that belong to one command must hold in the same `;`/`&`/`|`-separated part of it, so
+`git -c user.name=x commit && git push` or `git log > f; cat .git/hooks/x` aren't read as one command.
+`githooks/pre-push` (`#!/bin/bash`) and `review-gate` also set a fixed `PATH` themselves, so a `PATH` prefix can't
+hand them a look-alike `bash`, `git`, `jq` or `systemd-run`. And a command with `git` and `push` is blocked unless `core.hooksPath` in the session's checkout
 is this repo's `githooks/`: a repo-local `core.hooksPath` (husky sets one) wins over the global one and would
 switch the gate off there, and with nothing installed no push passes. It is a speed bump against an agent
 working around the gate, not a sandbox: it sees only Bash commands (not Edit/Write), and only the session's
-checkout for the `core.hooksPath` check.
+checkout for the `core.hooksPath` check: a push from another checkout (`git -C <dir> push`, `cd <dir> && git push`)
+whose own repo-local `core.hooksPath` (husky) overrides the global one is not caught here. A forged record is no
+longer the way around (the change id is worked out again at push time); what is left is writing OpenQodex-shaped
+records by hand for a change that was never reviewed, which the write list above slows down but can't prevent.
 
-**Deploying:** once this hook is live, every `git push` from Claude Code needs `install-githooks --global` (or
-`--repo`) to have been run and OpenQodex installed; until then pushes are blocked, which is the point.
+**Deploying**, in this order:
+
+0. **pr-orchestrator #21 merged** (https://github.com/j-bot-ai/pr-orchestrator/pull/21, the punch list split into
+   `review/punch-list/NN-*.md`, each at most 32 KB and at most 64 KB in all). `main` still has only
+   `review/PUNCH_LIST.md`, which is 36,375 bytes, over OpenQodex's 32 KB per-file limit: until #21 is merged every
+   `prepush` fails at once (naming #21) and, after step 2, no push passes. Headroom after the split: the sections
+   #21 adds come to 26,835 bytes on its branch today (`log.md` is not sent); `prepush` prints the size on every run
+   and warns past 56 KB of the 64 KB cap.
+1. OpenQodex 0.18.0 installed at `/opt/openqodex` (below).
+2. `install-githooks --global` (or `--repo`). From then on every `git push` from Claude Code needs a passing review;
+   until steps 0 and 1 are done, pushes are blocked, which is the point.
 
 **Escape hatch (Tim only).** `REVIEW_GATE_PREPUSH=off` in the environment Claude Code itself runs in (e.g. `env` in
 `~/.claude/settings.json`, or exported before starting `claude`) lets both hooks through; git inherits it from
 Claude Code. As a command prefix it is blocked. Every use is logged to
 `${XDG_STATE_HOME:-~/.local/state}/review-gate/prepush-bypass.log`; when that log can't be written, the switch
-doesn't work (a bypass is never silent). By hand, outside Claude Code, the same variable
+doesn't work (a bypass is never silent). The same log gets every `prepush-accept` (repo, commit, finding counts,
+reason). By hand, outside Claude Code, the same variable
 works (and `git push --no-verify` is git's own).
 
 ### Installing
@@ -373,7 +411,9 @@ never change the verdict; `openqodex doctor --install` (online, once) would fetc
 - `REVIEW_GATE_OPENQODEX_OFFLINE=off` — let OpenQodex's network scanners run (default: `--offline`)
 - `REVIEW_GATE_OPENQODEX_MEMORY` — the scope's `MemoryMax` (default `2G`; `off` runs uncapped),
   `REVIEW_GATE_OPENQODEX_SWAP` — its `MemorySwapMax` (default `256M`)
-- `REVIEW_GATE_PREPUSH_TIMEOUT` — OpenQodex's `--timeout` in seconds (default 1800)
+- `REVIEW_GATE_PREPUSH_TIMEOUT` — OpenQodex's `--timeout` in seconds (default 1800); `REVIEW_GATE_PREPUSH_GRACE` —
+  how much longer the outer `timeout` waits before stopping it (default 120)
+- `REVIEW_GATE_SYSTEMD_RUN`, `REVIEW_GATE_GH` — the `systemd-run` and `gh` to use (tests; default: the fixed `PATH`'s)
 - `REVIEW_GATE_OPENQODEX` — the binary (default `/opt/openqodex/bin/openqodex`); it must report the pinned version
 - `REVIEW_GATE_PUNCH_REPO` — where the punch list lives (default `j-bot-ai/pr-orchestrator`, branch `main`)
 - `OPENQODEX_HOME` — OpenQodex's record folder (default `~/.openqodex`)

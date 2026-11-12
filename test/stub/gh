@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Test stand-in for gh: serves the punch list from $PUNCH_FIXTURE (a folder holding review/...) the way the GitHub
-# contents API does (listings with git blob ids, raw files), and fails `pr view`. PUNCH_FAIL=1 fails every call;
+# contents API does (listings with git blob ids, raw files), and fails `pr view` unless STUB_PR_BASE names the PR's base branch. PUNCH_FAIL=1 fails every call;
 # PUNCH_CORRUPT=1 serves files that don't match their blob id.
 set -euo pipefail
 [ -z "${PUNCH_FAIL:-}" ] || { echo "stub gh: failing as asked" >&2; exit 1; }
 case "${1:-}" in
   auth) echo stub-token; exit 0 ;;
+  pr) [ "${2:-}" = view ] && [ -n "${STUB_PR_BASE:-}" ] && { echo "$STUB_PR_BASE"; exit 0; }; exit 1 ;;
   api) shift ;;
   *) exit 1 ;;
 esac

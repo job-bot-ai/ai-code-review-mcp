@@ -24,9 +24,9 @@ export OPENQODEX_HOME="$T/oqhome" REVIEW_GATE_OPENQODEX="$root/test/stub/openqod
 export PUNCH_FIXTURE="$T/punch" XDG_STATE_HOME="$T/state"; unset GH_TOKEN STUB_OQ PUNCH_FAIL REVIEW_GATE_PREPUSH
 mkdir -p "$T/punch/review" && echo '- 1.1 an item' >"$T/punch/review/PUNCH_LIST.md"
 stubgh="$root/test/stub/gh"; export REVIEW_GATE_GH="$stubgh"
-prepushed() { # the PR base: a remote branch holding the base commit
-  git -C "$1" update-ref refs/remotes/origin/base HEAD
-  (cd "$1" && bash "$gate" prepush --base origin/base >/dev/null 2>&1) || echo "prepushed $1 failed" >&2; }
+prepushed() { # the default branch on origin holds the base commit
+  git -C "$1" update-ref refs/remotes/origin/main HEAD
+  (cd "$1" && bash "$gate" prepush --base origin/main >/dev/null 2>&1) || echo "prepushed $1 failed" >&2; }
 green() { (cd "$1" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null) && prepushed "$1"; }
 run() { # run <cwd> <command> → sets rc, out, err
   local payload; payload="$(jq -cn --arg c "$2" --arg d "$1" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
@@ -491,10 +491,35 @@ expect "-c credential.helper=... on a push is fine" 0
 for c in "echo '[core] hooksPath = /x' >> .git/config" "rm githooks/pre-push" "mv githooks x" "sed -i 's/x/y/' ~/.gitconfig" "rm -rf .git/hooks" "cp x ~/.config/git/config" \
   "ln -sf /dev/null /opt/x/githooks/pre-push"; do
   run "$T/a" "$c"
-  expect "bypass blocked: $c" 2 stderr "writes a git config file or a hooks folder"
+  expect "bypass blocked: $c" 2 stderr "writes a git config file, a hooks folder"
 done
 run "$T/a" "cat .git/config 2>/dev/null; grep url ~/.gitconfig 2>&1"
 expect "reading git config files is fine" 0
+# Deep review #26: a forged pre-push record, a PATH prefix, include.path, prepush-accept (the agent's own waiver).
+for c in "jq --arg s B '.sha=\$s' .git/review-gate-prepush/A.json > .git/review-gate-prepush/B.json" \
+  "cp .git/review-gate-prepush/A.json .git/review-gate-prepush/B.json" "cd .git/review-gate-prepush && cp A.json B.json" \
+  "cp a.json ~/.openqodex/receipts/x/b.json" "echo {} > .openqodex/reviews/r/report.json" "f=.git/hooks/pre-push; echo x > \$f" \
+  "sed -i s/blocked/passed/ /root/.openqodex/last-review/x/last-review.json"; do
+  run "$T/a" "$c"
+  expect "bypass blocked: $c" 2 stderr "a pre-push review record"
+done
+for c in "PATH=/tmp/evil:\$PATH git push origin feat" "export PATH=/tmp/evil:\$PATH; git push" "PATH=/tmp/evil; git push" \
+  "PATH+=:/x git push" "env PATH=/tmp/evil git push" "PATH=/tmp/evil bash review-gate prepush" "HOME=\$(mktemp -d) git push" \
+  "HOME=\"/a b\"; git push" "HOME=\$(cd /tmp; pwd) git push" "git config --global include.path /tmp/c" \
+  "git config --global includeIf.gitdir:/x/.path /tmp/c" "bash review-gate prepush-accept --reason 'false positive, fine'" \
+  "/root/ai-code-review-mcp/review-gate prepush-accept --reason x" "cd /x && review_gate prepush-accept --reason x"; do
+  run "$T/a" "$c"
+  expect "bypass blocked: $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+for c in "HOME=/tmp npm test; git status" "git log --oneline > /tmp/x; cat .git/hooks/pre-commit" \
+  "git -c user.name=x commit -qm y && git push origin feat" "PATH=\$PATH:/usr/local/go/bin go build && git status" \
+  "cat .git/review-gate-prepush/x.json" "jq . ~/.openqodex/receipts/x/y.json > /tmp/r.json" "bash review-gate prepush" \
+  "cat .git/hooks/pre-push > /tmp/hook-copy" "git log --format=%H -1 > /tmp/head; ls ~/.openqodex"; do
+  run "$T/a" "$c"
+  expect "not a bypass: $c" 0
+done
+REVIEW_GATE_PREPUSH=off run "$T/a" "bash review-gate prepush-accept --reason 'declined by Tim: covered elsewhere'"
+expect "prepush-accept goes through when Tim set REVIEW_GATE_PREPUSH=off" 0
 git -C "$T/a" config core.hooksPath .husky
 run "$T/a" "git push"
 expect "a repo-local core.hooksPath (husky) overriding the gate blocks the push" 2 stderr "would not run"
