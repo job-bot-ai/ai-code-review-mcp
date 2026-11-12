@@ -290,7 +290,8 @@ reviewed change exactly the commit you push) it:
    whatever a finished review left running, before the lock is released. If part of it survives even KILL (a
    process stuck in the kernel, a scope that won't stop), `prepush` exits 5 naming the survivors (in `<sha>.last` and
    `review-gate-prepush/survivors`, pid and start time, or the scope), and the next `prepush` refuses to start while
-   any of them is alive. After `wait` has reaped the run's leader, its process group is no longer signalled (the
+   any of them is alive. A zombie (state Z or X) counts as gone everywhere: `kill -0` passes for one, but no signal
+   can clear it. After `wait` has reaped the run's leader, its process group is no longer signalled (the
    number may have been reused); the marker and the scope still are. Uncapped (`REVIEW_GATE_OPENQODEX_MEMORY=off`),
    a detached reviewer that also clears its environment is not contained; the lock's file
    descriptor is closed for it, so a hung run or a leftover reviewer never holds the lock. Never `review --agent`:

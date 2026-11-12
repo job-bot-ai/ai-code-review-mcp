@@ -417,6 +417,16 @@ prepush
 expect "once they are gone, prepush runs again (and clears the marker)" 0 "pre-push review passed"
 [ ! -e "$sv" ]; rc=$?
 expect "the survivors marker is gone" 0
+# A zombie in a survivors entry (Greptile on 85f0514): `kill -0` passes and its start time stays, but it is dead and no
+# signal clears it, so it never blocks a prepush. (Its parent execs into sleep and never reaps it.)
+bash -c 'sleep 0 & echo $! >"$1"; exec sleep 30' _ "$T/zombie.pid" & zparent=$!
+for _ in $(seq 1 20); do zp="$(cat "$T/zombie.pid" 2>/dev/null)"; [ -n "$zp" ] && [ "$(sed 's/^.*) //' "/proc/$zp/stat" 2>/dev/null | cut -d' ' -f1)" = Z ] && break; sleep 0.2; done
+printf 'pid %s %s\n' "$zp" "$(sed 's/^.*) //' "/proc/$zp/stat" | cut -d' ' -f20)" >"$sv"
+change zombie-entry; prepush
+expect "a survivors entry that is a zombie doesn't refuse the next prepush" 0 "pre-push review passed"
+[ ! -e "$sv" ]; rc=$?
+expect "and its marker is cleared" 0
+kill "$zparent" 2>/dev/null; wait "$zparent" 2>/dev/null
 STUB_OQ=killed prepush
 expect "a SIGKILL (the memory cap) is reported as that, naming MemoryMax" 4 "MemoryMax"
 fresh; STUB_OQ=leaves prepush

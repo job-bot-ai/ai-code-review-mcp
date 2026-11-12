@@ -103,6 +103,15 @@ oq_change_id() {
       --inter-hunk-context=0 --ignore-submodules=none --submodule=short --raw -z --no-abbrev "$1" "$2" -- ':(top,exclude).openqodex'
   } | sha256sum | cut -d' ' -f1
 }
+# proc_state <pid>: "<state> <start time>" from /proc/<pid>/stat, read after the last ")" (a command name may hold
+# spaces or parentheses). proc_live <pid>: it exists and isn't a zombie (Z) or dead (X): `kill -0` passes for a
+# zombie, which no signal can clear, so nothing waits on one or is refused because of one.
+proc_state() {
+  local s; s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  s="${s##*) }"; set -- $s
+  [ -n "${20:-}" ] && printf '%s %s\n' "$1" "${20}"
+}
+proc_live() { local x; x="$(proc_state "$1")" || return 1; case "${x%% *}" in Z|X) return 1 ;; esac; }
 # Files under the top-level .openqodex/ are outside OpenQodex's change id and its review (its STATE_PATHSPEC): a
 # change that commits any is never a reviewed change.
 oq_state_files() { git diff --name-only "$1" "$2" -- ':(top).openqodex'; }
@@ -261,7 +270,7 @@ run_prepush() {
     local kind id st alive=""
     while read -r kind id st; do
       case "$kind" in
-        pid) [ "$(cut -d' ' -f22 "/proc/$id/stat" 2>/dev/null)" = "$st" ] && alive="$alive pid $id" ;;
+        pid) proc_live "$id" && [ "$(proc_state "$id" | cut -d' ' -f2)" = "$st" ] && alive="$alive pid $id" ;;
         unit) systemctl is-active --quiet "$id" 2>/dev/null && alive="$alive $id" ;;
       esac
     done <"$pdir/survivors"
@@ -329,7 +338,7 @@ run_prepush() {
     local e p
     for e in /proc/[0-9]*/environ; do
       p="${e#/proc/}"; p="${p%/environ}"
-      grep -qzx "REVIEW_GATE_RUN_ID=$runid" "$e" 2>/dev/null && echo "$p"
+      grep -qzx "REVIEW_GATE_RUN_ID=$runid" "$e" 2>/dev/null && proc_live "$p" && echo "$p"
     done
   }
   # The group is signalled only until `wait` has reaped its leader: until then the leader's pid (a zombie at worst)
@@ -340,8 +349,9 @@ run_prepush() {
     [ -z "$unit" ] || systemctl kill --kill-whom=all --signal="$1" "$unit.scope" >/dev/null 2>&1 || true
     for p in $(run_members); do kill -"$1" "$p" 2>/dev/null || true; done
   }
+  group_live() { local p; for p in $(pgrep -g "$pid" 2>/dev/null); do proc_live "$p" && return 0; done; return 1; }
   run_alive() {
-    { [ "$reaped" = 0 ] && kill -0 -- "-$pid" 2>/dev/null; } || [ -n "$(run_members)" ] ||
+    { [ "$reaped" = 0 ] && group_live; } || [ -n "$(run_members)" ] ||
       { [ -n "$unit" ] && systemctl is-active --quiet "$unit.scope" 2>/dev/null; }
   }
   # stop_run: TERM all of the run, KILL what is left after $killafter s (a leader or a member that ignores TERM), and
@@ -360,9 +370,11 @@ run_prepush() {
   survivors() {
     local p st list=""
     for p in $( { [ "$reaped" = 1 ] || pgrep -g "$pid" 2>/dev/null; run_members; } | sort -u); do
-      st="$(cut -d' ' -f22 "/proc/$p/stat" 2>/dev/null)" && list="${list}pid $p $st"$'\n'
+      proc_live "$p" || continue
+      st="$(proc_state "$p" | cut -d' ' -f2)" && list="${list}pid $p $st"$'\n'
     done
     [ -n "$unit" ] && systemctl is-active --quiet "$unit.scope" 2>/dev/null && list="${list}unit $unit.scope"$'\n'
+    [ -n "$list" ] || return 0   # only zombies were left: nothing survives
     printf '%s' "$list" >"$pdir/survivors"
     fail "parts of the review are still running after KILL: $(printf '%s' "$list" | tr '\n' ';' | sed 's/;$//'). The review did not finish. Stop them (kill -9, systemctl stop), then run prepush again; it refuses while they are alive (exit 5)" 5
   }
