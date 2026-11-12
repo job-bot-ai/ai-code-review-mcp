@@ -64,6 +64,8 @@ push -q --dry-run origin feat
 expect "--dry-run is checked like a push (git runs the hook and doesn't say it's a dry run)" 1 "BLOCKED"
 
 # ── blocked, and prepush-accept ──
+prepush; out="$(cd "$W" && bash "$gate" prepush-accept --reason "nothing to accept here, really" 2>&1)"; rc=$?
+expect "a passed review has nothing to accept" 2 "nothing to accept"
 STUB_OQ=blocked prepush
 expect "a blocked review exits 1 and says how to accept" 1 "prepush-accept --reason"
 push -q origin feat
@@ -77,10 +79,10 @@ expect "accepted findings let the push through, announced" 0 "were ACCEPTED, not
 
 # ── incomplete, no reviewer, nothing to review: never a pass ──
 change three
-STUB_OQ=incomplete prepush
+prepush; STUB_OQ=incomplete prepush
 expect "an incomplete review fails (exit 4)" 4 "did not finish"
 push -q origin feat
-expect "an incomplete review blocks the push" 1 "did not pass"
+expect "an incomplete review blocks the push, even after an earlier pass of that commit" 1 "did not pass"
 out="$(cd "$W" && bash "$gate" prepush-accept --reason "the reviewer timed out, ship it" 2>&1)"; rc=$?
 expect "an unfinished review can't be accepted" 2 "unfinished review can't be accepted"
 STUB_OQ=noreviewer prepush
@@ -102,6 +104,14 @@ STUB_OQ=badhash prepush
 expect "a manifest hash that isn't the list's fails the review" 4 "not given the whole punch list"
 PUNCH_FAIL=1 prepush
 expect "no punch list, no review" 4 "couldn't list the punch list"
+mv "$T/punch/review/PUNCH_LIST.md" "$T/pl"
+prepush
+expect "a punch list with no file on main is no list" 4 "couldn't list the punch list"
+mv "$T/pl" "$T/punch/review/PUNCH_LIST.md"
+PUNCH_CORRUPT=1 prepush
+expect "a downloaded file that isn't the listed blob is refused" 4 "couldn't download"
+STUB_OQ=badreport prepush
+expect "a report that isn't the one OpenQodex recorded fails" 4 "doesn't match OpenQodex's record"
 prepush
 expect "a clean review of the new HEAD" 0
 PUNCH_FAIL=1 push -q origin feat
@@ -134,6 +144,31 @@ jq '.punch.files[0].sha256 = "0"' "$m" >"$T/m" && cp "$m" "$T/m0" && mv "$T/m" "
 push -q origin feat
 expect "a record whose punch hashes differ from the manifest blocks" 1 "whole punch list supplied"
 cp "$T/m0" "$m"
+# forge <jq on report> : edit the report and keep every hash in the record consistent, so only the guard under test fails
+forge() {
+  cp "$rd/report.json" "$T/rep0"; cp "$m" "$T/m1"; cp "$rec" "$T/rec1"
+  jq "$1" "$T/rep0" >"$rd/report.json"
+  jq --arg h "$(sha256sum "$rd/report.json" | cut -d' ' -f1)" ".report_sha256 = \$h | ${2:-.}" "$T/m1" >"$m"
+  jq "${3:-.}" "$T/rec1" >"$rec"
+}
+unforge() { cp "$T/rep0" "$rd/report.json"; cp "$T/m1" "$m"; cp "$T/rec1" "$rec"; }
+forge '.completion.status = "incomplete"'
+push -q origin feat
+expect "a report that is not complete blocks, even with every hash consistent" 1 "not a complete review"
+unforge
+forge '.verdict = "incomplete"' '.verdict = "incomplete"' '.verdict = "incomplete"'
+push -q origin feat
+expect "any verdict other than passed/blocked blocks" 1 "verdict 'incomplete'"
+unforge
+other="$(git -C "$W" commit-tree -m unrelated "$(git -C "$W" mktree </dev/null)")"
+forge '.' ".base_sha = \"$other\"" ".base.sha = \"$other\""
+push -q origin feat
+expect "a review against a base that isn't an ancestor blocks" 1 "not an ancestor"
+unforge
+cp "$m" "$T/m2"; prev="$(git -C "$W" rev-parse HEAD~1)"; pm="${m%/*}/$prev.json"; cp "$m" "$pm"
+push -q origin HEAD~1:refs/heads/prev
+expect "a record copied to another commit's name blocks" 1 "unreadable record"
+rm -f "$pm"
 REVIEW_GATE_BLOCK_ON=critical push -q origin feat
 expect "a review run with another block_on_severity doesn't count" 1 "block_on_severity"
 push -q origin feat
@@ -180,7 +215,16 @@ git -C "$W" config core.hooksPath "$root/githooks"
 own="$W/.git/hooks/pre-push"; printf '#!/bin/sh\necho own-hook-ran >&2\nexit 3\n' >"$own"; chmod +x "$own"
 push -q origin feat
 expect "the repo's own pre-push hook still runs after the gate passes (and can block)" 1 "own-hook-ran"
+printf '#!/bin/sh\nexit 0\n' >"$own"; chmod +x "$own"
+push -q origin feat
+expect "a repo hook that exits 0 without reading stdin is not a failure" 0
 rm -f "$own"
+ln -s "$root/githooks/pre-commit" "$W/.git/hooks/pre-commit"
+out="$(cd "$W" && timeout 20 git commit -q --allow-empty -m loop 2>&1)"; rc=$?
+expect "a repo hook linked back into githooks/ doesn't loop" 0
+rm -f "$W/.git/hooks/pre-commit"
+[ ! -e "$root/githooks/push-to-checkout" ]; rc=$?
+expect "no push-to-checkout link (its presence disables updateInstead)" 0
 
 # ── install-githooks ──
 git init -q "$T/inst"

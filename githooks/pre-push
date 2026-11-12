@@ -50,7 +50,7 @@ fi
 
 own="$(git rev-parse --git-common-dir)/hooks/pre-push"
 if [ -x "$own" ] && [ "$(readlink -f "$own")" != "$(readlink -f "${BASH_SOURCE[0]}")" ]; then
-  printf '%s\n' "$input" | "$own" "$@"
+  "$own" "$@" <<<"$input"   # not a pipe: a hook that exits without reading stdin must not turn into a failure
   exit $?
 fi
 exit 0

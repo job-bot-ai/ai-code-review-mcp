@@ -44,13 +44,17 @@ bypass_check() {
       printf '%s\tclaude-hook\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%s' "$cmd" | tr '\n\t' '  ' | cut -c1-300)" >>"$log" 2>/dev/null
     return 0
   fi
-  m() { printf '%s' "$cmd" | grep -Eq -- "$1"; }
-  mi() { printf '%s' "$cmd" | grep -Eqi -- "$1"; }
+  # Matched with quotes and backslashes removed, so `"core.hooks""Path"` or `"-"c` is read as what the shell runs.
+  local c; c="$(printf '%s' "$cmd" | tr -d "\"'\\\\")"
+  m() { printf '%s' "$c" | grep -Eq -- "$1"; }
+  mi() { printf '%s' "$c" | grep -Eqi -- "$1"; }
   local git='(^|[^[:alnum:]_.-])git([^[:alnum:]_-]|$)' push='(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'
   if m '(^|[^[:alnum:]_])(REVIEW_GATE_[[:alnum:]_]*|OPENQODEX_[[:alnum:]_]*)[[:space:]]*=' || m '(^|[^[:alnum:]_])REVIEW_GATE_PREPUSH([^[:alnum:]_]|$)'; then
     why="it sets a REVIEW_GATE_* / OPENQODEX_* variable. The gate's settings, and the REVIEW_GATE_PREPUSH=off switch, are Tim's."
   elif m "$push" && m '(^|[[:space:]])--no-ve'; then
     why="--no-verify skips the git pre-push hook."
+  elif m "$git" && m "$push" && printf '%s' "$c" | grep -Pq -- '(^|\s)(-c\s+(?!credential\.helper=)|--config-env)'; then
+    why="a git push may only take -c credential.helper=...: any other -c or --config-env can switch the pre-push hook off."
   elif m "$git" && mi 'hookspath' && ! mi '^[[:space:]]*git[[:space:]]+(-C[[:space:]]+[^[:space:];&|]+[[:space:]]+)?config([[:space:]]+--(global|local|system|show-origin|show-scope))*[[:space:]]+--get(-all)?[[:space:]]+core\.hookspath[[:space:]]*$'; then
     why="it sets or overrides core.hooksPath (git -c, --config-env, git config): the pre-push hook would not run."
   elif m "$git" && mi "(^|[[:space:]])(-c|--config-env)[[:space:]=]*[\"']?include(\.|if)"; then
@@ -61,7 +65,7 @@ bypass_check() {
     why="it clears HOME/XDG_CONFIG_HOME/GIT_* for git: git would read another config, without the hook."
   elif m 'install-githooks' && m '--uninstall'; then
     why="it uninstalls the pre-push hook."
-  elif m '(\.gitconfig|\.git/config|git/config|\.git/hooks|/githooks/)' && m '(>|(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod)([^[:alnum:]_-]|$))'; then
+  elif m '(\.gitconfig|\.git/config|git/config|\.git/hooks|(^|[^[:alnum:]_.-])githooks(/|$|[[:space:]]))' && m '(>|(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod)([^[:alnum:]_-]|$))'; then
     why="it writes a git config file or a hooks folder directly."
   elif m "$git" && m "$push"; then
     # A repo-local core.hooksPath (husky sets one) wins over the global one: the gate's hook would not run there.

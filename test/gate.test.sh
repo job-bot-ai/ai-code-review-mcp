@@ -43,6 +43,9 @@ expect() { # expect <name> <rc> [stdout|stderr] [substring]
 
 mkrepo "$T/a" acme/alpha && green "$T/a"
 mkrepo "$T/b" acme/beta
+mkrepo "$T/np" acme/noprepush && (cd "$T/np" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null)
+run "$T/np" "gh pr create --fill"
+expect "two passes without a pre-push review don't make check pass" 2 stderr "no passing pre-push review"
 mkdir "$T/plain"
 
 run "$T/a" "cd $T/b && gh pr create --fill"
@@ -464,7 +467,7 @@ for c in "git push --no-verify origin HEAD" "git push --no-verif" "git -C /x pus
   "env HOME=/tmp git push" "XDG_CONFIG_HOME=/tmp git push" "env -i git push" "env -u HOME git push" "unset HOME; git push" \
   "git -c include.path=/tmp/c push" "REVIEW_GATE_PREPUSH=off git push" "export REVIEW_GATE_PREPUSH=off; git push" \
   "env REVIEW_GATE_PREPUSH=off git push" "OPENQODEX_HOME=/tmp/fake git push" "REVIEW_GATE_PUNCH_REPO=me/empty review-gate prepush" \
-  "OPENQODEX_SKIP=1 git push" "bash install-githooks --uninstall --global"; do
+  "OPENQODEX_SKIP=1 git push" "read REVIEW_GATE_PREPUSH <<< off; export REVIEW_GATE_PREPUSH; git push" "bash install-githooks --uninstall --global"; do
   run "$T/a" "$c"
   expect "bypass blocked: $c" 2 stderr "BLOCKED by the pre-push review gate"
 done
@@ -474,7 +477,14 @@ for c in "git push" "git push -u origin feat" "git push --force-with-lease origi
   run "$T/a" "$c"
   expect "not a bypass: $c" 0
 done
-for c in "echo '[core] hooksPath = /x' >> .git/config" "sed -i 's/x/y/' ~/.gitconfig" "rm -rf .git/hooks" "cp x ~/.config/git/config" \
+for c in "git -c \"core.hooks\"\"Path=/dev/null\" push" "git \"-\"c core.hooksPath=/dev/null push" "git -c user.name=x push" \
+  "k=core.hooksPath; git -c \$k=/dev/null push" "git -c 'include.path=/tmp/c' push" "git --config-env=a.b=C push"; do
+  run "$T/a" "$c"
+  expect "bypass blocked (quoting, other -c): $c" 2 stderr "BLOCKED by the pre-push review gate"
+done
+run "$T/a" "git -c credential.helper= -c 'credential.helper=!f(){ echo x; }; f' push -q origin HEAD"
+expect "-c credential.helper=... on a push is fine" 0
+for c in "echo '[core] hooksPath = /x' >> .git/config" "rm githooks/pre-push" "mv githooks x" "sed -i 's/x/y/' ~/.gitconfig" "rm -rf .git/hooks" "cp x ~/.config/git/config" \
   "ln -sf /dev/null /opt/x/githooks/pre-push"; do
   run "$T/a" "$c"
   expect "bypass blocked: $c" 2 stderr "writes a git config file or a hooks folder"
