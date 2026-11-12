@@ -461,7 +461,7 @@ run "$T/u" "op run -- gh pr create --fill"
 expect "op run -- gh pr create (a wrapper that runs gh locally) is gated" 2 stderr "$T/u: missing/stale"
 
 # ── Ways around the git pre-push hook (bypass_check): blocked; ordinary git use is not ──
-for c in "git push --no-verify origin HEAD" "git push --no-verif" "git -C /x push origin main --no-verify" \
+for c in "git push --no-verify origin HEAD" "git push --no-verif" "git p --no-verify" "git -C /x push origin main --no-verify" \
   "git -c core.hooksPath=/dev/null push" "git -c core.hookspath= push" "git --config-env=core.hooksPath=X push" \
   "git config core.hooksPath /tmp/none" "git config --global core.hooksPath ''" "git config --unset core.hooksPath" \
   "GIT_CONFIG_GLOBAL=/dev/null git push" "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=x git push" \

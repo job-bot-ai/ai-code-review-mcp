@@ -144,8 +144,8 @@ verify_prepush() {
   git merge-base --is-ancestor "$b" "$sha" 2>/dev/null || { bad "the reviewed base is not an ancestor of it"; return 1; }
   # The whole change: the base must be on a remote branch other than the one pushed (a PR base), so a review of
   # only the newest commits (--base HEAD~1, or the branch's own remote tip) doesn't count.
-  git for-each-ref --contains "$b" --format='%(refname)' refs/remotes/ 2>/dev/null |
-    grep -v -x -e '.*/HEAD' ${br:+-e "refs/remotes/[^/]*/$br"} | grep -q . ||
+  local on; on="$(git for-each-ref --contains "$b" --format='%(refname)' refs/remotes/ 2>/dev/null || true)"
+  printf '%s\n' "$on" | grep -v -x -e '' -e '.*/HEAD' ${br:+-e "refs/remotes/[^/]*/$br"} >/dev/null ||
     { bad "the reviewed base ${b:0:12} is not on a remote branch other than ${br:-this one}: review the whole change against the PR's base (--base origin/<base>)"; return 1; }
   jq -e --slurpfile m "$m" "$MANIFEST_MATCHES" "$rd/manifest.json" >/dev/null 2>&1 ||
     { bad "the review's manifest doesn't show the whole punch list supplied"; return 1; }
@@ -288,7 +288,8 @@ run_accept() {
   prepush_lock
   [ -f "$m" ] || die "no finished pre-push review of ${head:0:12} to accept (an unfinished review can't be accepted): run \`review-gate prepush\`"
   [ "$(jq -r .verdict "$m")" = blocked ] || die "the pre-push review of ${head:0:12} has no blocking findings; nothing to accept"
-  jq --arg r "$reason" '.accepted = {reason: $r, at: (now | todate)}' "$m" >"$m.tmp" && mv "$m.tmp" "$m"
+  { jq --arg r "$reason" '.accepted = {reason: $r, at: (now | todate)}' "$m" >"$m.tmp" && mv "$m.tmp" "$m"; } ||
+    die "couldn't record the acceptance in $m"
   echo "review-gate: recorded ACCEPTED pre-push findings ($(jq -r .counts "$m")) for $branch @ ${head:0:12} — $reason"
   echo "review-gate: every check of this commit announces it; report: $(jq -r .run_dir "$m")/report.html"
 }

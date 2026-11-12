@@ -320,8 +320,9 @@ tree and the same HEAD before and after the run, so that diff is exactly `<merge
 that change id to the HEAD sha. Pushing another commit needs its own review.
 
 **Ways around a git hook** are blocked by the Claude Code PreToolUse hook with a short fixed list matched anywhere
-in the command (no parsing): `--no-verify` with `push`; `core.hooksPath` in a `git` command (`-c`, `--config-env`,
-`git config` writes; `git config --get core.hooksPath` is fine); `-c include.*` / `includeIf`; `GIT_CONFIG*`,
+in the command (no parsing): `core.hooksPath` in a `git` command (`-c`, `--config-env`,
+`git config` writes; `git config --get core.hooksPath` is fine); `--no-verify` on any git command (an alias can
+push); `GIT_CONFIG*`,
 `GIT_DIR`, `GIT_COMMON_DIR`, `HOME` or `XDG_CONFIG_HOME` assignments, `env -i`/`-u` or `unset` of them, with `git`;
 any `REVIEW_GATE_*=` or `OPENQODEX_*=` assignment (the gate's settings are Tim's); `install-githooks --uninstall`;
 a write (`>`, `tee`, `sed -i`, `cp`, `mv`, `ln`, `rm`, ...) to `.gitconfig`, `.git/config`, `git/config`, `.git/hooks`
