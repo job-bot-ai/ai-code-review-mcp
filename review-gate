@@ -2,24 +2,35 @@
 # review-gate — record/verify per-reviewer "green light" passes bound to the current git HEAD.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
 #
-# `check` passes only when EVERY required reviewer has a pass recorded for the commit being
-# checked (HEAD, or `--rev <commit>`). Required reviewers default to "kimi codex" (Kimi
-# K2.7-code on Ollama Cloud via `kimi-review`, and Codex); override via REVIEW_GATE_REQUIRED.
+# Flow: open the PR as a draft (`gh pr create --draft` is never gated), let the primary
+# reviewers review it, record each clean pass, then `gh pr ready` (gated). A non-draft
+# `gh pr create` is gated the same way as `gh pr ready`.
+#
+# `check` passes for the commit being checked (HEAD, or `--rev <commit>`) when:
+#   1. at least REVIEW_GATE_MIN (default 2) DIFFERENT reviewers have a pass recorded for it;
+#   2. every primary reviewer has a pass OR an announced skip for it. Primaries default to
+#      "kodus greptile" (CodeRabbit was retired on 2026-11-12); override
+#      with REVIEW_GATE_PRIMARY (REVIEW_GATE_REQUIRED is read as a legacy alias);
+#   3. a `self` pass only counts when codex also has a pass or a skip (Codex comes first).
 # Markers live in $GIT_DIR/review-gate/<reviewer> and are bound to a commit, so adding
 # new commits invalidates them (re-review required).
 #
-# A reviewer that genuinely can't run (quota, outage) can be skipped for ONE commit with
-# `record-skip <reviewer> --reason "..."`. The skip is stored separately
-# ($GIT_DIR/review-gate/<reviewer>.skip), is announced by every `check` that relies on it,
-# and never satisfies the gate on its own: at least one real pass is required.
-# `coderabbit` (free allowance only) and `agy` (Google Antigravity) are optional fallback
-# reviewers: not required by default, but a pass from either counts as that real pass, e.g.
-# when Kimi AND Codex are both skipped. (Any reviewer left out of REVIEW_GATE_REQUIRED works
-# the same way.)
+# A reviewer that genuinely can't run (not installed on the repo, errored, quota, no review
+# within 30 min) is skipped for ONE commit with `record-skip <reviewer> --reason "..."`.
+# The skip is stored separately ($GIT_DIR/review-gate/<reviewer>.skip), is announced by
+# every `check` that relies on it, and never counts as a pass.
+# Reviewers: kodus, greptile (primaries), codex (fallback), self (last resort). `coderabbit` stays
+# valid for old records and an explicit REVIEW_GATE_PRIMARY, but is no longer a default primary.
+# `agy` stays valid for old records. `kimi` (the retired DeepSeek/kimi-review pass) is no longer a
+# reviewer: a leftover kimi marker is ignored by `check`/`status` and never counts as a pass.
 set -euo pipefail
 
-VALID="coderabbit codex agy kimi"
-read -r -a REQUIRED <<<"${REVIEW_GATE_REQUIRED:-kimi codex}"
+VALID="kodus coderabbit greptile codex self agy"
+MIN="${REVIEW_GATE_MIN:-2}"
+case "$MIN" in ''|*[!0-9]*) echo "review-gate: REVIEW_GATE_MIN must be a number" >&2; exit 2;; esac
+[ "$MIN" -ge 1 ] || MIN=1
+default_primary="kodus greptile"   # CodeRabbit retired 2026-11-12 (Tim): slower, and its findings come late
+read -r -a PRIMARY <<<"${REVIEW_GATE_PRIMARY:-${REVIEW_GATE_REQUIRED:-$default_primary}}"
 # NB: "${arr[@]+"${arr[@]}"}" keeps empty arrays safe under `set -u` on bash < 4.4 (macOS).
 
 gitdir="$(git rev-parse --absolute-git-dir 2>/dev/null)" || {
@@ -42,7 +53,7 @@ case "${1:-help}" in
     r="${2:-}"
     is_valid "$r" || { echo "review-gate: unknown reviewer '$r' (valid: $VALID)" >&2; exit 2; }
     rev="$head"
-    if [ "${3:-}" = "--rev" ]; then   # the exact commit that was reviewed (kimi-review)
+    if [ "${3:-}" = "--rev" ]; then   # the exact commit that was reviewed
       rev="$(git rev-parse --verify -q "${4:-}^{commit}" 2>/dev/null)" || {
         echo "review-gate: --rev '${4:-}' is not a commit" >&2; exit 2; }
     fi
@@ -67,35 +78,39 @@ case "${1:-help}" in
       rev="$(git rev-parse --verify -q "${3:-}^{commit}" 2>/dev/null)" || {
         echo "review-gate: --rev '${3:-}' is not a commit" >&2; exit 1; }
     fi
-    if [ "${#REQUIRED[@]}" -eq 0 ]; then
-      echo "REVIEW_GATE_REQUIRED is set but names no reviewers (valid: $VALID)" >&2; exit 1
-    fi
-    missing=(); skips=(); passes=0
-    for r in "${REQUIRED[@]}"; do
-      if [ "$(recorded "$r")" = "$rev" ]; then
-        passes=$((passes + 1))
-      elif [ "$(skipped "$r")" = "$rev" ]; then
-        skips+=("$r")
-      else
-        missing+=("$r")
-      fi
+    for r in ${PRIMARY[@]+"${PRIMARY[@]}"}; do
+      is_valid "$r" || { echo "review-gate: unknown primary reviewer '$r' (valid: $VALID)" >&2; exit 1; }
     done
+    passes=(); skips=(); problems=()
+    for r in $VALID; do
+      if [ "$(recorded "$r")" = "$rev" ]; then passes+=("$r")
+      elif [ "$(skipped "$r")" = "$rev" ]; then skips+=("$r"); fi
+    done
+    has() { local x="$1"; shift; case " $* " in *" $x "*) return 0;; *) return 1;; esac; }
     for r in ${skips[@]+"${skips[@]}"}; do
       echo "review-gate: $r was SKIPPED for ${rev:0:12} — reason: $(skip_reason "$r")" >&2
     done
-    if [ "${#missing[@]}" -gt 0 ]; then
-      echo "missing/stale review pass for ${rev:0:12}: ${missing[*]}" >&2
-      exit 1
+    # A self-review is the last resort: it only counts once Codex passed or was skipped.
+    # An ineligible self pass is simply not counted; it is only reported when the gate fails.
+    counted=(); self_ignored=0
+    for r in ${passes[@]+"${passes[@]}"}; do
+      if [ "$r" = self ] && ! has codex ${passes[@]+"${passes[@]}"} ${skips[@]+"${skips[@]}"}; then
+        self_ignored=1
+        continue
+      fi
+      counted+=("$r")
+    done
+    for r in ${PRIMARY[@]+"${PRIMARY[@]}"}; do
+      has "$r" ${passes[@]+"${passes[@]}"} ${skips[@]+"${skips[@]}"} ||
+        problems+=("primary reviewer $r has no pass or skip")
+    done
+    if [ "${#counted[@]}" -lt "$MIN" ]; then
+      problems+=("${#counted[@]} of $MIN review passes (${counted[*]:-none})")
+      [ "$self_ignored" = 1 ] &&
+        problems+=("a self review only counts after codex has a pass or a skip (record-skip codex --reason ...)")
     fi
-    if [ "$passes" -eq 0 ]; then
-      for r in $VALID; do   # a fallback (non-required) reviewer's pass is the real pass
-        case " ${REQUIRED[*]} " in *" $r "*) continue;; esac
-        if [ "$(recorded "$r")" = "$rev" ]; then
-          echo "review-gate: required reviewers were skipped for ${rev:0:12}; the $r review is the real pass" >&2
-          exit 0
-        fi
-      done
-      echo "every required reviewer was skipped for ${rev:0:12}; at least one real review pass is required (kimi, codex, coderabbit or agy)" >&2
+    if [ "${#problems[@]}" -gt 0 ]; then
+      echo "missing/stale review pass for ${rev:0:12}: $(IFS=';'; printf '%s' "${problems[*]}" | sed 's/;/; /g')" >&2
       exit 1
     fi
     exit 0
@@ -109,7 +124,7 @@ case "${1:-help}" in
       elif [ -n "$rh" ]; then s="STALE @ ${rh:0:12}"
       elif [ -n "$sh" ]; then s="STALE skip @ ${sh:0:12}"
       else s="(none)"; fi
-      req=""; case " ${REQUIRED[*]-} " in *" $r "*) req=" [required]";; esac
+      req=""; case " ${PRIMARY[*]-} " in *" $r "*) req=" [primary]";; esac
       printf '  %-11s %s%s\n' "$r" "$s" "$req"
     done
     ;;
@@ -125,7 +140,8 @@ case "${1:-help}" in
     {
       echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer]}"
       echo "  reviewers: $VALID"
-      echo "  required : ${REQUIRED[*]-}  (override with REVIEW_GATE_REQUIRED=\"kimi codex\")"
+      echo "  primary  : ${PRIMARY[*]-}  (override with REVIEW_GATE_PRIMARY=\"kodus greptile\")"
+      echo "  passes   : $MIN different reviewers (REVIEW_GATE_MIN); self counts only after codex passed or was skipped"
     } >&2
     exit 2
     ;;

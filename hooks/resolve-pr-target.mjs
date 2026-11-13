@@ -1,14 +1,15 @@
 #!/usr/bin/env node
-// Resolve which git checkout(s) and commit(s) the `gh pr create` invocations in a Bash
-// command will open PRs from, so the PR gate checks THOSE repos' review markers instead
-// of the session's cwd.
+// Resolve which git checkout(s) and commit(s) the `gh pr create` / `gh pr ready`
+// invocations in a Bash command open or mark ready, so the PR gate checks THOSE repos'
+// review markers instead of the session's cwd. `gh pr create --draft` and
+// `gh pr ready --undo` are not gated (a draft is how the PR reviewers get to see it).
 // Part of https://github.com/job-bot-ai/ai-code-review-mcp
 //
 // Usage: resolve-pr-target.mjs <cwd>   (the Bash command on stdin)
 // Prints one JSON object:
 //   { "status": "ok", "targets": [{ "dir", "rev"|null, "note"|null }, ...] }
 //   { "status": "block", "reason": "..." }   a target can't be determined safely
-//   { "status": "help" }                     `gh pr create --help`: nothing to gate
+//   { "status": "help" }                     `--help`, a draft create or `ready --undo`: nothing to gate
 //   { "status": "none" }                     `gh pr create` only appears as data (a heredoc
 //                                            body, a quoted string): no PR is created
 //   { "status": "error", "reason": "..." }   the command couldn't be parsed; "risky": true
@@ -313,7 +314,15 @@ const DATA_SINKS = new Set(['cat', 'tee', 'echo', 'printf', 'git', 'gh', 'grep',
 // Script interpreters: a heredoc/stdin/file fed to them is nearly always a file edit, so a
 // mention there is treated as data; inline code (-c/-e) that mentions gh pr create is opaque.
 const INTERPRETERS = new Set(['python', 'python3', 'node', 'perl', 'ruby', 'php']);
-const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+(create|new)\b/; // same boundary as the hook's pre-filter
+const MENTION = /(^|[^A-Za-z0-9_-]|\\[nt])gh(\s|\\t)+pr(\s|\\t)+(create|new|ready)\b|markPullRequestReadyForReview/; // same boundary as the hook's pre-filter
+// The GraphQL mutation that takes a PR out of draft: only `gh pr ready` may do that.
+const READY_MUTATION = /markPullRequestReadyForReview/;
+const API_CLIENTS = new Set(['curl', 'wget', 'http', 'https', 'xh']);
+/** Index of an API client (`gh api`, curl, wget, httpie) in a command's words, or -1. */
+function apiClientAt(words, from = 0) {
+  return words.findIndex((w, i) => i >= from && !w.dynamic &&
+    ((path.basename(w.value) === 'gh' && words[i + 1]?.value === 'api') || API_CLIENTS.has(path.basename(w.value))));
+}
 const DIR_WORD = /(^|[\s;&|(])(cd|pushd|popd)([\s;&|)]|$)/;
 const ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
@@ -340,12 +349,86 @@ export function awkRuns(program) {
   return /system\s*\(|(^|[^|])\|(?!\|)/.test(code); // piped getline has a lone | too; bare getline reads input
 }
 
+// Runner options that take a separate value (so the value isn't read as the executable).
+// Per runner: short options that take a value (attached `-uroot` or as the next word) and
+// long options that take one as the next word (`--opt=value` is a single word anyway).
+const RUNNER_VALUE_OPTS = {
+  timeout: { short: 'sk', long: ['--signal', '--kill-after'] },
+  env: { short: 'uCS', long: ['--unset', '--chdir', '--split-string'] },
+  sudo: { short: 'ughpCDrtUT', long: ['--user', '--group', '--host', '--prompt', '--close-from', '--chdir', '--role', '--type', '--other-user', '--command-timeout'] },
+  nice: { short: 'n', long: ['--adjustment'] },
+  exec: { short: 'a', long: [] },
+  nohup: { short: '', long: [] },
+};
+
+/**
+ * Where does a runner (`timeout 60`, `env -C d X=y`, `sudo -u u`, `nice -n 5`, `nohup`,
+ * `exec`) put the program it launches? Returns { k, chdir, assigns } with k the index of the
+ * executable, or null when that can't be told (a dynamic word, `env -S`, xargs): callers then
+ * fall back to scanning every argument.
+ */
+export function runnerExec(cmd) {
+  const c0 = progName(cmd[0]);
+  if (!(c0 in RUNNER_VALUE_OPTS)) return null;
+  const assigns = [];
+  let chdir = false;
+  let i = 1;
+  const { short, long } = RUNNER_VALUE_OPTS[c0];
+  const chdirOpt = c0 === 'env' ? 'C' : c0 === 'sudo' ? 'D' : null;
+  let endOfOpts = false;
+  for (; i < cmd.length; i++) {
+    const w = cmd[i];
+    const v = w.value;
+    if (w.dynamic) return null;
+    if (c0 === 'env' && ASSIGN.test(v)) { assigns.push(w); continue; } // also after `--`
+    if (endOfOpts) break;
+    if (v === '--') { endOfOpts = true; continue; }
+    if (c0 === 'env' && v === '-') continue; // `env -` is `env -i`
+    if (!v.startsWith('-')) break;
+    if (c0 === 'nice' && /^-\d+$/.test(v)) continue;
+    if (v.startsWith('--')) {
+      const name = v.split('=')[0];
+      if (c0 === 'env' && name === '--split-string') return null; // runs a string
+      if (name === '--chdir') chdir = true;
+      if (long.includes(name) && !v.includes('=')) i += 1;
+      continue;
+    }
+    // A short-option cluster: a value-taking letter takes the rest of the word (`-uroot`,
+    // `-iCdir`) or, at the end of the word, the next word (`-u root`, `-iC dir`).
+    for (let j = 1; j < v.length; j++) {
+      const ch = v[j];
+      if (!short.includes(ch)) continue;
+      if (c0 === 'env' && ch === 'S') return null; // runs a string
+      if (ch === chdirOpt) chdir = true;
+      if (j === v.length - 1) i += 1;
+      break;
+    }
+  }
+  if (c0 === 'timeout') { // DURATION comes before the command
+    if (i >= cmd.length || cmd[i].dynamic) return null;
+    i += 1;
+  }
+  if (i >= cmd.length) return null;
+  return { k: i, chdir, assigns };
+}
+
+// Shell builtins keep their exact name (`/usr/bin/cd` doesn't move the shell); any other
+// program is classified by its basename, so `/usr/bin/git`, `/bin/bash -c`,
+// `/usr/bin/timeout` are handled like `git`, `bash -c`, `timeout`.
+const BUILTINS = new Set(['cd', 'pushd', 'popd', 'eval', 'source', '.', 'export', 'declare', 'local', 'command', 'builtin', 'exec']);
+export function progName(word) {
+  const v = word?.value ?? '';
+  const base = path.basename(v);
+  return v.includes('/') && BUILTINS.has(base) ? v : base;
+}
+
 function isGhPrCreate(words) {
-  // `gh pr new` is gh's built-in alias of `gh pr create`.
+  // `gh pr new` is gh's built-in alias of `gh pr create`; `gh pr ready` marks a draft ready.
   // ...and gh may be invoked by path (/usr/bin/gh, ./bin/gh).
   return words.length >= 3 && !words[0].dynamic && path.basename(words[0].value) === 'gh' && words[1].value === 'pr' &&
-    (words[2].value === 'create' || words[2].value === 'new');
+    (words[2].value === 'create' || words[2].value === 'new' || words[2].value === 'ready');
 }
+const subOf = (w) => (w.value === 'ready' ? 'ready' : 'create');
 
 /**
  * Walk the command, simulating the shell's working directory, and collect every
@@ -384,11 +467,12 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
 
   // Code that runs in a subshell ($(...), `...`, <(...), bash -c, eval): gate any
   // gh pr create inside it, starting from the current directory.
-  const nested = (script, dir) => {
+  const nested = (script, dir, ghRepo = scope().ghRepo) => {
     const s = scope();
-    const inner = findPrCreates(script, dir, env, { ghRepo: s.ghRepo, cdpath: s.cdpath, pushes, headMoves });
+    const inner = findPrCreates(script, dir, env, { ghRepo, cdpath: s.cdpath, pushes, headMoves });
     for (const h of inner) found.push({ ...h, dir: funcDepth > 0 ? null : h.dir });
     if (inner.opaque) found.opaque = inner.opaque;
+    if (inner.readyMutation) found.readyMutation = true;
   };
   const opaque = (why) => { found.opaque ??= why; };
 
@@ -423,12 +507,11 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     s.dir = s.dirStack.length ? s.dirStack.pop() : null;
   };
 
-  const recordPush = (cmd) => {
+  const recordPush = (cmd, base = scope().dir) => {
     // `git [-C dir] push [opts] <remote> <src>:<dst> ...` — lets `--head <dst>` be checked at
     // <src> even though the push (and its remote-tracking ref) hasn't happened yet.
-    const s = scope();
     let k = 1;
-    let gdir = s.dir;
+    let gdir = base;
     while (k < cmd.length && cmd[k].value.startsWith('-')) {
       const v = cmd[k].value;
       if (v === '-C') {
@@ -450,6 +533,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       return;
     }
     if (sub !== 'push') return;
+    headMoves.push({ dir: gdir, sub, pushOnly: true }); // moves the PR's head, not local HEAD
     const positional = [];
     const rest = cmd.slice(k + 1);
     let remoteGiven = false; // `--repo <remote>` means every positional is a refspec
@@ -531,13 +615,53 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     }
     // `command gh pr create` / `builtin cd x` run the same thing as without the prefix.
     if ((cmd[0].value === 'command' || cmd[0].value === 'builtin') && !cmd[0].dynamic && cmd[1]) cmd = cmd.slice(1);
+    // Runners launch another program: unwrap them (`timeout 60 git push`, `env -C d X=y gh pr
+    // ready`, `sudo -u u bash -c ...`) so the program they run is classified like any other.
+    // `env -C`/`sudo -D` run it elsewhere, so its directory is unknown.
+    let wrapped = false;
+    let runnerChdir = false;
+    const unwrapped = cmd;
+    for (let r = runnerExec(cmd); r && !cmd[0].dynamic; r = runnerExec(cmd)) {
+      wrapped = true;
+      if (r.chdir) runnerChdir = true;
+      assigns.push(...r.assigns);
+      cmd = cmd.slice(r.k);
+    }
+    // Safety net: a runner parse can only add checks, never lose one. If the parsed program
+    // isn't the `gh pr` / `git` command the old argument scan would have found, gate that one
+    // too, the old way (directory unknown if any word looks like a chdir option; the last
+    // GH_REPO= among the words before it).
+    if (wrapped) {
+      const kPr = unwrapped.findIndex((w, idx) => idx > 0 && isGhPrCreate(unwrapped.slice(idx)));
+      if (kPr > 0 && unwrapped.length - kPr !== cmd.length) {
+        const pre = unwrapped.slice(1, kPr);
+        const anyChdir = runnerChdir || pre.some((w) => /^(--chdir|-[A-Za-z]*[CD])/.test(w.value));
+        const repoW = pre.filter((w) => w.value.startsWith('GH_REPO=')).pop() ?? assigns.filter((w) => w.value.startsWith('GH_REPO=')).pop();
+        found.push({
+          dir: anyChdir || funcDepth > 0 ? null : s.dir,
+          sub: subOf(unwrapped[kPr + 2]),
+          args: unwrapped.slice(kPr + 3),
+          ghRepo: repoW ? (repoW.dynamic ? null : repoW.value.slice('GH_REPO='.length)) : s.ghRepo,
+          pushes: [...pushes],
+          headMoves: [...headMoves],
+        });
+      }
+      const kGit = unwrapped.findIndex((w, idx) => idx > 0 && !w.dynamic && progName(w) === 'git');
+      if (kGit > 0 && unwrapped.length - kGit !== cmd.length) recordPush(unwrapped.slice(kGit), null);
+    }
+    // The context the command really runs in, used by every branch below: its directory, and
+    // GH_REPO from prefix/env assignments (the last one wins, as in env and the shell).
+    const here = runnerChdir || funcDepth > 0 ? null : s.dir; // a function body runs later, from wherever it's called
+    const repoAssign = assigns.filter((w) => w.value.startsWith('GH_REPO=')).pop();
+    const ghRepoHere = repoAssign ? (repoAssign.dynamic ? null : repoAssign.value.slice('GH_REPO='.length)) : s.ghRepo;
+    if (wrapped && ['cd', 'pushd', 'popd'].includes(cmd[0].value)) return; // not a builtin there: can't move us
     if (assigns.some((w) => w.value.startsWith('CDPATH=')) && ['cd', 'pushd'].includes(cmd[0].value)) { s.dir = null; return; }
     if (isGhPrCreate(cmd)) {
-      const prefixed = assigns.find((w) => w.value.startsWith('GH_REPO='));
       found.push({
-        dir: funcDepth > 0 ? null : s.dir, // a function body runs later, from wherever it's called
+        dir: here,
+        sub: subOf(cmd[2]),
         args: cmd.slice(3),
-        ghRepo: prefixed ? (prefixed.dynamic ? null : prefixed.value.slice('GH_REPO='.length)) : s.ghRepo,
+        ghRepo: ghRepoHere,
         pushes: [...pushes],
         headMoves: [...headMoves],
       });
@@ -548,15 +672,27 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     const stdinCode = cmd.flatMap((w) => (w.heredoc ? [w.heredoc.body ?? ''] : w.herestring ? [w.value] : []));
     const mentioned = () => cmd.some((w) => MENTION.test(w.heredoc ? w.heredoc.body ?? '' : w.value));
     if (cmd[0].dynamic) { if (mentioned()) opaque(`\`${cmd[0].value}\` (a non-literal command)`); return; }
-    const c0 = cmd[0].value;
+    const c0 = progName(cmd[0]);
     if (c0 === 'cd' || c0 === 'pushd' || c0 === 'popd') { applyDirCommand(cmd, pipelined); return; }
-    if (c0 === 'git') { recordPush(cmd); return; }
+    if (c0 === 'git') { recordPush(cmd, here); return; }
+    // An API client (runners already unwrapped above) that sends the ready mutation in its
+    // arguments, a heredoc, a here-string or a pipe. Only for a runner whose arguments can't be
+    // parsed is every argument scanned for a client, and then a `gh pr create|ready` among its
+    // words wins (the RUNNERS branch below gates it).
+    const runnerRunsPr = RUNNERS.has(c0) && cmd.some((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
+    const client = API_CLIENTS.has(path.basename(c0)) || (path.basename(c0) === 'gh' && cmd[1]?.value === 'api') ? 0
+      : RUNNERS.has(c0) && !runnerRunsPr ? apiClientAt(cmd, 1) : -1;
+    if (client >= 0) {
+      if (cmd.slice(client + 1).some((w) => READY_MUTATION.test(w.heredoc ? w.heredoc.body ?? '' : w.value)) ||
+        (fromPipe !== null && READY_MUTATION.test(fromPipe))) found.readyMutation = true;
+      return;
+    }
     if (c0 === 'eval') {
       // eval runs in this shell. Walk its script even when part of it is an expansion ($X
       // stays a dynamic word); a cd in it isn't modelled, so the directory becomes unknown.
       const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring);
       const script = args.map((w) => w.value).join(' ');
-      nested(script, s.dir);
+      nested(script, here, ghRepoHere);
       if (!pipelined && (args.some((w) => w.dynamic) || DIR_WORD.test(script))) s.dir = null;
       return;
     }
@@ -567,7 +703,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       const isRedirect = (w) => /^\d*[<>]/.test(w.value) && !/^[<>]\(/.test(w.value); // not <(...)
       const args = cmd.slice(1).filter((w) => !w.heredoc && !w.herestring && !isRedirect(w));
       const code = [...stdinCode, ...(fromPipe !== null && (!args.length || ['/dev/stdin', '-'].includes(args[0].value)) ? [fromPipe] : [])];
-      for (const body of code) nested(body, s.dir);
+      for (const body of code) nested(body, here, ghRepoHere);
       if (substMention()) opaque(`${c0} <(...)`);
       if (!pipelined && (args.some((w) => w.dynamic) || code.some((b) => DIR_WORD.test(b)))) s.dir = null;
       return;
@@ -576,7 +712,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
       // A child shell can't move us, but a gh pr create in its script still runs: walk a
       // -c script (even a partly dynamic one) or code on stdin (heredoc, here-string, pipe).
       const ci = cmd.findIndex((w, idx) => idx > 0 && /^-[A-Za-z]*c$/.test(w.value));
-      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, s.dir); return; }
+      if (ci > 0) { if (cmd[ci + 1]) nested(cmd[ci + 1].value, here, ghRepoHere); return; }
       let file = null;
       const rest = cmd.slice(1);
       for (let j = 0; j < rest.length; j++) {
@@ -590,7 +726,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         break;
       }
       if (file) { if (mentioned() || substMention()) opaque(`${c0} ${file.value}`); return; } // a script we can't read
-      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, s.dir);
+      for (const body of [...stdinCode, ...(fromPipe !== null ? [fromPipe] : [])]) nested(body, here, ghRepoHere);
       return;
     }
     if (INTERPRETERS.has(c0)) {
@@ -606,9 +742,10 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
         const chdir = c0 === 'env' && pre.some((w) => /^(--chdir|-[A-Za-z]*C)/.test(w.value));
         const repoArg = c0 === 'env' ? pre.filter((w) => w.value.startsWith('GH_REPO=')).pop() : undefined;
         found.push({
-          dir: chdir || funcDepth > 0 ? null : s.dir,
+          dir: chdir ? null : here,
+          sub: subOf(cmd[k + 2]),
           args: cmd.slice(k + 3),
-          ghRepo: repoArg ? (repoArg.dynamic ? null : repoArg.value.slice('GH_REPO='.length)) : s.ghRepo,
+          ghRepo: repoArg ? (repoArg.dynamic ? null : repoArg.value.slice('GH_REPO='.length)) : ghRepoHere,
           pushes: [...pushes],
         headMoves: [...headMoves],
         });
@@ -641,7 +778,7 @@ export function findPrCreates(command, cwd, env = process.env, inherit = {}) {
     // gh pr create` (gated against the local checkout, conservatively).
     const k = cmd.findIndex((w, idx) => idx > 0 && isGhPrCreate(cmd.slice(idx)));
     if (k > 0) {
-      found.push({ dir: funcDepth > 0 ? null : s.dir, args: cmd.slice(k + 3), ghRepo: s.ghRepo, pushes: [...pushes], headMoves: [...headMoves] });
+      found.push({ dir: here, sub: subOf(cmd[k + 2]), args: cmd.slice(k + 3), ghRepo: ghRepoHere, pushes: [...pushes], headMoves: [...headMoves] });
       return;
     }
     // Otherwise, anything that receives `gh pr create` (in one argument, split across
@@ -700,20 +837,28 @@ const VALUE_LONG = new Set(['--assignee', '--base', '--body', '--body-file', '--
 const VALUE_SHORT = new Set(['a', 'B', 'b', 'F', 'l', 'm', 'p', 'r', 't', 'T', 'H', 'R']);
 const KEY = { H: 'head', R: 'repo', '--head': 'head', '--repo': 'repo' };
 
-/** Pull -R/--repo, -H/--head and -h/--help out of `gh pr create` args (pflag rules). */
-export function parseGhArgs(args) {
-  const out = { repo: undefined, head: undefined, help: false, opaque: null };
+const BOOL_FALSE = /^(false|0|f)$/i;
+
+/** Pull -R/--repo, -H/--head, -h/--help, -d/--draft, --undo and the first positional
+ * (`gh pr ready <number|url|branch>`) out of `gh pr create|ready` args (pflag rules). */
+export function parseGhArgs(args, sub = 'create') {
+  const out = { repo: undefined, head: undefined, help: false, draft: false, undo: false, selector: undefined, opaque: null };
+  const valueLong = sub === 'ready' ? new Set(['--repo']) : VALUE_LONG;
+  const valueShort = sub === 'ready' ? new Set(['R']) : VALUE_SHORT;
   const set = (key, w, value) => { if (key) out[key] = w && !w.dynamic ? value : null; };
   for (let i = 0; i < args.length; i++) {
     const w = args[i];
     const v = w.value;
     if (w.dynamic && !v.startsWith('-')) { out.opaque ??= v; continue; } // could expand to --repo/--head
-    if (v === '--') break;
+    if (w.dynamic && /^--?(d|draft|undo)\b/.test(v)) { out.opaque ??= v; continue; } // --draft=$X
+    if (v === '--') { if (args[i + 1] && out.selector === undefined) out.selector = args[i + 1].value; break; }
     if (v === '--help' || v === '-h') { out.help = true; continue; }
     if (v.startsWith('--')) {
       const eq = v.indexOf('=');
       const name = eq < 0 ? v : v.slice(0, eq);
-      if (!VALUE_LONG.has(name)) continue;
+      if (name === '--draft' && sub === 'create') { out.draft = eq < 0 || !BOOL_FALSE.test(v.slice(eq + 1)); continue; }
+      if (name === '--undo' && sub === 'ready') { out.undo = eq < 0 || !BOOL_FALSE.test(v.slice(eq + 1)); continue; }
+      if (!valueLong.has(name)) continue;
       if (eq >= 0) set(KEY[name], w, v.slice(eq + 1));
       else { const nx = args[++i]; set(KEY[name], nx, nx?.value); }
       continue;
@@ -722,14 +867,22 @@ export function parseGhArgs(args) {
       for (let j = 1; j < v.length; j++) {
         const ch = v[j];
         if (ch === 'h') { out.help = true; continue; }
-        if (!VALUE_SHORT.has(ch)) continue; // boolean shorthand like -d / -f / -w
+        if (ch === 'd' && sub === 'create') {
+          if (w.dynamic) { out.opaque ??= v; break; } // -fd=$DRAFT: can't tell if it's a draft
+          if (v[j + 1] === '=') { out.draft = !BOOL_FALSE.test(v.slice(j + 2)); break; } // -d=false
+          out.draft = true;
+          continue;
+        }
+        if (!valueShort.has(ch)) continue; // boolean shorthand like -f / -w
         let rest = v.slice(j + 1);
         if (rest.startsWith('=')) rest = rest.slice(1);
         if (rest) set(KEY[ch], w, rest);
         else { const nx = args[++i]; set(KEY[ch], nx, nx?.value); }
         break;
       }
+      continue;
     }
+    if (out.selector === undefined) out.selector = v; // positional: `gh pr ready 12`
   }
   return out;
 }
@@ -755,23 +908,57 @@ function git(dir, ...args) {
 // checking the wrong repo (it changes directory or names a repo/branch)?
 const RISKY = /(^|[\s;&|(){}'"`])(cd|pushd|popd)(\s|$)|(^|\s)(--repo|--head)([\s=]|$)|(^|\s)-[A-Za-z]*[RH]|GH_REPO|CDPATH/;
 
+// `gh pr view` for `gh pr ready`: the PR's head commit and branch. REVIEW_GATE_GH lets the
+// tests use a fake gh.
+function prHead(dir, selector, repo) {
+  const args = ['pr', 'view', ...(selector !== undefined ? [selector] : []), '--json', 'headRefOid,headRefName',
+    ...(repo ? ['--repo', repo] : [])];
+  try {
+    const out = execFileSync(process.env.REVIEW_GATE_GH || 'gh', args,
+      { cwd: dir, encoding: 'utf8', timeout: 20000, stdio: ['ignore', 'pipe', 'ignore'] });
+    const j = JSON.parse(out);
+    return /^[0-9a-f]{40}$/.test(j.headRefOid ?? '') ? { oid: j.headRefOid, branch: j.headRefName } : null;
+  } catch {
+    return null;
+  }
+}
+
+function worktreeFor(dir, branch) {
+  return (git(dir, 'worktree', 'list', '--porcelain') ?? '').split('\n\n').map((block) => ({
+    path: block.match(/^worktree (.+)$/m)?.[1],
+    branch: block.match(/^branch refs\/heads\/(.+)$/m)?.[1],
+  })).find((w) => w.branch === branch && w.path)?.path ?? null;
+}
+
 function resolveOne(hit) {
+  const sub = hit.sub ?? 'create';
+  const what = `\`gh pr ${sub}\``;
+  const { repo: flagRepo, head, help, draft, undo, selector, opaque } = parseGhArgs(hit.args, sub);
+  if (help) return { help: true };
+  if (opaque) return { block: `${what} has a non-literal argument (${opaque}) that could change which PR or repo it acts on; pass it literally` };
+  // Never gated, wherever they run: a draft PR is how the reviewers get to see it.
+  if (sub === 'create' && draft) return { help: true };
+  if (sub === 'ready' && undo) return { help: true }; // back to draft
   if (hit.dir === null) {
-    return { block: "can't tell which repo a `gh pr create` runs in: a `cd` before it isn't a literal path, or only runs conditionally. Use `cd /literal/path && gh pr create ...`" };
+    return { block: `can't tell which repo a ${what} runs in: a \`cd\` before it isn't a literal path, or only runs conditionally. Use \`cd /literal/path && gh pr ${sub} ...\`` };
   }
   let dir = hit.dir;
   if (!existsSync(dir) || !statSync(dir).isDirectory()) {
-    return { block: `\`gh pr create\` would run in ${dir}, which doesn't exist` };
+    return { block: `${what} would run in ${dir}, which doesn't exist` };
   }
-  const { repo: flagRepo, head, help, opaque } = parseGhArgs(hit.args);
-  if (help) return { help: true };
-  if (opaque) return { block: `\`gh pr create\` has a non-literal argument (${opaque}) that could set --repo/--head; pass flags literally` };
-  const repo = flagRepo !== undefined ? flagRepo : hit.ghRepo;
+  let repo = flagRepo !== undefined ? flagRepo : hit.ghRepo;
+  // `gh pr ready https://github.com/OWNER/REPO/pull/N` acts on the URL's repo, whatever
+  // --repo/GH_REPO say: check that repo against the checkout like --repo.
+  const urlRepo = sub === 'ready' && typeof selector === 'string' ? selector.match(/^https?:\/\/[^/]+\/([^/]+\/[^/]+)\/pull\/\d+/)?.[1] : undefined;
+  if (urlRepo) repo = urlRepo;
   const notes = [];
   const top = git(dir, 'rev-parse', '--show-toplevel');
   if (top === null) {
     if (repo !== undefined || head !== undefined) {
       return { block: `${dir} isn't a git checkout, so the reviews behind this --repo/--head PR can't be verified. Run it from the checkout.` };
+    }
+    if (sub === 'ready') {
+      return { block: `${dir} isn't a git checkout, so the reviews behind \`gh pr ready\` can't be verified. Run it from the PR's checkout.` };
     }
     return { target: { dir, rev: null, note: `${dir} isn't a git repo; not gated` } };
   }
@@ -786,7 +973,7 @@ function resolveOne(hit) {
     if (!want || !have.includes(want)) {
       return {
         block: `the PR targets ${repo}, but ${dir} is a checkout of ${have.join(', ') || '(no remotes)'}. ` +
-          `Run it from the target checkout so the gate checks that repo's reviews: cd <checkout of ${repo}> && gh pr create ...`,
+          `Run it from the target checkout so the gate checks that repo's reviews: cd <checkout of ${repo}> && gh pr ${sub} ...`,
       };
     }
   }
@@ -794,9 +981,31 @@ function resolveOne(hit) {
   // A commit made earlier in this same command (git commit/merge/rebase/pull...) is what
   // the PR will contain, but the hook runs before it exists, so it can't have been reviewed.
   const repoOf = (d) => (d ? git(d, 'rev-parse', '--path-format=absolute', '--git-common-dir') ?? git(d, 'rev-parse', '--show-toplevel') : null);
-  const moved = (hit.headMoves ?? []).find((m) => m.dir === null || repoOf(m.dir) === repoOf(dir));
+  const moved = (hit.headMoves ?? []).find((m) => (!m.pushOnly || sub === 'ready') &&
+    (m.dir === null || repoOf(m.dir) === repoOf(dir)));
+  if (moved?.pushOnly) {
+    return { block: `\`git push\` runs before \`gh pr ready\` in the same command, so the PR's head would be a commit the gate can't look up yet. Push first, make sure the reviews cover the pushed commit, then run gh pr ready on its own.` };
+  }
   if (moved) {
-    return { block: `\`git ${moved.sub}\` runs before \`gh pr create\` in the same command, so the PR would contain a commit that doesn't exist yet and can't have been reviewed. Commit first, review it, then run gh pr create.` };
+    return { block: `\`git ${moved.sub}\` runs before ${what} in the same command, so the PR would contain a commit that doesn't exist yet and can't have been reviewed. Commit first, review it, then run gh pr ${sub}.` };
+  }
+
+  if (sub === 'ready') {
+    // The reviews must cover the PR's head commit on GitHub, which may differ from local HEAD.
+    const pr = prHead(dir, selector, repo);
+    if (!pr) {
+      if (selector !== undefined) {
+        return { block: `couldn't look up PR ${selector} with \`gh pr view\`, so there's no way to tell which commit it would mark ready. Run \`gh pr ready\` with no argument from the PR's checkout.` };
+      }
+      notes.push("couldn't look up the PR with `gh pr view`; checked local HEAD");
+      return { target: { dir, rev: null, note: notes.join('; ') } };
+    }
+    const wt = worktreeFor(dir, pr.branch);
+    if (wt) dir = wt; // markers live in the worktree that has the branch checked out
+    if (!git(dir, 'rev-parse', '--verify', '--quiet', `${pr.oid}^{commit}`)) {
+      return { block: `the PR's head commit ${pr.oid.slice(0, 12)} (${pr.branch}) isn't in ${dir}, so it can't have been reviewed there. Fetch or check out the branch, review that commit, then run \`gh pr ready\`.` };
+    }
+    return { target: { dir, rev: pr.oid, note: notes.length ? notes.join('; ') : null } };
   }
 
   let rev = null;
@@ -823,12 +1032,9 @@ function resolveOne(hit) {
       dir = top; // its markers live in the checkout that pushed
     } else if (branch !== current) {
       // Markers live in each worktree's own git dir: prefer the worktree that has the branch.
-      const wt = (git(dir, 'worktree', 'list', '--porcelain') ?? '').split('\n\n').map((block) => ({
-        path: block.match(/^worktree (.+)$/m)?.[1],
-        branch: block.match(/^branch refs\/heads\/(.+)$/m)?.[1],
-      })).find((w) => w.branch === branch && w.path);
+      const wt = worktreeFor(dir, branch);
       if (wt) {
-        dir = wt.path;
+        dir = wt;
       } else {
         rev = git(dir, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`);
         if (!rev) {
@@ -854,6 +1060,12 @@ export function resolveTargets(command, cwd, env = process.env) {
     hits = findPrCreates(command, cwd, env);
   } catch (err) {
     return { status: 'error', reason: String(err?.message ?? err), risky: RISKY.test(command) };
+  }
+  if (hits.readyMutation) {
+    return { status: 'block', reason: 'mark a PR ready with `gh pr ready` (gated on the recorded reviews), not through the GraphQL API.' };
+  }
+  if (hits.opaque && READY_MUTATION.test(command)) {
+    return { status: 'block', reason: `the GraphQL ready mutation is passed to ${hits.opaque}, which the gate can't follow. Use \`gh pr ready\`.` };
   }
   if (!hits.length) {
     if (hits.opaque) {
