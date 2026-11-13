@@ -23,7 +23,7 @@
 #      runs): a finished OpenQodex review of exactly that commit that passed, or whose findings were declined with
 #      `prepush-accept --reason "..."` (announced like a skip), given the punch list that is on main now.
 #
-# Pre-push review (`prepush [--base <ref>]`): OpenQodex reviews the whole change against the base, with the punch
+# Pre-push review (`prepush [--base <ref>] [--wait[=<secs>]]`; --wait waits for a running one, then runs or reports): OpenQodex reviews the whole change against the base, with the punch
 # list as its convention files. githooks/pre-push (installed with install-githooks) runs `check-prepush` for every
 # branch commit a `git push` sends and blocks anything else: no review, an unfinished one, findings, a stale list.
 # Reviewers: kodus, greptile (primaries), codex (fallback), self (last resort). `coderabbit` stays
@@ -223,12 +223,46 @@ verify_prepush() {
   return 0
 }
 
-# One prepush/prepush-accept at a time per repository (they share OpenQodex's last-review record).
+# One prepush/prepush-accept at a time per repository (they share OpenQodex's last-review record). The lock is in the
+# common git dir, so every worktree of the repository shares it.
+# prepush_lock [<seconds>]: without a wait, a held lock is refused at once (exit 2). With one (`prepush --wait`), it
+# blocks on the lock itself (flock -w), never on a process search: `until ! pgrep -f "openqodex review"` matches its
+# own shell and never ends (#30/#31 stalled ~40 min each). Still held after <seconds>: exit 6. Sets lock_waited=1
+# when another run held it, and lock_mark to a file made before the wait (a record newer than it is that run's).
+lock_waited=0 lock_mark=""
 prepush_lock() {
   mkdir -p "$pdir"
   command -v flock >/dev/null 2>&1 || return 0
   exec 9>>"$pdir/lock"
-  flock -n 9 || die "another prepush/prepush-accept is running in this repository; wait for it"
+  [ -z "${1:-}" ] || { lock_mark="$(mktemp "$pdir/.wait.XXXXXX")" || die "couldn't create a wait marker in $pdir"; }
+  flock -n 9 && return 0
+  [ -n "${1:-}" ] || die "another prepush/prepush-accept is running in this repository; wait for it with \`review-gate prepush --wait\` (never a pgrep loop)"
+  echo "review-gate: another prepush/prepush-accept is running in this repository; waiting up to ${1}s for it to finish..." >&2
+  flock -w "$1" 9 || { rm -f "${lock_mark:?}"; echo "review-gate: the other prepush/prepush-accept still holds the lock after ${1}s; stopped waiting. Nothing was reviewed (exit 6): \`review-gate status\` shows what is recorded" >&2; exit 6; }
+  lock_waited=1
+}
+
+# After `prepush --wait` waited for another run: that run's result for HEAD, if it left one (a record newer than the
+# wait). A finished review is reported as \`check-prepush\` would judge it (exit 0 holds, 1 doesn't); a failed one exits
+# 4 with its reason. Returns only when the run left nothing for HEAD (another commit or worktree): then HEAD is reviewed.
+report_waited() {
+  local m="$pdir/$head.json" l="$pdir/$head.last" mark="$lock_mark" newm=0 newl=0
+  # (-nt is true of any file when the marker is gone: compare first, then remove it.)
+  [ -f "$mark" ] || die "the wait marker $mark is gone; run prepush again"
+  [ -f "$m" ] && [ "$m" -nt "$mark" ] && newm=1
+  [ -f "$l" ] && [ "$l" -nt "$mark" ] && newl=1
+  rm -f "${mark:?}"
+  if [ "$newm" = 1 ]; then
+    echo "review-gate: the run waited for reviewed ${head:0:12}: $(jq -r '"\(.verdict) (OpenQodex vs \(.base_ref))" + (if .counts != "" then ": \(.counts)" else "" end)' "$m" 2>/dev/null); not reviewing it again" >&2
+    verify_prepush "$head" "$branch" || exit 1
+    echo "review-gate: pre-push review passed for $branch @ ${head:0:12} (the run waited for; $(jq -r '"OpenQodex vs \(.base_ref)"' "$m"))"
+    exit 0
+  fi
+  if [ "$newl" = 1 ]; then
+    echo "review-gate: the run waited for, of ${head:0:12}, FAILED: $(head -c 400 "$l"). Fix that, then run \`review-gate prepush\` again" >&2
+    exit 4
+  fi
+  echo "review-gate: the run waited for left no review of ${head:0:12} (another commit or worktree); reviewing it now" >&2
 }
 
 # The base to review against: the PR base if gh can tell, else origin/main.
@@ -249,12 +283,14 @@ dirty() {   # a git status that fails counts as dirty
 }
 
 run_prepush() {
-  local base="" unit="" runid tmo grace mem cfg list copy tmp rid lr start rc=0 rd cid verdict kind name blob path sz total=0 big=""
+  local base="" wait="" unit="" runid tmo grace mem cfg list copy tmp rid lr start rc=0 rd cid verdict kind name blob path sz total=0 big=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --base) [ -n "${2:-}" ] || die "--base needs a ref"; base="$2"; shift 2 ;;
       --base=*) base="${1#--base=}"; shift ;;
-      *) die "usage: prepush [--base <ref>]" ;;
+      --wait) wait=default; shift ;;
+      --wait=*) wait="${1#--wait=}"; [[ "$wait" =~ ^[1-9][0-9]*$ ]] || die "--wait=<seconds> needs a whole number of seconds (1 or more)"; shift ;;
+      *) die "usage: prepush [--base <ref>] [--wait[=<seconds>]]" ;;
     esac
   done
   command -v jq >/dev/null 2>&1 || die "jq is required for prepush"
@@ -262,9 +298,14 @@ run_prepush() {
   [ "$("$OQ_BIN" --version 2>/dev/null)" = "$OQ_VERSION" ] || die "$OQ_BIN is not OpenQodex $OQ_VERSION, the pinned version"
   tmo="${REVIEW_GATE_PREPUSH_TIMEOUT:-1800}"; [[ "$tmo" =~ ^[0-9]+$ ]] || die "REVIEW_GATE_PREPUSH_TIMEOUT must be seconds"
   grace="${REVIEW_GATE_PREPUSH_GRACE:-120}"; [[ "$grace" =~ ^[0-9]+$ ]] || die "REVIEW_GATE_PREPUSH_GRACE must be seconds"
+  # The default wait outlasts the longest run another prepush can make: its timeout, grace, the KILL step, and 5 min.
+  local ka="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}"; [[ "$ka" =~ ^[0-9]+$ ]] || die "REVIEW_GATE_PREPUSH_KILL_AFTER must be seconds"
+  [ "$wait" != default ] || wait=$((tmo + grace + ka + 300))
   [ -n "$base" ] || base="$(default_base)"
   git rev-parse --verify -q "$base^{commit}" >/dev/null || die "base '$base' is not a commit here (fetch it, or pass --base <ref>)"
-  prepush_lock
+  prepush_lock "$wait"
+  [ "$lock_waited" = 0 ] || report_waited
+  [ -z "$lock_mark" ] || rm -f "${lock_mark:?}"
   # Survivors of an earlier run that outlived KILL: no new review while any of them is alive.
   if [ -f "$pdir/survivors" ]; then
     local kind id st alive=""
@@ -593,7 +634,7 @@ case "${1:-help}" in
   *)
     {
       echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>] [--branch <name>]|status|clear [reviewer|prepush]}"
-      echo "       review-gate {prepush [--base <ref>]|prepush-accept --reason \"...\"|check-prepush [--rev <commit> [--branch <name>]]|change-id <base> [<commit>]|bypass-log}"
+      echo "       review-gate {prepush [--base <ref>] [--wait[=<seconds>]]|prepush-accept --reason \"...\"|check-prepush [--rev <commit> [--branch <name>]]|change-id <base> [<commit>]|bypass-log}"
       echo "  reviewers: $VALID"
       echo "  primary  : ${PRIMARY[*]-}  (override with REVIEW_GATE_PRIMARY=\"kodus greptile\")"
       echo "  passes   : $MIN different reviewers (REVIEW_GATE_MIN); self counts only after codex passed or was skipped"

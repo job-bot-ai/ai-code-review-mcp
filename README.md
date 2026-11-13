@@ -261,6 +261,7 @@ This repo only adds glue: fetching the punch list, binding a review to a commit,
 
 ```bash
 review-gate prepush [--base <ref>]   # default base: the PR's base (gh pr view), else origin/main
+review-gate prepush --wait[=<secs>]  # another prepush is running: wait for it, then run or report (below)
 # fix every finding at minor or above (and the same bug class elsewhere), commit, run it again, then push
 review-gate prepush-accept --reason "why each finding is not being fixed"   # declining, for this commit only
 review-gate status                   # shows the pre-push review of HEAD
@@ -310,6 +311,20 @@ reviewed change exactly the commit you push) it:
    change id. Exit 2 (incomplete, no reviewer that can start,
    OpenQodex failing), "Nothing to review", HEAD moving during the run: nothing passes, exit 4, and the reason is
    kept in `<sha>.last`.
+
+**One at a time, and `--wait`.** One `prepush`/`prepush-accept` runs at a time per repository (a lock in
+`$GIT_COMMON_DIR/review-gate-prepush/`, shared by every worktree). A second one is refused at once (exit 2) unless it
+is given `--wait`, which blocks on that lock itself (`flock -w`) for `<secs>`, by default the longest run another
+prepush can make (`REVIEW_GATE_PREPUSH_TIMEOUT` + `_GRACE` + `_KILL_AFTER` + 300 s, 2,250 s by default). Then:
+
+- the run it waited for reviewed HEAD (or accepted its findings): it reports that result as `check-prepush` would judge it, without a second
+  review (exit 0 when it holds, 1 when it doesn't: blocked, or no longer current), or exit 4 with the reason when
+  that run failed;
+- that run left nothing for HEAD (another commit, or another worktree's): it reviews HEAD itself;
+- the lock is still held after `<secs>`: exit 6, nothing reviewed.
+
+Wait with `--wait`, never with a process search: `until ! pgrep -f "openqodex review"` matches the shell running it
+and never ends (two ~40 min stalls on pr-orchestrator #30/#31, 2026-11-13).
 
 **Findings.** A `blocked` review exits 1. Fix the findings. Declining them for that commit with
 `prepush-accept --reason "..."` (only after a finished review with findings; an unfinished review can't be

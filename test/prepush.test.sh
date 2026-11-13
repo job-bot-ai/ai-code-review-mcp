@@ -81,6 +81,69 @@ mkdir -p "$W/.git/review-gate-prepush"
 flock "$W/.git/review-gate-prepush/lock" bash -c "cd '$W' && bash '$gate' prepush --base origin/main" >"$T/lk" 2>&1; rc=$?; out="$(cat "$T/lk")"
 expect "a second prepush while one runs is refused" 2 "another prepush/prepush-accept is running"
 
+# ── prepush --wait: block on the lock itself (flock -w), then run or report ──
+# Agents hand-rolled `until ! pgrep -f "openqodex review"`, which matches its own shell (#30/#31 stalled ~40 min).
+lk="$W/.git/review-gate-prepush/lock"
+oqn() { wc -l <"$T/oq-args" 2>/dev/null | tr -d ' '; }   # OpenQodex runs so far (the stub logs each one's arguments)
+# hold <seconds>: another holder of the lock (not a review) for that long, in the background; returns once it holds it
+# (flock -o: flock alone holds it, so `unhold` killing flock frees it; then its sleep, whose pid is in $T/held, goes too.)
+hold() { rm -f "$T/held"; flock -o "$lk" bash -c 'echo $$ >"$1"; exec sleep "$2"' _ "$T/held" "$1" & holder=$!
+  for _ in $(seq 1 50); do [ -s "$T/held" ] && break; sleep 0.1; done; }
+unhold() { kill "$holder" "$(cat "$T/held")" 2>/dev/null; wait "$holder" 2>/dev/null; }
+# bgrun <env...>: a real prepush in the background (in $BW, default $W); returns once its OpenQodex has started (the lock held)
+bgrun() { local n; n="$(oqn)"
+  (cd "${BW:-$W}" && env "$@" bash "$gate" prepush --base origin/main) >"$T/bg.out" 2>&1 & bg=$!
+  for _ in $(seq 1 100); do [ "$(oqn)" != "$n" ] && return; sleep 0.1; done
+  echo "FAIL - the background prepush never started OpenQodex: $(cat "$T/bg.out")"; fail=$((fail + 1)); }
+change wait-1
+hold 3; s0=$SECONDS; n0="$(oqn)"
+prepush --wait=30
+[ $((SECONDS - s0)) -ge 2 ] || { out="$out (returned after $((SECONDS - s0))s: it didn't wait)"; rc=99; }
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "prepush --wait waits for the lock, then reviews (red without the wait: refused at once, exit 2)" 0 "pre-push review passed"
+[[ "$out" == *"waiting up to 30s"* && "$out" == *"left no review"* ]] || { rc=97; }
+expect "and says it is waiting, and that the holder left no review of HEAD" 0
+wait "$holder" 2>/dev/null
+hold 15; s0=$SECONDS
+prepush --wait=1
+[ $((SECONDS - s0)) -le 6 ] || { out="$out (took $((SECONDS - s0))s)"; rc=99; }
+expect "a wait that runs out exits 6, having reviewed nothing" 6 "stopped waiting"
+unhold
+prepush --wait=abc
+expect "--wait=<not seconds> is a usage error" 2 "whole number of seconds"
+prepush --wait=0
+expect "--wait=0 is a usage error too" 2 "whole number of seconds"
+# The run waited for reviewed HEAD: its result is reported, and HEAD isn't reviewed a second time.
+change wait-2
+bgrun STUB_OQ_DELAY=3; n0="$(oqn)"
+prepush --wait
+wait "$bg"
+[ "$(oqn)" = "$n0" ] || { out="$out (OpenQodex ran again: $n0 -> $(oqn))"; rc=98; }
+expect "prepush --wait after another review of HEAD reports its pass, without a second review" 0 "the run waited for reviewed"
+push -q origin feat
+expect "and that commit can be pushed" 0
+change wait-3
+bgrun STUB_OQ_DELAY=3 STUB_OQ=blocked; n0="$(oqn)"
+prepush --wait
+wait "$bg"
+[ "$(oqn)" = "$n0" ] || { out="$out (OpenQodex ran again)"; rc=98; }
+expect "a waited-for review that blocked HEAD is reported as blocked (exit 1)" 1 "OpenQodex blocked it"
+change wait-4
+bgrun STUB_OQ_DELAY=3 STUB_OQ=incomplete; n0="$(oqn)"
+prepush --wait
+wait "$bg"
+[ "$(oqn)" = "$n0" ] || { out="$out (OpenQodex ran again)"; rc=98; }
+expect "a waited-for review of HEAD that failed is reported as failed (exit 4)" 4 "FAILED"
+# Another worktree shares the lock: its review is of another commit, so this one is reviewed after it.
+git -C "$W" worktree add -q -b feat-wt "$T/w2" HEAD && echo wt >>"$T/w2/g.txt" && git -C "$T/w2" add g.txt && git -C "$T/w2" commit -q -m wt
+BW="$T/w2" bgrun STUB_OQ_DELAY=3; n0="$(oqn)"
+prepush --wait
+wait "$bg"
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "after another worktree's review (another commit), --wait reviews HEAD itself" 0 "pre-push review passed"
+git -C "$W" worktree remove --force "$T/w2"
+prepush
+
 # ── a different commit ──
 change two
 push -q origin feat
