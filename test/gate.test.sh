@@ -47,7 +47,19 @@ mkrepo "$T/a" acme/alpha && green "$T/a"
 mkrepo "$T/b" acme/beta
 mkrepo "$T/np" acme/noprepush && (cd "$T/np" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null)
 run "$T/np" "gh pr create --fill"
-expect "two passes without a pre-push review don't make check pass" 2 stderr "no passing pre-push review"
+expect "every primary passed this head: no pre-push review needed at ready/merge (Tim, 2026-11-13)" 0 stdout \
+  "pre-push review not required"
+REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 run "$T/np" "gh pr create --fill"
+expect "REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 still requires it" 2 stderr "no passing pre-push review"
+out="$(cd "$T/np" && REVIEW_GATE_MERGE_NEEDS_PREPUSH=true bash "$gate" check 2>&1)"; rc=$?
+expect "REVIEW_GATE_MERGE_NEEDS_PREPUSH=true is refused, never read as off" 2 stdout "must be 0 or 1"
+mkrepo "$T/np2" acme/noprepush2 && (cd "$T/np2" && bash "$gate" record kodus >/dev/null &&
+  bash "$gate" record-skip coderabbit --reason "not installed on this repo" >/dev/null && bash "$gate" record codex >/dev/null)
+run "$T/np2" "gh pr create --fill"
+expect "a skipped primary is no pass: the pre-push review is still required" 2 stderr "no passing pre-push review"
+mkrepo "$T/np3" acme/noprepush3 && (cd "$T/np3" && bash "$gate" record kodus >/dev/null && bash "$gate" record codex >/dev/null)
+run "$T/np3" "gh pr create --fill"
+expect "one primary passed, the other missing: the pre-push review is still required" 2 stderr "no passing pre-push review"
 mkdir "$T/plain"
 
 run "$T/a" "cd $T/b && gh pr create --fill"
@@ -474,11 +486,13 @@ chmod +x "$T/stackgh"
 (cd "$T/stackrepo" && bash "$gate" record kodus >/dev/null && bash "$gate" record coderabbit >/dev/null &&
   REVIEW_GATE_GH="$T/stackgh" bash "$gate" prepush --base origin/base1 >/dev/null 2>&1) || echo "stacked prepush failed" >&2
 git -C "$T/stackrepo" switch -q main
-REVIEW_GATE_GH="$T/stackgh" run "$T/stackrepo" "gh pr ready 7"
+# Both primaries passed this commit, which would waive the pre-push review: these three require it, so they still
+# test its base rule (allowed by the PR's base, refused without it), not the waiver (Greptile on PR 30).
+REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 REVIEW_GATE_GH="$T/stackgh" run "$T/stackrepo" "gh pr ready 7"
 expect "gh pr ready <n> for a reviewed stacked PR, from main, judges the base by that PR's base (allowed)" 0
-out="$(cd "$T/stackrepo" && REVIEW_GATE_GH="$T/stackgh" bash "$gate" check --rev "$stk" 2>&1)"; rc=$?
+out="$(cd "$T/stackrepo" && REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 REVIEW_GATE_GH="$T/stackgh" bash "$gate" check --rev "$stk" 2>&1)"; rc=$?
 expect "check --rev of another commit without --branch never uses the checked-out branch's PR (only the default branch)" 1 "not on origin's default branch"
-out="$(cd "$T/stackrepo" && REVIEW_GATE_GH="$T/stackgh" bash "$gate" check --branch stk --rev "$stk" 2>&1)"; rc=$?
+out="$(cd "$T/stackrepo" && REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 REVIEW_GATE_GH="$T/stackgh" bash "$gate" check --branch stk --rev "$stk" 2>&1)"; rc=$?
 expect "check --branch <the PR's branch> --rev (either order) passes" 0
 
 # ── Ways around the git pre-push hook (bypass_check): blocked; ordinary git use is not ──

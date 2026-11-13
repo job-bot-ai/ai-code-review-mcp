@@ -113,7 +113,11 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
 3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback);
 4. the commit has a **pre-push review**, the same check the git pre-push hook makes: a finished OpenQodex review
    of exactly that commit that passed (or whose findings were declined with `prepush-accept`, which every check
-   announces), given the punch list that is on main now. See the next section.
+   announces), given the punch list that is on main now. See the next section. **Unless every primary reviewer
+   passed that exact commit** (Tim, 2026-11-13): a head Kodus and Greptile both reviewed clean doesn't wait for a
+   local review again at `gh pr ready` / `gh pr merge`, and `check` says so. A skipped primary is not a pass, so
+   with one skipped the pre-push review is still required. `REVIEW_GATE_MERGE_NEEDS_PREPUSH=1` requires it always.
+   The git pre-push hook is unchanged: a push still needs its pre-push review.
 
 Reviewers: `kodus`, `greptile` (primaries; `coderabbit` stays valid for old records), `codex` (fallback), `self`
 (the agent's own thorough review, last resort). `agy` stays valid for old records. `kimi`
