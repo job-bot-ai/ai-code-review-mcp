@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PreToolUse(Bash) hook: `gh pr create --draft` is always allowed (the PR reviewers —
-# Kodus, CodeRabbit/Greptile — only review a PR that exists). `gh pr ready` and a non-draft
+# Kodus, Greptile — only review a PR that exists). `gh pr ready` and a non-draft
 # `gh pr create` are blocked until `review-gate check` passes (two different reviewers'
 # passes, primaries passed or skipped) for the PR's commit, in the repo the PR comes from
 # (followed from `cd`/`--repo`/`--head` by resolve-pr-target.mjs; the session cwd is only
@@ -14,8 +14,10 @@
 
 input="$(cat)"
 
-# Fast path: if the payload can't possibly contain `gh ... pr ... create`, allow now.
-printf '%s' "$input" | grep -Eq 'gh[^"]*pr[^"]*(create|new|ready)|markPullRequestReadyForReview' || exit 0   # `gh pr new` is an alias
+# Fast path: if the payload can't possibly contain `gh ... pr ... create`, allow now. Quotes and
+# backslashes are dropped first: the shell removes them, so `gh pr "ready"` and `gh pr re\ady` run
+# `gh pr ready` (the resolver unquotes; it only has to be reached).
+printf '%s' "$input" | tr -d "\"'\\\\" | grep -Eq 'gh.*pr.*(create|new|ready)|markPullRequestReadyForReview' || exit 0   # `gh pr new` is an alias
 
 # Pull the actual command string out of tool_input.command. jq is required to isolate the
 # command from surrounding JSON reliably; without it, warn (not silent) and fail open
@@ -37,7 +39,11 @@ fi
 # and pipes into shells, and lets mentions that are only data (commit messages, grep
 # patterns) through. Only the no-node fallback below keeps the command-position match.
 # (`\n`/`\t` escapes count as separators: `printf 'cd x\ngh pr create' | bash`.)
-printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new|ready)([^[:alnum:]_-]|$)|markPullRequestReadyForReview' || exit 0
+# The second pass drops quotes and backslash escapes (keeping the `\n`/`\t` separators), as the
+# shell would: `gh pr "ready" 24`, `g''h pr create`, `gh pr re\ady`.
+mention_re='(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(create|new|ready)([^[:alnum:]_-]|$)|markPullRequestReadyForReview'
+printf '%s' "$cmd" | grep -Eq "$mention_re" ||
+  printf '%s' "$cmd" | sed -E "s/[\"']//g; s/\\\\([^nt])/\\1/g" | grep -Eq "$mention_re" || exit 0
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"
@@ -64,6 +70,30 @@ fallback_or_block() {
   risky && block "couldn't run the target resolver ($1), and the command changes directory or names a repo/branch, so the session cwd may be the wrong repo."
   notes="review-gate: $1; checked the session cwd"
 }
+# No-node fallback for --help / --draft / --undo: only a single simple `gh pr <sub> ...` command
+# can be read without a shell parser. With several commands (`echo --undo; gh pr ready`) or a
+# substitution, a flag may belong to another command, so the reviews are checked. A flag only
+# counts as the exact word (`--draft=false`, `"--draft"` don't), and not as the value of the
+# flag before it (`--title --draft` is a title).
+fallback_exempt() {
+  case "$cmd" in *[\;\|\&\(\)\{\}\`]*|*$'\n'*) return 1;; esac
+  local -a w; read -r -a w <<<"$cmd"
+  [ "${w[0]:-}" = gh ] && [ "${w[1]:-}" = pr ] || return 1
+  local sub="${w[2]:-}" prev="" t
+  for t in "${w[@]:3}"; do
+    case "$prev" in
+      -*=*|--draft|-d|--undo|--fill|-f|--fill-first|--fill-verbose|--web|-w|--no-maintainer-edit|--dry-run|"") ;;
+      -*) prev="$t"; continue ;;   # may be this flag's value
+    esac
+    case "$sub:$t" in
+      *:--help|*:-h) return 0 ;;
+      create:--draft|create:--draft=true|create:-d|new:--draft|new:--draft=true|new:-d) return 0 ;;
+      ready:--undo|ready:--undo=true) return 0 ;;
+    esac
+    prev="$t"
+  done
+  return 1
+}
 targets=""; notes=""
 if command -v node >/dev/null 2>&1 && [ -r "$here/resolve-pr-target.mjs" ]; then
   res="$(printf '%s' "$cmd" | node "$here/resolve-pr-target.mjs" "$session_cwd" 2>/dev/null || true)"
@@ -88,7 +118,7 @@ else
     block "the command mentions the GraphQL ready mutation and the target resolver (node) isn't available. Use \`gh pr ready\`."
   fi
   printf '%s' "$cmd" | grep -Eq '(^|[;|&(){])[[:space:]]*gh[[:space:]]+pr[[:space:]]+(create|new|ready)([[:space:];|&)}]|$)' || exit 0
-  case "$cmd" in *--help*|*" -h"*|*--draft*|*--undo*) exit 0;; esac   # crude help/draft check without the resolver
+  fallback_exempt && exit 0   # help, a draft create or `ready --undo`, in a single simple command
   fallback_or_block "node unavailable"
 fi
 [ -n "$targets" ] || targets="$(jq -cn --arg d "$session_cwd" '{dir: $d, rev: null, note: null}')"
@@ -116,8 +146,11 @@ while IFS= read -r t; do
         blocked="${blocked:+$blocked
 }  $where: ${out:-no green light recorded}
     status there:  cd $q && bash $(printf '%q' "$gate") status$revnote" ;;
-    *)  [ -n "$note" ] || msgs="${msgs:+$msgs
+    3)  [ -n "$note" ] || msgs="${msgs:+$msgs
 }review-gate: $dir is not a git repo with commits; not gated" ;;   # fail-open by design
+    *)  # any other failure (bad REVIEW_GATE_MIN, a crash) is not a green light
+        blocked="${blocked:+$blocked
+}  $where: review-gate check failed (exit $rc): ${out:-no output}" ;;
   esac
 done <<<"$targets"
 
@@ -127,11 +160,11 @@ if [ -n "$blocked" ]; then
     echo "BLOCKED by the AI code-review PR gate: two independent reviews must be green on the PR's final commit first."
     echo "$blocked"
     echo "1. Open the PR as a draft (allowed without reviews):  gh pr create --draft ..."
-    echo "2. The primary reviewers review it: Kodus + CodeRabbit through 2026-11-18, Kodus + Greptile from 2026-11-19 (UTC)."
-    echo "   Kodus starts by itself; CodeRabbit skips drafts, so comment \`@coderabbitai review\` (Greptile: \`@greptileai review\`)."
+    echo "2. The primary reviewers review it: Kodus + Greptile."
+    echo "   Kodus starts by itself; comment \`@greptileai review\` to start Greptile."
     echo "   Fix high findings, fix medium ones or say why not, push, request a re-review, then record each clean pass:"
     echo "       $g record kodus"
-    echo "       $g record coderabbit      (through 2026-11-18; from 2026-11-19: $g record greptile)"
+    echo "       $g record greptile"
     echo "   Still findings after two review rounds? Don't push a third fix-by-fix round: first do a deep analysis of the"
     echo "   whole change (root cause shared by the findings, the same bug class elsewhere in the diff, tests), fix that,"
     echo "   and say in the PR body what kept coming up and why before asking for the third review."
@@ -142,7 +175,7 @@ if [ -n "$blocked" ]; then
     echo "   - both primaries out: Codex + your own thorough review ($g record codex, then $g record self)"
     echo "   - both primaries and Codex out: the gate can't pass. Leave the PR as a draft, list the skips, ask Tim."
     echo "4. Once \`$g check\` passes, list every reviewer, skip and reason in the PR body, then \`gh pr ready\`."
-    echo "Never falsify or work around the gate. CodeRabbit: free hourly allowance only, never --use-credits."
+    echo "Never falsify or work around the gate."
   } >&2
   exit 2
 fi

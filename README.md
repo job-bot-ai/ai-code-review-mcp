@@ -82,8 +82,7 @@ Each reviewer exposes a `*_status` tool (CLI version + auth) and a `*_review` to
 `review-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "two independent reviews
 before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
 
-- `gh pr create --draft` (or `-d`) is **always allowed**: Kodus, the CodeRabbit app and
-  Greptile only review a PR that exists, so the draft is how they get to see it.
+- `gh pr create --draft` (or `-d`) is **always allowed**: Kodus and Greptile only review a PR that exists, so the draft is how they get to see it.
   `gh pr ready --undo` is not gated either.
 - `gh pr ready` and a **non-draft** `gh pr create` are blocked until `review-gate check`
   passes for the PR's commit. For `gh pr ready` that is the PR's head on GitHub (looked up
@@ -96,6 +95,13 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
   (`gh api`, `curl`, `wget`, httpie) is blocked wherever the resolver sees it run (directly,
   through runners, `bash -c`, `eval`, a heredoc or pipe fed to a shell, or piped into the
   client). A mention that is only data (`echo`, a heredoc written to a file) passes.
+  Only the command text is inspected, not files it reads: a request body kept in a file
+  (`gh api graphql --input payload.json`, `cat payload.json | curl --data @- ...`) is not
+  opened, so a ready mutation stored there is not seen.
+- Quoted command words are unquoted as the shell would (`gh pr "ready"`, `g''h pr create`).
+- If `node` (the resolver) isn't available, `--draft`, `--undo` and `--help` only exempt a
+  single simple `gh pr ...` command, as their own words (not `--draft=false`, not the value
+  of `--title`); anything else is checked for reviews.
 
 `check` passes when:
 
@@ -179,7 +185,7 @@ Workflow:
 
 ```bash
 gh pr create --draft ...                 # always allowed; Kodus reviews it automatically
-# CodeRabbit skips drafts by default: comment `@coderabbitai review` (Greptile: `@greptileai review`)
+# start Greptile: comment `@greptileai review`
 # fix high findings, fix medium ones or say why not, push, request a re-review; then for each clean pass:
 ./review-gate record kodus               # and: record greptile
 gh pr ready                              # now allowed

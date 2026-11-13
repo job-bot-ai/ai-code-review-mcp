@@ -9,7 +9,7 @@ gate="$root/review-gate"
 T="$(cd "$(mktemp -d)" && pwd -P)"   # physical path: macOS /var is a symlink to /private/var
 trap 'rm -rf "$T"' EXIT
 unset REVIEW_GATE_REQUIRED REVIEW_GATE_MIN
-export REVIEW_GATE_PRIMARY="kodus coderabbit"   # the date-based default is tested separately
+export REVIEW_GATE_PRIMARY="kodus coderabbit"   # the default primaries are tested separately
 export GIT_CONFIG_GLOBAL=/dev/null GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
 pass=0; fail=0
@@ -446,6 +446,61 @@ expect "a hook installed via a symlinked path still resolves the target" 2 stder
 
 run "$T/u" "op run -- gh pr create --fill"
 expect "op run -- gh pr create (a wrapper that runs gh locally) is gated" 2 stderr "$T/u: missing/stale"
+
+# ── Quoted command words: the shell unquotes them, so the pre-filters must still reach the resolver ──
+run "$T/r" 'gh pr "ready"'
+expect 'gh pr "ready" (quoted subcommand) is gated' 2 stderr "missing/stale"
+run "$T/r" "gh 'pr' ready"
+expect "gh 'pr' ready is gated" 2 stderr "missing/stale"
+run "$T/r" 'g""h pr create --fill'
+expect 'g""h pr create (empty quotes inside the word) is gated' 2 stderr "missing/stale"
+run "$T/r" 'gh pr re\ady'
+expect 'gh pr re\ady (backslash inside the word) is gated' 2 stderr "missing/stale"
+run "$T/r" "printf 'true\\ngh pr \"ready\"\\n' | bash"
+expect 'a \n-separated, quoted gh pr "ready" piped to bash is gated' 2 stderr "missing/stale"
+run "$T/r" "echo 'gh pr \"ready\"'"
+expect 'a quoted mention that is only data still passes' 0
+
+# ── No-node fallback: --draft/--undo/--help only exempt their own single command ──
+cp -r "$root" "$T/nonode" && rm "$T/nonode/hooks/resolve-pr-target.mjs"
+run_nonode() { # run_nonode <cwd> <command>
+  local payload; payload="$(jq -cn --arg c "$2" --arg d "$1" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}')"
+  out="$(printf '%s' "$payload" | bash "$T/nonode/hooks/pre-pr-coderabbit-gate.sh" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+}
+run_nonode "$T/r" "gh pr create --draft --fill"
+expect "no-node: gh pr create --draft is still allowed" 0
+run_nonode "$T/r" "gh pr create --fill --draft"
+expect "no-node: --draft after a boolean flag is a draft" 0
+run_nonode "$T/r" "gh pr create -t x --draft"
+expect "no-node: --draft after a flag's value is a draft" 0
+run_nonode "$T/r" "gh pr ready --undo"
+expect "no-node: gh pr ready --undo is still allowed" 0
+run_nonode "$T/r" "gh pr create --help"
+expect "no-node: gh pr create --help is still allowed" 0
+run_nonode "$T/r" "gh pr create --draft=false --fill"
+expect "no-node: --draft=false is not a draft" 2 stderr "missing/stale"
+run_nonode "$T/r" "gh pr ready --undo=false"
+expect "no-node: --undo=false is not an undo" 2 stderr "missing/stale"
+run_nonode "$T/r" "echo --undo; gh pr ready"
+expect "no-node: an --undo in another command doesn't exempt gh pr ready" 2 stderr "missing/stale"
+run_nonode "$T/r" "echo --draft && gh pr create --fill"
+expect "no-node: a --draft in another command doesn't exempt gh pr create" 2 stderr "missing/stale"
+run_nonode "$T/r" "gh pr create --title --draft --fill"
+expect "no-node: --draft as the value of --title is not a draft" 2 stderr "missing/stale"
+run_nonode "$T/r" "gh pr create --title --help --fill"
+expect "no-node: --help as the value of --title is not help" 2 stderr "missing/stale"
+
+# ── A review-gate failure other than "not a git repo" is not a green light ──
+REVIEW_GATE_MIN=abc run "$T/a" "gh pr create --fill"
+expect "an invalid REVIEW_GATE_MIN blocks instead of failing open" 2 stderr "review-gate check failed (exit 2)"
+run "$T/plain" "gh pr create --fill"
+expect "a directory that isn't a git repo is still not gated" 0 stdout "not gated"
+
+# ── The block message names the current primaries ──
+run "$T/r" "gh pr ready"
+expect "the block message tells you to record greptile" 2 stderr "record greptile"
+case "$err" in *"record coderabbit"*|*coderabbitai*|*2026-11-1*) fail=$((fail + 1)); echo "FAIL - block message still names CodeRabbit or the date switch";;
+  *) pass=$((pass + 1)); echo "ok   - the block message no longer names CodeRabbit or the date switch";; esac
 
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]
