@@ -250,8 +250,8 @@ prepush_lock() {
   fi
   # flock runs in the background and is waited for: bash runs a trap only once a foreground child ends, `wait` at once.
   # The lock it takes belongs to fd 9's open file description, which this shell shares, so it stays held after flock.
-  local fp
-  trap 'kill "$fp" 2>/dev/null; rm -f "${lock_mark:?}"; echo "review-gate: stopped waiting for the lock (signal); nothing reviewed" >&2; exit 130' INT TERM HUP
+  local fp=""   # (set -e: a kill of a flock already gone, or not started yet, mustn't end the trap before the rm)
+  trap '[ -z "$fp" ] || kill "$fp" 2>/dev/null || true; rm -f "${lock_mark:?}"; echo "review-gate: stopped waiting for the lock (signal); nothing reviewed" >&2; exit 130' INT TERM HUP
   echo "review-gate: another prepush/prepush-accept is running in this repository; waiting up to ${1}s for it to finish..." >&2
   flock -w "$1" 9 & fp=$!
   if ! wait "$fp"; then
