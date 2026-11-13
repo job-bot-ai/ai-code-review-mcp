@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Test stand-in for OpenQodex 0.18.0 `review`: writes the same records, with the same shapes, that the real one
+# writes (checked against a real run, see README): the run folder with report.json and manifest.json under
+# .openqodex/reviews/, and receipts/<repo id>/<change id>.json and last-review/<repo id>/last-review.json under
+# $OPENQODEX_HOME. STUB_OQ picks the outcome: passed (default), blocked, incomplete, noreviewer, nothing, omit
+# (a punch-list file skipped as over the cap), badhash (manifest hash that isn't the file's), lie (exit 0 with a
+# blocked verdict), commit (HEAD moves while it runs), badreport (last-review's report hash
+# isn't the report's), wrongid (a change id that isn't OpenQodex's formula), hang (never returns), stubborn (ignores TERM), leaves (passes but leaves a detached reviewer running), killed (SIGKILL, as the memory cap does). Arguments are appended to $STUB_OQ_ARGS when set.
+set -euo pipefail
+[ "${1:-}" = --version ] && { echo 0.18.0; exit 0; }
+[ "${1:-}" = review ] || { echo "stub openqodex: only review" >&2; exit 2; }
+shift
+[ -z "${STUB_OQ_ARGS:-}" ] || printf '%s\n' "$*" >>"$STUB_OQ_ARGS"
+[ -z "${STUB_OQ_ARGS:-}" ] || printf 'GH_TOKEN=%s\nGITHUB_TOKEN=%s\n' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >"$(dirname "$STUB_OQ_ARGS")/oq-env"
+base="" cfg="" blk="" mode="${STUB_OQ:-passed}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) base="$2"; shift 2 ;;
+    --config) cfg="$2"; shift 2 ;;
+    --block-on-severity) blk="$2"; shift 2 ;;
+    --instructions|--timeout|--reviewer-web|--reviewer) shift 2 ;;
+    --offline|--quiet) shift ;;
+    --agent) echo "stub openqodex: --agent must never be used" >&2; exit 9 ;;
+    *) echo "stub openqodex: unknown flag $1" >&2; exit 2 ;;
+  esac
+done
+home="${OPENQODEX_HOME:?}"
+top="$(git rev-parse --show-toplevel)"
+rid="$(printf '%s' "$(realpath "$top")" | sha256sum | cut -d' ' -f1)"
+bsha="$(git merge-base "$base" HEAD)"
+# OpenQodex's change id (changeId/diffChange in its dist/bin.js), of the work tree, which prepush keeps clean at HEAD.
+cid="$( { printf '%s\n' "$bsha"; git diff --no-color --no-ext-diff --no-textconv --no-relative --find-renames --inter-hunk-context=0 \
+  --ignore-submodules=none --submodule=short --raw -z --no-abbrev "$bsha" -- ':(top,exclude).openqodex'; } | sha256sum | cut -d' ' -f1)"
+[ "$mode" = wrongid ] && cid="$( { printf '%s\n' "$bsha"; git diff "$bsha"; } | sha256sum | cut -d' ' -f1)"
+# hang: a reviewer that outlives its parent (its own session) and a run that never returns.
+[ "$mode" = killed ] && kill -KILL $$
+if [ "$mode" = leaves ]; then mkdir -p "$home"; setsid sleep 33 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan4.pid"; mode=passed; fi
+if [ "$mode" = stubborn ]; then
+  echo $$ >"$home/stubborn.pid"; trap '' TERM
+  setsid sleep 32 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan3.pid"   # a detached reviewer
+  while :; do sleep 1; done   # only KILL ends it
+fi   # ignores TERM (and so does its child)
+# hang: reviewers that outlive their parent, detached as OpenQodex starts them: one keeping the environment, one that
+# cleared it (only a cgroup holds that one); then a run that never returns.
+if [ "$mode" = hang ]; then
+  mkdir -p "$home"
+  setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan.pid"
+  env -i /usr/bin/setsid /usr/bin/sleep 31 </dev/null >/dev/null 2>&1 & echo $! >"$home/orphan2.pid"
+  exec sleep 60
+fi
+if [ "$mode" = nothing ]; then echo "Nothing to review: no changes against $base"; exit 0; fi
+rd="$top/.openqodex/reviews/$(date -u +%Y%m%d-%H%M%S)-${cid:0:12}"; mkdir -p "$rd"
+if [ "$mode" = noreviewer ]; then
+  echo '{"started": false, "reasons": ["claude: not logged in"]}' >"$rd/reviewer.json"
+  echo "Full review unavailable: no reviewer could start. Fallback: openqodex review --agent" >&2
+  exit 2
+fi
+[ "$mode" = commit ] && git -C "$top" commit -q --allow-empty -m "moved during review"
+# The manifest: each convention file the config names, with its raw sha256.
+first=1
+sed -n 's/^    - "\(.*\)"$/\1/p' "$cfg" | while read -r p; do
+  s="$(sha256sum "$top/$p" | cut -d' ' -f1)"; om=null
+  if [ "$first" = 1 ]; then
+    [ "$mode" = omit ] && om='"over the 32 KB cap"'
+    [ "$mode" = badhash ] && s="$(printf x | sha256sum | cut -d' ' -f1)"
+  fi
+  first=0
+  jq -cn --arg p "$p" --arg s "$s" --argjson b "$(wc -c <"$top/$p")" --argjson o "$om" \
+    '{path: $p, source: "work tree", sha256: $s, bytes: $b, omitted: $o}'
+done | jq -s --arg c "$cid" '{version: 1, change_id: $c, config_hash: "x", created_at: "t", instructions_hash: "y",
+  instruction_files: ., lenses: [], runtime_version: "0.18.0"}' >"$rd/manifest.json"
+case "$mode" in
+  blocked|lie) verdict=blocked; status=complete; kind=complete; findings='[{"severity": "major", "title": "a bug"}, {"severity": "minor", "title": "a rare bug"}]' ;;
+  incomplete) verdict=incomplete; status=incomplete; kind=incomplete; findings='[]' ;;
+  *) verdict=passed; status=complete; kind=complete; findings='[]' ;;
+esac
+jq -n --arg c "$cid" --arg b "$base" --arg bs "$bsha" --arg v "$verdict" --arg blk "$blk" --arg st "$status" --argjson f "$findings" \
+  '{version: 1, kind: "review", change_id: $c, base: {ref: $b, sha: $bs}, verdict: $v, block_on_severity: $blk,
+    findings: $f, completion: {version: 1, status: $st, missing: (if $st == "complete" then [] else ["1 changed range was not examined"] end),
+    reviewer: {driver: "claude", version: "2.1.322"}}}' >"$rd/report.json"
+mkdir -p "$home/receipts/$rid" "$home/last-review/$rid"
+jq -n --arg c "$cid" --arg k "$kind" --arg v "$verdict" --arg blk "$blk" --arg b "$base" --arg bs "$bsha" --arg r "$rd" \
+  '{version: 1, change_id: $c, kind: $k, verdict: (if $k == "incomplete" then null else $v end), block_on_severity: $blk,
+    base: {ref: $b, sha: $bs}, report: ($r + "/report.md"), counts: null, missing: null, written_at: (now | todate)}' \
+  >"$home/receipts/$rid/$cid.json"
+rs="$(sha256sum "$rd/report.json" | cut -d' ' -f1)"; [ "$mode" = badreport ] && rs="$(printf y | sha256sum | cut -d' ' -f1)"
+jq -n --arg d "$rd" --arg c "$cid" --arg s "$rs" \
+  --arg t "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" \
+  '{version: 2, dir: $d, shown: $d, change_id: $c, report_sha256: $s, written_at: $t}' >"$home/last-review/$rid/last-review.json"
+case "$mode" in
+  blocked) echo "Blocked: 1 finding at or above $blk"; exit 1 ;;
+  incomplete) echo "Review incomplete: 1 changed range was not examined" >&2; exit 2 ;;
+  *) echo "Passed: no findings"; exit 0 ;;
+esac

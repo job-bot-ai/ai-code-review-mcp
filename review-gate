@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # review-gate — record/verify per-reviewer "green light" passes bound to the current git HEAD.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
 #
@@ -19,11 +19,32 @@
 # within 30 min) is skipped for ONE commit with `record-skip <reviewer> --reason "..."`.
 # The skip is stored separately ($GIT_DIR/review-gate/<reviewer>.skip), is announced by
 # every `check` that relies on it, and never counts as a pass.
+#   4. the commit has a pre-push review that still holds (`verify_prepush`, the same check the git pre-push hook
+#      runs): a finished OpenQodex review of exactly that commit that passed, or whose findings were declined with
+#      `prepush-accept --reason "..."` (announced like a skip), given the punch list that is on main now.
+#
+# Pre-push review (`prepush [--base <ref>]`): OpenQodex reviews the whole change against the base, with the punch
+# list as its convention files. githooks/pre-push (installed with install-githooks) runs `check-prepush` for every
+# branch commit a `git push` sends and blocks anything else: no review, an unfinished one, findings, a stale list.
 # Reviewers: kodus, greptile (primaries), codex (fallback), self (last resort). `coderabbit` stays
 # valid for old records and an explicit REVIEW_GATE_PRIMARY, but is no longer a default primary.
 # `agy` stays valid for old records. `kimi` (the retired DeepSeek/kimi-review pass) is no longer a
 # reviewer: a leftover kimi marker is ignored by `check`/`status` and never counts as a pass.
 set -euo pipefail
+# bash -p (the #! line): BASH_ENV, ENV, SHELLOPTS, BASHOPTS and exported functions from the caller are ignored.
+# A fixed PATH: a `PATH=` prefix must not swap git, jq, gh, systemd-run or timeout for look-alikes that write
+# OpenQodex-shaped records without a review. Test seams are REVIEW_GATE_* variables, which are Tim's (README).
+PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"; export PATH
+
+# The bypass log is at a fixed place, from the user's passwd entry (~user), never from HOME or XDG_STATE_HOME: a
+# caller must not be able to send a waiver to a throwaway file. REVIEW_GATE_BYPASS_LOG (Tim's, like every
+# REVIEW_GATE_* setting) moves it. `review-gate bypass-log`
+# prints it (read-only, outside a repo too); both hooks take it from there.
+bypass_log() {
+  local h; eval "h=~$(id -un)"
+  printf '%s' "${REVIEW_GATE_BYPASS_LOG:-$h/.local/state/review-gate/prepush-bypass.log}"
+}
+if [ "${1:-}" = bypass-log ]; then bypass_log; echo; exit 0; fi
 
 VALID="kodus coderabbit greptile codex self agy"
 MIN="${REVIEW_GATE_MIN:-2}"
@@ -47,6 +68,404 @@ marker()   { printf '%s/%s' "$dir" "$1"; }
 recorded() { local m; m="$(marker "$1")"; [ -f "$m" ] && cut -d' ' -f1 <"$m" || true; }
 skipped()  { local m; m="$(marker "$1").skip"; [ -f "$m" ] && cut -d' ' -f1 <"$m" || true; }
 skip_reason() { cut -d' ' -f4- <"$(marker "$1").skip"; }
+
+# ── Pre-push review: OpenQodex (https://github.com/openqodex/openqodex) reviews; this is glue around it ──
+# `prepush` runs `openqodex review` on a clean work tree at HEAD (so the reviewed change is exactly HEAD's tree
+# against the base), with the current punch list from $PUNCH_REPO main as its convention files, offline, under a
+# memory cap, and records which OpenQodex receipt/report/manifest belong to that commit. `check-prepush` (the git
+# pre-push hook) and `check` accept a commit only while that record holds: a FINISHED review of exactly that commit
+# that passed (or whose findings were declined with `prepush-accept`), given the punch list that is on main NOW.
+OQ_VERSION="0.18.0"   # pinned; upgrading is a reviewed change (README: "Upgrading OpenQodex")
+OQ_BIN="${REVIEW_GATE_OPENQODEX:-/opt/openqodex/bin/openqodex}"
+OQ_HOME="${OPENQODEX_HOME:-$HOME/.openqodex}"
+BLOCK_ON="${REVIEW_GATE_BLOCK_ON:-minor}"   # minor = "a real bug that will rarely surface", our P2 (README)
+PUNCH_REPO="${REVIEW_GATE_PUNCH_REPO:-j-bot-ai/pr-orchestrator}"
+GH="${REVIEW_GATE_GH:-gh}"
+SDRUN="${REVIEW_GATE_SYSTEMD_RUN:-systemd-run}"
+# OpenQodex's limits on convention files (CONVENTION_FILE_MAX_BYTES, CONVENTIONS_MAX_BYTES in its dist/bin.js): a file
+# past either is skipped whole, so the reviewer would not see the whole punch list.
+OQ_FILE_MAX=32768; OQ_TOTAL_MAX=65536
+PUNCH_SPLIT_PR="https://github.com/j-bot-ai/pr-orchestrator/pull/21"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+common="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+pdir="$common/review-gate-prepush"   # <sha>.json per reviewed commit, shared by every worktree; not under $dir, which `clear` removes
+top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
+die() { echo "review-gate: $*" >&2; exit 2; }
+sha256() { sha256sum "$1" | cut -d' ' -f1; }
+# OpenQodex keys its records by sha256(realpath(work tree root)) (repoId in its src/receipts.ts).
+repo_id() { printf '%s' "$(realpath "$1")" | sha256sum | cut -d' ' -f1; }
+# OpenQodex's change id for <base>..<commit>: sha256 of the base sha, a newline, and `git diff --raw -z --no-abbrev`
+# with its DIFF_FLAGS, its .openqodex/ state folder left out (changeId/diffChange/getTreeChange in OpenQodex 0.18.0's
+# dist/bin.js; its own pre-push hook matches a push to a review this way). Checked against real runs in the tests.
+oq_change_id() {
+  { printf '%s\n' "$1" && GIT_NO_REPLACE_OBJECTS=1 git diff --no-color --no-ext-diff --no-textconv --no-relative --find-renames \
+      --inter-hunk-context=0 --ignore-submodules=none --submodule=short --raw -z --no-abbrev "$1" "$2" -- ':(top,exclude).openqodex'
+  } | sha256sum | cut -d' ' -f1
+}
+# proc_state <pid>: "<state> <start time>" from /proc/<pid>/stat, read after the last ")" (a command name may hold
+# spaces or parentheses). proc_live <pid>: it exists and isn't a zombie (Z) or dead (X): `kill -0` passes for a
+# zombie, which no signal can clear, so nothing waits on one or is refused because of one.
+proc_state() {
+  local s; s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  s="${s##*) }"; set -- $s
+  [ -n "${20:-}" ] && printf '%s %s\n' "$1" "${20}"
+}
+proc_live() { local x; x="$(proc_state "$1")" || return 1; case "${x%% *}" in Z|X) return 1 ;; esac; }
+# Files under the top-level .openqodex/ are outside OpenQodex's change id and its review (its STATE_PATHSPEC): a
+# change that commits any is never a reviewed change.
+oq_state_files() { git diff --name-only "$1" "$2" -- ':(top).openqodex'; }
+# gh for the punch list, as job-bot-ai. The token lives in a variable that is not exported: it reaches gh's
+# environment only, never a command line, the output, or the OpenQodex reviewer.
+PUNCH_TOKEN="${GH_TOKEN:-}"
+pgh() {
+  [ -n "$PUNCH_TOKEN" ] || PUNCH_TOKEN="$("$GH" auth token --user job-bot-ai 2>/dev/null || true)"
+  if [ -n "$PUNCH_TOKEN" ]; then GH_TOKEN="$PUNCH_TOKEN" timeout 60 "$GH" "$@"; else timeout 60 "$GH" "$@"; fi
+}
+
+# punch_list <out.tsv>: the punch list on $PUNCH_REPO main, one "<name>\t<git blob id>\t<path>" line per file, then
+# a "#ref <commit>" line. review/punch-list/NN-*.md when that folder exists (log.md and the rest are not for the
+# reviewer), else review/PUNCH_LIST.md. Any failure, or no file, returns non-zero: never "review without the list".
+punch_list() {
+  local out="$1" ref listing
+  ref="$(pgh api "repos/$PUNCH_REPO/commits/main" --jq .sha 2>/dev/null)" || return 1
+  [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
+  listing="$(pgh api "repos/$PUNCH_REPO/contents/review?ref=$ref" 2>/dev/null)" || return 1
+  if printf '%s' "$listing" | jq -e 'any(.[]; .name == "punch-list" and .type == "dir")' >/dev/null 2>&1; then
+    listing="$(pgh api "repos/$PUNCH_REPO/contents/review/punch-list?ref=$ref" 2>/dev/null)" || return 1
+    printf '%s' "$listing" | jq -r '.[] | select(.type == "file" and (.name | test("^[0-9][0-9]-[A-Za-z0-9._-]+\\.md$")))
+      | [.name, .sha, .path] | @tsv' >"$out" 2>/dev/null || return 1
+  else
+    printf '%s' "$listing" | jq -r '.[] | select(.type == "file" and .name == "PUNCH_LIST.md") | [.name, .sha, .path] | @tsv' \
+      >"$out" 2>/dev/null || return 1
+  fi
+  [ -s "$out" ] || return 1
+  LC_ALL=C sort -o "$out" "$out"
+  printf '#ref %s\n' "$ref" >>"$out"
+}
+# punch_fetch <list.tsv> <dir>: download each file at the listed commit; its git blob id must match the listing.
+punch_fetch() {
+  local list="$1" d="$2" ref name blob path
+  ref="$(sed -n 's/^#ref //p' "$list")"
+  while IFS=$'\t' read -r name blob path; do
+    case "$name" in '#'*) continue;; esac
+    pgh api -H 'Accept: application/vnd.github.raw' "repos/$PUNCH_REPO/contents/$path?ref=$ref" >"$d/$name" 2>/dev/null || return 1
+    [ "$(git hash-object --no-filters "$d/$name")" = "$blob" ] || return 1
+  done <"$list"
+}
+# The reviewer was given every punch-list file whole (OpenQodex skips an over-cap file whole), with these hashes.
+MANIFEST_MATCHES='[.instruction_files[] | {path, sha256, omitted}] | sort == ($m[0].punch.files | map({path, sha256, omitted: null}) | sort)'
+
+# base_ok <base sha> <branch>: <base sha> is on origin's default branch (origin/HEAD, else origin/main) or on the base
+# branch of <branch>'s PR (gh, asked only when the default branch doesn't hold it).
+base_ok() {
+  local b="$1" br="${2:-}" d pb
+  d="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
+  git merge-base --is-ancestor "$b" "refs/remotes/$d" 2>/dev/null && return 0
+  [ -n "$br" ] || return 1
+  pb="$(pgh pr view "$br" --json baseRefName -q .baseRefName 2>/dev/null </dev/null || true)"
+  [[ "$pb" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+  git merge-base --is-ancestor "$b" "refs/remotes/origin/$pb" 2>/dev/null
+}
+
+# verify_prepush <sha> <branch>: the one check of a pre-push review, used by `check-prepush` (the git hook) and by
+# `check`. 0 = the push of <sha> to <branch> may go (accepted findings are announced on stderr); 1 = blocked, with
+# the reason on stderr.
+verify_prepush() {
+  local sha="$1" br="${2:-}" m="$pdir/$1.json" rec rd v cur b
+  bad() { echo "no passing pre-push review for ${sha:0:12}: $*" >&2; }
+  if [ ! -f "$m" ]; then
+    if [ -f "$pdir/$sha.last" ]; then bad "its last \`review-gate prepush\` did not pass: $(head -c 400 "$pdir/$sha.last")"
+    else bad "run \`review-gate prepush\` on that commit"; fi
+    return 1
+  fi
+  jq -e --arg s "$sha" '.version == 1 and .sha == $s' "$m" >/dev/null 2>&1 || { bad "unreadable record $m"; return 1; }
+  rd="$(jq -r .run_dir "$m")"; v="$(jq -r .verdict "$m")"
+  # OpenQodex's own record (written only when a review finished), then the report and the manifest it hashed.
+  rec="$OQ_HOME/receipts/$(jq -r .repo_id "$m")/$(jq -r .change_id "$m").json"
+  jq -e --slurpfile m "$m" '.version == 1 and .kind == "complete" and .change_id == $m[0].change_id
+    and .verdict == $m[0].verdict and .base.sha == $m[0].base_sha and .block_on_severity == $m[0].block_on' "$rec" >/dev/null 2>&1 ||
+    { bad "OpenQodex's receipt $rec is missing or doesn't match (not a finished review of this change)"; return 1; }
+  [ "$(sha256 "$rd/report.json" 2>/dev/null)" = "$(jq -r .report_sha256 "$m")" ] || { bad "$rd/report.json changed or is gone"; return 1; }
+  [ "$(sha256 "$rd/manifest.json" 2>/dev/null)" = "$(jq -r .manifest_sha256 "$m")" ] || { bad "$rd/manifest.json changed or is gone"; return 1; }
+  jq -e --slurpfile m "$m" '.completion.status == "complete" and .change_id == $m[0].change_id and .verdict == $m[0].verdict' \
+    "$rd/report.json" >/dev/null 2>&1 || { bad "the report is not a complete review of this change"; return 1; }
+  [ "$(jq -r .block_on "$m")" = "$BLOCK_ON" ] || { bad "reviewed with block_on_severity $(jq -r .block_on "$m"); the gate uses $BLOCK_ON"; return 1; }
+  b="$(jq -r .base_sha "$m")"
+  git merge-base --is-ancestor "$b" "$sha" 2>/dev/null || { bad "the reviewed base is not an ancestor of it"; return 1; }
+  # The record names a change id; it must be OpenQodex's id of exactly <base>..<this commit>, worked out again here,
+  # so a record copied or edited onto another commit never matches.
+  local st; st="$(oq_state_files "$b" "$sha" 2>/dev/null)" || st="(git diff failed)"
+  [ -z "$st" ] || { bad "it changes files under .openqodex/, which OpenQodex neither reviews nor counts in its change id: $(printf '%s' "$st" | head -n 3 | tr '\n' ' ')"; return 1; }
+  local want; want="$(oq_change_id "$b" "$sha" 2>/dev/null)" || want=""
+  [ -n "$want" ] && [ "$want" = "$(jq -r .change_id "$m")" ] ||
+    { bad "the record's review (change $(jq -r .change_id "$m" | cut -c1-12)) is not of ${b:0:12}..${sha:0:12}, whose change id is ${want:0:12}"; return 1; }
+  # The whole change: the base must be on the remote's default branch or on the PR's base branch, so a review of only
+  # the newest commits (--base HEAD~1, the branch's own remote tip, or any other branch they were pushed to) doesn't count.
+  base_ok "$b" "$br" || { bad "the reviewed base ${b:0:12} is not on origin's default branch or the PR's base: review the whole change (\`review-gate prepush\` picks the PR's base)"; return 1; }
+  jq -e --slurpfile m "$m" "$MANIFEST_MATCHES" "$rd/manifest.json" >/dev/null 2>&1 ||
+    { bad "the review's manifest doesn't show the whole punch list supplied"; return 1; }
+  case "$v" in
+    passed) ;;
+    blocked)
+      jq -e '.accepted.reason | type == "string" and length >= 10' "$m" >/dev/null 2>&1 ||
+        { bad "OpenQodex blocked it ($(jq -r .counts "$m"); $BLOCK_ON and above block): fix them, or \`review-gate prepush-accept --reason ...\`. Report: $rd/report.html"; return 1; } ;;
+    *) bad "verdict '$v'"; return 1 ;;
+  esac
+  # The punch list it was given must be the one on main now. A failed fetch blocks.
+  cur="$(mktemp)"
+  if ! punch_list "$cur"; then rm -f "${cur:?}"; bad "couldn't fetch the current punch list from $PUNCH_REPO main (a failed fetch never passes)"; return 1; fi
+  if [ "$(grep -v '^#' "$cur" | cut -f1,2)" != "$(jq -r '.punch.files[] | [.name, .blob] | @tsv' "$m" | LC_ALL=C sort)" ]; then
+    rm -f "${cur:?}"; bad "the punch list on $PUNCH_REPO main changed since the review (reviewed at $(jq -r .punch.ref "$m" | cut -c1-12)); run \`review-gate prepush\` again"; return 1
+  fi
+  rm -f "${cur:?}"
+  [ "$v" = passed ] || echo "review-gate: pre-push review findings for ${sha:0:12} ($(jq -r .counts "$m")) were ACCEPTED, not fixed — reason: $(jq -r .accepted.reason "$m") (report: $rd/report.html)" >&2
+  return 0
+}
+
+# One prepush/prepush-accept at a time per repository (they share OpenQodex's last-review record).
+prepush_lock() {
+  mkdir -p "$pdir"
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>>"$pdir/lock"
+  flock -n 9 || die "another prepush/prepush-accept is running in this repository; wait for it"
+}
+
+# The base to review against: the PR base if gh can tell, else origin/main.
+default_base() {
+  local b
+  b="$(timeout 20 "$GH" pr view --json baseRefName -q .baseRefName 2>/dev/null </dev/null || true)"
+  [[ "$b" =~ ^[A-Za-z0-9._/-]+$ ]] || b=""
+  if [ -n "$b" ]; then
+    GIT_TERMINAL_PROMPT=0 timeout 60 git fetch -q origin "$b" >/dev/null 2>&1 </dev/null || true
+    if git rev-parse --verify -q "refs/remotes/origin/$b^{commit}" >/dev/null; then echo "origin/$b"; return; fi
+  fi
+  echo "origin/main"
+}
+
+dirty() {   # a git status that fails counts as dirty
+  local o; o="$(git status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null)" || return 0
+  [ -n "$o" ]
+}
+
+run_prepush() {
+  local base="" unit="" runid tmo grace mem cfg list copy tmp rid lr start rc=0 rd cid verdict kind name blob path sz total=0 big=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --base) [ -n "${2:-}" ] || die "--base needs a ref"; base="$2"; shift 2 ;;
+      --base=*) base="${1#--base=}"; shift ;;
+      *) die "usage: prepush [--base <ref>]" ;;
+    esac
+  done
+  command -v jq >/dev/null 2>&1 || die "jq is required for prepush"
+  [ -x "$OQ_BIN" ] || die "OpenQodex is not installed at $OQ_BIN (README: install it, pinned to $OQ_VERSION)"
+  [ "$("$OQ_BIN" --version 2>/dev/null)" = "$OQ_VERSION" ] || die "$OQ_BIN is not OpenQodex $OQ_VERSION, the pinned version"
+  tmo="${REVIEW_GATE_PREPUSH_TIMEOUT:-1800}"; [[ "$tmo" =~ ^[0-9]+$ ]] || die "REVIEW_GATE_PREPUSH_TIMEOUT must be seconds"
+  grace="${REVIEW_GATE_PREPUSH_GRACE:-120}"; [[ "$grace" =~ ^[0-9]+$ ]] || die "REVIEW_GATE_PREPUSH_GRACE must be seconds"
+  [ -n "$base" ] || base="$(default_base)"
+  git rev-parse --verify -q "$base^{commit}" >/dev/null || die "base '$base' is not a commit here (fetch it, or pass --base <ref>)"
+  prepush_lock
+  # Survivors of an earlier run that outlived KILL: no new review while any of them is alive.
+  if [ -f "$pdir/survivors" ]; then
+    local kind id st alive=""
+    while read -r kind id st; do
+      case "$kind" in
+        pid) proc_live "$id" && [ "$(proc_state "$id" | cut -d' ' -f2)" = "$st" ] && alive="$alive pid $id" ;;
+        unit) systemctl is-active --quiet "$id" 2>/dev/null && alive="$alive $id" ;;
+      esac
+    done <"$pdir/survivors"
+    [ -z "$alive" ] || die "parts of an earlier review are still running after KILL:$alive. Stop them first (README: Pre-push review)"
+    rm -f "$pdir/survivors"
+  fi
+  rm -f "${pdir:?}/${head:?}.json"   # a new review of this commit replaces the old one, whatever it said
+  tmp="$(mktemp -d)"; list="$tmp/punch.tsv"
+  fail() { rm -rf "${tmp:?}"; printf '%s\n' "$1" >"$pdir/$head.last"; echo "review-gate: pre-push review of ${head:0:12} FAILED: $1" >&2; exit "${2:-4}"; }
+  # .openqodex/ (OpenQodex's report folder, and the punch-list copies) stays out of git. The tree must be clean:
+  # OpenQodex reviews the work tree, so only a clean tree makes "the change" exactly the commit that is pushed.
+  git check-ignore -q "$top/.openqodex/x" 2>/dev/null || { mkdir -p "$common/info"; echo '/.openqodex/' >>"$common/info/exclude"; }
+  dirty && fail "the work tree is not clean: commit or stash first (the review must be of exactly the commit you push)"
+  local st mb; mb="$(git merge-base "$base" "$head")" && st="$(oq_state_files "$mb" "$head")" || fail "couldn't diff $base..HEAD"
+  [ -z "$st" ] || fail "the change commits files under .openqodex/, which OpenQodex neither reviews nor counts in its change id (remove them): $(printf '%s' "$st" | head -n 3 | tr '\n' ' ')"
+  # The current punch list, checked against its git blob ids, copied where OpenQodex reads convention files.
+  punch_list "$list" || fail "couldn't list the punch list on $PUNCH_REPO main (no review without it)"
+  copy="$top/.openqodex/punch-list"; rm -rf "${copy:?}"; mkdir -p "$copy"
+  punch_fetch "$list" "$copy" || fail "couldn't download the punch list from $PUNCH_REPO main (no review without it)"
+  # OpenQodex skips a convention file past its limits whole. Fail closed now, before a review that can't count.
+  while IFS=$'\t' read -r name blob path; do
+    case "$name" in '#'*) continue;; esac
+    sz="$(wc -c <"$copy/$name" | tr -d ' ')"; total=$((total + sz))
+    [ "$sz" -le "$OQ_FILE_MAX" ] || big="$big $name ($sz bytes)"
+  done <"$list"
+  if [ -n "$big" ] || [ "$total" -gt "$OQ_TOTAL_MAX" ]; then
+    if grep -q $'^PUNCH_LIST.md\t' "$list"; then
+      fail "the punch list doesn't fit OpenQodex's limits (32 KB per file, 64 KB in all):${big:+ over 32 KB:$big;} $total bytes in all. OpenQodex would skip it whole, so no review runs without it (failing closed). The single review/PUNCH_LIST.md needs the split into review/punch-list/ section files: pr-orchestrator #21 ($PUNCH_SPLIT_PR) must be merged first."
+    fi
+    fail "the punch list doesn't fit OpenQodex's limits (32 KB per file, 64 KB in all):${big:+ over 32 KB:$big;} $total bytes in all. OpenQodex would skip a file whole, so no review runs (failing closed). Split or trim the sections in $PUNCH_REPO review/punch-list/."
+  fi
+  [ "$total" -le $((OQ_TOTAL_MAX * 7 / 8)) ] ||
+    echo "review-gate: WARNING: the punch list is $total of OpenQodex's $OQ_TOTAL_MAX bytes; past that no review runs. Trim it in $PUNCH_REPO." >&2
+  cfg="$pdir/openqodex.yaml"   # ours, outside the work tree: a branch can't loosen it
+  {
+    printf 'version: 1\nmin_version: %s\nreview:\n  block_on_severity: %s\n  instructions_files:\n' "$OQ_VERSION" "$BLOCK_ON"
+    while IFS=$'\t' read -r name blob path; do
+      case "$name" in '#'*) ;; *) printf '    - ".openqodex/punch-list/%s"\n' "$name" ;; esac
+    done <"$list"
+  } >"$cfg"
+  local -a cap=() off=(--offline)
+  [ "${REVIEW_GATE_OPENQODEX_OFFLINE:-on}" = off ] && off=()
+  mem="${REVIEW_GATE_OPENQODEX_MEMORY:-2G}"
+  if [ "$mem" != off ]; then
+    command -v "$SDRUN" >/dev/null 2>&1 || fail "systemd-run is missing for the memory cap (REVIEW_GATE_OPENQODEX_MEMORY=off runs uncapped)"
+    unit="review-gate-prepush-$$-$RANDOM"   # a known name: stop_run kills everything in its cgroup
+    cap=("$SDRUN" --scope --quiet --collect --unit="$unit" -p "MemoryMax=$mem" -p "MemorySwapMax=${REVIEW_GATE_OPENQODEX_SWAP:-256M}" --)
+  fi
+  rid="$(repo_id "$top")"; lr="$OQ_HOME/last-review/$rid/last-review.json"
+  start="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"   # OpenQodex writes ms; a record of an earlier run never counts
+  echo "review-gate: OpenQodex $OQ_VERSION reviewing ${head:0:12} vs $base (${off[*]:-online}, memory cap $mem, punch list @ $(sed -n 's/^#ref //p' "$list" | cut -c1-12): $total of $OQ_TOTAL_MAX bytes)..." >&2
+  # Never `review --agent` (the coding agent reviewing its own work): only OpenQodex's own reviewer counts.
+  # No GitHub token reaches OpenQodex or its reviewer. A watchdog of our own stops a run that ignores --timeout: the run
+  # gets its own process group (set -m), which gets TERM at --timeout + grace and KILL $killafter s later (a reviewer
+  # that ignores TERM can't hold on), with OpenQodex's detached reviewers found by an environment marker and the scope. Not timeout(1): uutils' timeout (Ubuntu's default) neither escalates nor exits
+  # 124 with -k. The lock's fd is closed for the run, so a leftover reviewer in a session of its own never holds it.
+  local pid t0 fired=0 reaped=0 killafter="${REVIEW_GATE_PREPUSH_KILL_AFTER:-30}" killsig="${REVIEW_GATE_PREPUSH_KILL_SIGNAL:-KILL}"
+  [[ "$killafter" =~ ^[0-9]+$ ]] || fail "REVIEW_GATE_PREPUSH_KILL_AFTER must be seconds"
+  [[ "$killsig" =~ ^[A-Z]+$ ]] || fail "REVIEW_GATE_PREPUSH_KILL_SIGNAL must be a signal name"   # a test seam: KILL
+  # The run is the process group $pid, every process carrying REVIEW_GATE_RUN_ID=$runid in its environment (OpenQodex
+  # starts its reviewers detached, in groups of their own; they inherit the environment), and, under the memory cap,
+  # the systemd scope $unit (which also holds a reviewer that cleared its environment).
+  runid="$$-$RANDOM-$SECONDS"
+  run_members() {   # the marked processes (Linux /proc); never this script, which doesn't carry the marker
+    local e p
+    for e in /proc/[0-9]*/environ; do
+      p="${e#/proc/}"; p="${p%/environ}"
+      grep -qzx "REVIEW_GATE_RUN_ID=$runid" "$e" 2>/dev/null && proc_live "$p" && echo "$p"
+    done
+  }
+  # The group is signalled only until `wait` has reaped its leader: until then the leader's pid (a zombie at worst)
+  # can't be reused, after it the number may name someone else's group (punch list 4.16).
+  signal_run() {
+    local p
+    [ "$reaped" = 1 ] || kill -"$1" -- "-$pid" 2>/dev/null || true
+    [ -z "$unit" ] || systemctl kill --kill-whom=all --signal="$1" "$unit.scope" >/dev/null 2>&1 || true
+    for p in $(run_members); do kill -"$1" "$p" 2>/dev/null || true; done
+  }
+  group_live() { local p; for p in $(pgrep -g "$pid" 2>/dev/null); do proc_live "$p" && return 0; done; return 1; }
+  run_alive() {
+    { [ "$reaped" = 0 ] && group_live; } || [ -n "$(run_members)" ] ||
+      { [ -n "$unit" ] && systemctl is-active --quiet "$unit.scope" 2>/dev/null; }
+  }
+  # stop_run: TERM all of the run, KILL what is left after $killafter s (a leader or a member that ignores TERM), and
+  # wait until it is gone, so nothing of it outlives the lock. At the deadline, on INT/TERM/HUP, and for leftovers.
+  # Returns 1 when part of the run survives even KILL (a process stuck in the kernel, a scope that won't stop).
+  stop_run() {
+    local term_end=$((SECONDS + killafter)) gone=$((SECONDS + killafter + 10))
+    signal_run TERM
+    while run_alive && [ "$SECONDS" -lt "$term_end" ]; do sleep 1; done
+    signal_run "$killsig"
+    while run_alive && [ "$SECONDS" -lt "$gone" ]; do sleep 1; done
+    ! run_alive
+  }
+  # survivors: part of the run outlived KILL. The lock goes with this process, so leave a marker naming what survives
+  # (pid and start time, the scope): the next prepush refuses to start while any of it is alive. Never a finished run.
+  survivors() {
+    local p st list=""
+    for p in $( { [ "$reaped" = 1 ] || pgrep -g "$pid" 2>/dev/null; run_members; } | sort -u); do
+      proc_live "$p" || continue
+      st="$(proc_state "$p" | cut -d' ' -f2)" && list="${list}pid $p $st"$'\n'
+    done
+    [ -n "$unit" ] && systemctl is-active --quiet "$unit.scope" 2>/dev/null && list="${list}unit $unit.scope"$'\n'
+    [ -n "$list" ] || return 0   # only zombies were left: nothing survives
+    printf '%s' "$list" >"$pdir/survivors"
+    fail "parts of the review are still running after KILL: $(printf '%s' "$list" | tr '\n' ';' | sed 's/;$//'). The review did not finish. Stop them (kill -9, systemctl stop), then run prepush again; it refuses while they are alive (exit 5)" 5
+  }
+  set -m
+  (cd "$top" && unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN && export REVIEW_GATE_RUN_ID="$runid" &&
+    OPENQODEX_AUTO_UPDATE=0 exec ${cap[@]+"${cap[@]}"} \
+    bash -c '"$@"; rc=$?
+      p="/sys/fs/cgroup$(cut -d: -f3- /proc/self/cgroup 2>/dev/null | head -n 1)/memory.peak"
+      [ -r "$p" ] && echo "review-gate: OpenQodex peak memory $(( $(cat "$p") / 1048576 )) MiB" >&2
+      exit $rc' _ "$OQ_BIN" review --base "$base" ${off[@]+"${off[@]}"} --reviewer-web off --config "$cfg" \
+      --instructions "$HERE/prompts/openqodex-instructions.md" --block-on-severity "$BLOCK_ON" --timeout "$tmo") </dev/null 9>&- &
+  pid=$!
+  set +m
+  trap 'stop_run || survivors; exit 130' INT TERM HUP   # our run is in its own group: take it down with us, all of it
+  t0=$SECONDS
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $((SECONDS - t0)) -ge $((tmo + grace)) ]; then stop_run || survivors; fired=1; break; fi
+    sleep 1
+  done
+  wait "$pid" 2>/dev/null || rc=$?
+  reaped=1
+  # A reviewer left behind by a run that ended (detached, so not in the group): stopped too, before the lock goes.
+  if [ "$fired" = 0 ] && run_alive; then
+    echo "review-gate: stopping processes the review left running" >&2; stop_run || survivors
+  fi
+  trap - INT TERM HUP
+  [ "$fired" = 0 ] || rc=124   # we stopped it: a timeout, whatever signal it died of
+  { [ "$(git rev-parse HEAD)" = "$head" ] && ! dirty; } || fail "HEAD or the work tree changed while the review ran; review again"
+  case "$rc" in
+    0|1) ;;
+    124) fail "OpenQodex didn't finish within $((tmo + grace))s (--timeout $tmo plus $grace) and was stopped: the review did not finish" ;;
+    137) fail "OpenQodex was killed (SIGKILL): most likely the memory cap, MemoryMax=$mem (REVIEW_GATE_OPENQODEX_MEMORY; see the peak memory above), or a kill from outside. The review did not finish" ;;
+    *) fail "OpenQodex exited $rc: the review did not finish (incomplete, no reviewer that can start, or an error; see above). Fix that (reviewer login, --timeout) and run prepush again; never \`openqodex review --agent\`" ;;
+  esac
+  # The run that just ended: OpenQodex's last-review record (newer than our start), its report, and the receipt.
+  jq -e --arg t "$start" '.version == 2 and .written_at >= $t' "$lr" >/dev/null 2>&1 || fail "OpenQodex recorded no review (nothing to review against $base?)"
+  rd="$(jq -r .dir "$lr")"; cid="$(jq -r .change_id "$lr")"
+  [ "$(sha256 "$rd/report.json" 2>/dev/null)" = "$(jq -r .report_sha256 "$lr")" ] || fail "the report doesn't match OpenQodex's record"
+  verdict="$(jq -r .verdict "$rd/report.json")"; kind="$(jq -r .completion.status "$rd/report.json")"
+  # The change OpenQodex reviewed (the clean work tree) must be the one check-prepush works out for this commit.
+  [ "$cid" = "$(oq_change_id "$(jq -r .base.sha "$rd/report.json")" "$head" 2>/dev/null)" ] ||
+    fail "OpenQodex's change id ${cid:0:12} is not the one worked out for ${head:0:12} against its base (a different OpenQodex? a git clean/smudge filter?), so no push could match it"
+  { [ "$kind" = complete ] && { { [ "$rc" = 0 ] && [ "$verdict" = passed ]; } || { [ "$rc" = 1 ] && [ "$verdict" = blocked ]; }; }; } ||
+    fail "OpenQodex exited $rc with a '$kind' review, verdict '$verdict': not a finished review"
+  while IFS=$'\t' read -r name blob path; do
+    case "$name" in '#'*) ;; *) printf '%s\t%s\t%s\n' "$name" "$blob" "$(sha256 "$copy/$name")" ;; esac
+  done <"$list" >"$tmp/files.tsv"
+  PUNCH_REF="$(sed -n 's/^#ref //p' "$list")" jq -n --arg sha "$head" --arg branch "$branch" --arg base "$base" \
+    --arg rid "$rid" --arg root "$top" --arg rd "$rd" --arg cid "$cid" --arg v "$verdict" --arg blk "$BLOCK_ON" \
+    --arg oq "$OQ_VERSION" --arg repo "$PUNCH_REPO" --arg rs "$(sha256 "$rd/report.json")" --arg ms "$(sha256 "$rd/manifest.json")" \
+    --slurpfile r "$rd/report.json" --rawfile pl "$tmp/files.tsv" \
+    '{version: 1, sha: $sha, branch: $branch, base_ref: $base, base_sha: $r[0].base.sha, repo_id: $rid, repo_root: $root,
+      run_dir: $rd, change_id: $cid, verdict: $v, block_on: $blk, openqodex: $oq, report_sha256: $rs, manifest_sha256: $ms,
+      counts: ([$r[0].findings[]?.severity] | group_by(.) | map("\(length) \(.[0])") | join(", ")),
+      reviewer: ($r[0].completion.reviewer.driver // null),
+      punch: {repo: $repo, ref: env.PUNCH_REF, files: ($pl | split("\n") | map(select(length > 0) | split("\t")
+        | {name: .[0], blob: .[1], sha256: .[2], path: (".openqodex/punch-list/" + .[0])}))},
+      accepted: null, written_at: (now | todate)}' >"$tmp/record.json" 2>/dev/null || fail "couldn't write the record"
+  # Fail here rather than at push time when the reviewer wasn't given the whole punch list.
+  jq -e --slurpfile m "$tmp/record.json" "$MANIFEST_MATCHES" "$rd/manifest.json" >/dev/null 2>&1 ||
+    fail "OpenQodex was not given the whole punch list (it skips a file over 32 KB, or past 64 KB in all, whole); see $rd/report.md"
+  mv "$tmp/record.json" "$pdir/$head.json"; rm -f "${pdir:?}/${head:?}.last"; rm -rf "${tmp:?}"
+  if [ "$verdict" = blocked ]; then
+    {
+      echo "review-gate: NOT passed ($(jq -r .counts "$pdir/$head.json")): fix the findings at or above $BLOCK_ON, commit, run \`review-gate prepush\` again."
+      echo "  A finding you decide not to fix: decline it explicitly, for this commit only:"
+      echo "    review-gate prepush-accept --reason \"why each finding is not being fixed\""
+    } >&2
+    exit 1
+  fi
+  echo "review-gate: pre-push review passed for $branch @ ${head:0:12} (OpenQodex vs $base)"
+}
+
+run_accept() {
+  local reason m="$pdir/$head.json"
+  [ "${1:-}" = "--reason" ] || die "usage: prepush-accept --reason \"why the findings are not being fixed\""
+  reason="$(printf '%s' "${2:-}" | tr '\n\r' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ "${#reason}" -ge 10 ] || die "--reason must say why each finding is not being fixed (10+ characters)"
+  prepush_lock
+  local log; log="$(bypass_log)"
+  [ -f "$m" ] || die "no finished pre-push review of ${head:0:12} to accept (an unfinished review can't be accepted): run \`review-gate prepush\`"
+  [ "$(jq -r .verdict "$m")" = blocked ] || die "the pre-push review of ${head:0:12} has no blocking findings; nothing to accept"
+  # Declining findings is a waiver: logged with the bypasses, and never without the log (Claude Code's hook also
+  # blocks it unless Tim set REVIEW_GATE_PREPUSH=off).
+  { mkdir -p "$(dirname "$log")" && printf '%s\tprepush-accept\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$top" "$head" \
+      "$(jq -r .counts "$m")" "$reason" >>"$log"; } 2>/dev/null || die "can't log the acceptance to $log; an acceptance is never silent"
+  { jq --arg r "$reason" '.accepted = {reason: $r, at: (now | todate)}' "$m" >"$m.tmp" && mv "$m.tmp" "$m"; } ||
+    die "couldn't record the acceptance in $m"
+  echo "review-gate: recorded ACCEPTED pre-push findings ($(jq -r .counts "$m")) for $branch @ ${head:0:12} — $reason"
+  echo "review-gate: every check of this commit announces it; logged to $log; report: $(jq -r .run_dir "$m")/report.html"
+}
 
 case "${1:-help}" in
   record)
@@ -73,11 +492,20 @@ case "${1:-help}" in
     echo "review-gate: every gate check on this commit will announce the skip; a real pass still needs another reviewer"
     ;;
   check)
-    rev="$head"
-    if [ "${2:-}" = "--rev" ]; then
-      rev="$(git rev-parse --verify -q "${3:-}^{commit}" 2>/dev/null)" || {
-        echo "review-gate: --rev '${3:-}' is not a commit" >&2; exit 1; }
-    fi
+    # --branch: the PR's branch (the hook passes the one the resolver found), whose PR base the pre-push review's base
+    # is judged by. Without it: the checked-out branch for HEAD; for another --rev, no branch (only origin's default
+    # branch counts as a base), never the checked-out branch's PR.
+    rev="$head"; to=""; shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --rev) rev="$(git rev-parse --verify -q "${2:-}^{commit}" 2>/dev/null)" || {
+                 echo "review-gate: --rev '${2:-}' is not a commit" >&2; exit 1; }
+               shift 2 ;;
+        --branch) [ -n "${2:-}" ] || { echo "review-gate: --branch needs a name" >&2; exit 1; }; to="$2"; shift 2 ;;
+        *) echo "review-gate: usage: check [--rev <commit>] [--branch <name>]" >&2; exit 1 ;;
+      esac
+    done
+    [ -n "$to" ] || [ "$rev" != "$head" ] || to="$branch"
     for r in ${PRIMARY[@]+"${PRIMARY[@]}"}; do
       is_valid "$r" || { echo "review-gate: unknown primary reviewer '$r' (valid: $VALID)" >&2; exit 1; }
     done
@@ -104,6 +532,9 @@ case "${1:-help}" in
       has "$r" ${passes[@]+"${passes[@]}"} ${skips[@]+"${skips[@]}"} ||
         problems+=("primary reviewer $r has no pass or skip")
     done
+    # Nothing reaches "ready" without the pre-push review the git hook requires for that commit.
+    if pp="$(verify_prepush "$rev" "$to" 2>&1)"; then [ -z "$pp" ] || echo "$pp" >&2   # accepted findings are announced
+    else problems+=("$pp"); fi
     if [ "${#counted[@]}" -lt "$MIN" ]; then
       problems+=("${#counted[@]} of $MIN review passes (${counted[*]:-none})")
       [ "$self_ignored" = 1 ] &&
@@ -127,21 +558,46 @@ case "${1:-help}" in
       req=""; case " ${PRIMARY[*]-} " in *" $r "*) req=" [primary]";; esac
       printf '  %-11s %s%s\n' "$r" "$s" "$req"
     done
+    if [ -f "$pdir/$head.json" ]; then
+      s="$(jq -r '"\(.verdict) @ \(.sha[:12]) (OpenQodex vs \(.base_ref), punch list @ \(.punch.ref[:12]))"
+        + (if .counts != "" then ": \(.counts)" else "" end) + (if .accepted then "; ACCEPTED — \(.accepted.reason)" else "" end)' "$pdir/$head.json")"
+    elif [ -f "$pdir/$head.last" ]; then s="FAILED: $(head -c 200 "$pdir/$head.last")"
+    else s="(none)"; fi
+    printf '  %-11s %s [required before push; check-prepush also checks the punch list is current]\n' prepush "$s"
     ;;
   clear)
-    if [ -n "${2:-}" ]; then
+    if [ "${2:-}" = prepush ]; then
+      rm -f "${pdir:?}/${head:?}.json" "${pdir:?}/${head:?}.last"; echo "review-gate: cleared the pre-push review of ${head:0:12}"
+    elif [ -n "${2:-}" ]; then
       is_valid "$2" || { echo "review-gate: unknown reviewer '$2' (valid: $VALID)" >&2; exit 2; }
       rm -f "$(marker "$2")" "$(marker "$2").skip"; echo "review-gate: cleared $2"
     else
       rm -rf "$dir"; echo "review-gate: cleared all"
     fi
     ;;
+  prepush) shift; run_prepush "$@" ;;
+  change-id)   # OpenQodex's change id for <base>..<commit> (what check-prepush works out); read-only
+    b="$(git rev-parse --verify -q "${2:-}^{commit}")" && c="$(git rev-parse --verify -q "${3:-HEAD}^{commit}")" ||
+      die "usage: change-id <base> [<commit>]"
+    oq_change_id "$b" "$c" ;;
+  prepush-accept) shift; run_accept "$@" ;;
+  check-prepush)   # the git pre-push hook: may this commit be pushed (to branch <name>)?
+    rev="$head"; to="$branch"
+    if [ "${2:-}" = "--rev" ]; then
+      rev="$(git rev-parse --verify -q "${3:-}^{commit}" 2>/dev/null)" || {
+        echo "review-gate: --rev '${3:-}' is not a commit" >&2; exit 1; }
+      [ "${4:-}" = "--branch" ] && to="${5:-}"
+    fi
+    verify_prepush "$rev" "$to" || exit 1
+    ;;
   *)
     {
-      echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>]|status|clear [reviewer]}"
+      echo "usage: review-gate {record <reviewer> [--rev <commit>]|record-skip <reviewer> --reason \"...\"|check [--rev <commit>] [--branch <name>]|status|clear [reviewer|prepush]}"
+      echo "       review-gate {prepush [--base <ref>]|prepush-accept --reason \"...\"|check-prepush [--rev <commit> [--branch <name>]]|change-id <base> [<commit>]|bypass-log}"
       echo "  reviewers: $VALID"
       echo "  primary  : ${PRIMARY[*]-}  (override with REVIEW_GATE_PRIMARY=\"kodus greptile\")"
       echo "  passes   : $MIN different reviewers (REVIEW_GATE_MIN); self counts only after codex passed or was skipped"
+      echo "  prepush  : OpenQodex $OQ_VERSION review of the commit (passed, or findings accepted) with the current punch list"
     } >&2
     exit 2
     ;;

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# install-githooks — point git's core.hooksPath at this checkout's githooks/ (the pre-push review gate).
+#   install-githooks --repo <path>   one repository (its .git/config)
+#   install-githooks --global        every repository of this user (~/.gitconfig): the setup for root on panda
+#   install-githooks --uninstall [--repo <path> | --global]
+# A repository's own .git/hooks/* keep running: githooks/ chains to them. A different core.hooksPath already set
+# is never replaced silently: it is named and the install stops (--force replaces it).
+# Part of https://github.com/job-bot-ai/ai-code-review-mcp
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+hooks="$here/githooks"
+scope=""; repo=""; uninstall=0; force=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) [ -n "${2:-}" ] || { echo "install-githooks: --repo needs a path" >&2; exit 2; }; scope=repo; repo="$2"; shift 2 ;;
+    --global) scope=global; shift ;;
+    --uninstall) uninstall=1; shift ;;
+    --force) force=1; shift ;;
+    *) sed -n '2,7p' "${BASH_SOURCE[0]}" >&2; exit 2 ;;
+  esac
+done
+[ -n "$scope" ] || { sed -n '2,7p' "${BASH_SOURCE[0]}" >&2; exit 2; }
+if [ "$scope" = global ]; then cfg=(git config --global)
+else
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "install-githooks: $repo is not a git repository" >&2; exit 2; }
+  cfg=(git -C "$repo" config --local)
+fi
+
+cur="$("${cfg[@]}" --get core.hooksPath 2>/dev/null || true)"
+if [ "$uninstall" = 1 ]; then
+  if [ "$cur" = "$hooks" ]; then "${cfg[@]}" --unset core.hooksPath; echo "install-githooks: removed core.hooksPath ($scope)"
+  else echo "install-githooks: core.hooksPath ($scope) is ${cur:-unset}, not $hooks; left alone"; fi
+  exit 0
+fi
+if [ -n "$cur" ] && [ "$cur" != "$hooks" ] && [ "$force" != 1 ]; then
+  echo "install-githooks: core.hooksPath ($scope) is already $cur; not replacing it (--force does)" >&2; exit 1
+fi
+[ -x "$hooks/pre-push" ] || { echo "install-githooks: $hooks/pre-push is missing or not executable" >&2; exit 1; }
+"${cfg[@]}" core.hooksPath "$hooks"
+echo "install-githooks: core.hooksPath ($scope) = $hooks"
+if [ "$scope" = repo ]; then
+  over="$(git -C "$repo" config --show-origin --get core.hooksPath)"
+  echo "install-githooks: in effect for $repo: $over"
+fi
+oq="${REVIEW_GATE_OPENQODEX:-/opt/openqodex/bin/openqodex}"
+pin="$(sed -n 's/^OQ_VERSION="\([0-9.]*\)".*/\1/p' "$here/review-gate")"
+v="$("$oq" --version 2>/dev/null || true)"
+[ "$v" = "$pin" ] || echo "install-githooks: WARNING: $oq is not OpenQodex $pin (${v:-not found}); no push passes until it is (README)" >&2

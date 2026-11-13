@@ -5,19 +5,23 @@
 # passes, primaries passed or skipped) for the PR's commit, in the repo the PR comes from
 # (followed from `cd`/`--repo`/`--head` by resolve-pr-target.mjs; the session cwd is only
 # the fallback). Marking a PR ready through the GraphQL API is blocked outright.
+# Pushes are gated by git itself: githooks/pre-push (core.hooksPath) needs a passing OpenQodex review of each pushed
+# commit. This hook only blocks the ways around a git hook, with a short fixed check (bypass_check below): skipping
+# it (--no-verify), pointing git elsewhere for its hooks or its config, and setting the gate's own variables. Tim's
+# escape hatch: REVIEW_GATE_PREPUSH=off in the environment Claude Code runs in (never a command prefix), logged.
 # Wire into ~/.claude/settings.json (matcher: "Bash"). Filename kept for back-compat
 # with existing settings.json entries.
 # Part of https://github.com/job-bot-ai/ai-code-review-mcp
 #
-# Fail-open by design: any unexpected error exits non-2 so it never wedges the shell;
-# only a genuine "no green light" condition returns exit 2 (which blocks the tool call).
+# Fail-open where it can't tell (no jq, review-gate's "nothing to gate"), so it never wedges the shell; a genuine
+# "no green light", a bypass, and any unexpected review-gate exit code return exit 2 (which blocks the tool call).
 
 input="$(cat)"
 
-# Fast path: if the payload can't possibly contain `gh ... pr ... create`, allow now. Quotes and
-# backslashes are dropped first: the shell removes them, so `gh pr "ready"` and `gh pr re\ady` run
-# `gh pr ready` (the resolver unquotes; it only has to be reached).
-printf '%s' "$input" | tr -d "\"'\\\\" | grep -Eq 'gh.*pr.*(create|new|ready)|markPullRequestReadyForReview' || exit 0   # `gh pr new` is an alias
+# Fast path: if the payload can't possibly contain `gh ... pr ... create` or touch git or the gate, allow now. Quotes
+# and backslashes are dropped first: the shell removes them, so `gh pr "ready"` and `gh pr re\ady` run `gh pr ready`
+# (the resolver unquotes; it only has to be reached).
+printf '%s' "$input" | tr -d "\"'\\\\" | grep -Eqi 'gh.*pr.*(create|new|ready)|markPullRequestReadyForReview|git|review.gate|openqodex|hookspath' || exit 0   # `gh pr new` is an alias
 
 # Pull the actual command string out of tool_input.command. jq is required to isolate the
 # command from surrounding JSON reliably; without it, warn (not silent) and fail open
@@ -29,6 +33,140 @@ else
   exit 0
 fi
 [ -n "$cmd" ] || exit 0
+
+# ── Ways around the git pre-push hook: a fixed list, matched anywhere in the command (no parsing) ──
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+session_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)"
+[ -n "$session_cwd" ] && [ -d "$session_cwd" ] || session_cwd="$PWD"
+bypass_check() {
+  local why="" log
+  if [ "${REVIEW_GATE_PREPUSH:-}" = off ]; then   # Tim's switch, set in Claude Code's own environment
+    # A fixed place, never HOME/XDG_STATE_HOME (review-gate bypass-log). A bypass is never silent: when it can't be
+    # logged, the checks below apply.
+    log="$(/bin/bash -p "$here/../review-gate" bypass-log 2>/dev/null)" || log=""
+    { [ -n "$log" ] && mkdir -p "$(dirname "$log")" &&
+      printf '%s\tclaude-hook\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(printf '%s' "$cmd" | tr '\n\t' '  ' | cut -c1-300)" >>"$log"; } 2>/dev/null &&
+      return 0
+  fi
+  # Matched with quotes and backslashes removed, so `"core.hooks""Path"` or `"-"c` is read as what the shell runs.
+  local c; c="$(printf '%s' "$cmd" | tr -d "\"'\\\\")"
+  m() { printf '%s' "$c" | grep -Eq -- "$1"; }
+  mi() { printf '%s' "$c" | grep -Eqi -- "$1"; }
+  local git='(^|[^[:alnum:]_.-])git([^[:alnum:]_-]|$)' push='(^|[^[:alnum:]_-])push([^[:alnum:]_-]|$)'
+  # Commands: the hook's own tokenizer (command-segments.mjs, on resolve-pr-target.mjs's tokenize) splits the command
+  # line at ; & | && || ( ) and newlines OUTSIDE quotes, heredocs, $(...) and backticks, and lists each substitution's
+  # body as a command of its own. Two conditions of one rule must hold in the same command, so
+  # `git -c x=y commit && git push`, `git log > f; cat .git/hooks/x` or a heredoc commit message that mentions
+  # .git/hooks and `->` aren't read as a write. One line per command, fields split by \x1f:
+  #   <has a substitution> <text, unquoted> <redirect targets> <only assignments> <NAME= names before the command>
+  local segtsv="" crude=0 US=$'\x1f'
+  if command -v node >/dev/null 2>&1 && [ -r "$here/command-segments.mjs" ]; then
+    segtsv="$(printf '%s' "$cmd" | node "$here/command-segments.mjs" 2>/dev/null)" || segtsv=""
+  fi
+  if [ -z "$segtsv" ]; then
+    # No node, or it can't tokenize: a cruder split that errs toward blocking. With $( or a backtick the whole command
+    # is one command; every command counts as built at run time, and any write plus any protected path counts.
+    crude=1
+    local l nm
+    while IFS= read -r l; do
+      nm="$(printf '%s' "$l" | grep -oE '(^|[[:space:]])[A-Za-z_][A-Za-z0-9_%]*\+?=' | sed 's/^[[:space:]]*//; s/+\{0,1\}=$//' | tr '\n' ' ')"
+      segtsv="${segtsv}1$US$l$US${US}0$US$nm"$'\n'
+    done <<<"$(if printf '%s' "$c" | grep -q '\$(\|`'; then printf '%s' "$c" | tr '\n' ' '; else printf '%s' "$c" | tr ';&|' '\n\n\n'; fi)"
+  fi
+  local segs targets
+  segs="$(printf '%s\n' "$segtsv" | cut -d"$US" -f2)"
+  targets="$(printf '%s\n' "$segtsv" | cut -d"$US" -f3)"
+  seg2() { local l; while IFS= read -r l; do printf '%s' "$l" | grep -Eq -- "$1" && printf '%s' "$l" | grep -Eq -- "$2" && return 0; done <<<"$segs"; return 1; }
+  seg_push_c() { local l; while IFS= read -r l; do printf '%s' "$l" | grep -Eq -- "$git" && printf '%s' "$l" | grep -Eq -- "$push" &&
+    printf '%s' "$l" | grep -Pq -- '(^|[^\w.-])git(\s+(-C\s+\S+|-c\s+credential\.helper=\S*(\s+[^-\s]\S*)*|--?[\w-]+(=\S*)?))*\s+(-c\s+(?!credential\.helper=)|--config-env)' &&
+    return 0; done <<<"$segs"; return 1; }
+  # GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME, XDG_*, PATH: git reads another config, or runs another git (or another
+  # bash for the hook); bash's own startup inputs (the hooks run bash -p, which ignores most of them; this is the
+  # second line) and the dynamic loader. An assignment to one of them (before the command, or with env/export/declare)
+  # counts unless it is plainly temporary, for one command that is not git or the gate and has no $(...) or backticks
+  # (`HOME=/tmp npm test; git status`, `PATH=$PATH:/x go build`). Only assignments holds for the rest of the shell.
+  local ev='(GIT_CONFIG[[:alnum:]_]*|GIT_DIR|GIT_COMMON_DIR|HOME|XDG_CONFIG_HOME|XDG_STATE_HOME|PATH|BASH_ENV|ENV|BASH_FUNC_[^[:space:]=]*|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH)'
+  env_reaches_git() {
+    local sub text tg alone names _wr _parsed
+    while IFS="$US" read -r sub text tg alone names _wr _parsed; do
+      [ -n "$text" ] || continue
+      printf ' %s ' "$names" | grep -Eq -- " $ev " ||
+        printf '%s' "$text" | grep -Eq -- "(^|[[:space:]])(env|export|declare|typeset|readonly|local)([[:space:]]+[^[:space:]]+)*[[:space:]]+$ev[[:space:]]*\\+?=" ||
+        continue
+      [ "$sub" = 1 ] && return 0
+      printf '%s' "$text" | grep -Eq -- "$git|review.gate" && return 0
+      printf '%s' "$text" | grep -Eq -- '^[[:space:]]*(export|declare|typeset|readonly|local)([[:space:]]|$)' && return 0
+      [ "$alone" = 1 ] && return 0   # set for the rest
+    done <<<"$segtsv"
+    return 1
+  }
+  # Files that hold git's config and hooks, and the pre-push review's records (the gate's and OpenQodex's own).
+  local prot='(\.gitconfig|\.git/config|git/config|\.git/hooks|(^|[^[:alnum:]_.-])githooks(/|$|[[:space:]])|review-gate-prepush|(^|[^[:alnum:]_-])\.openqodex(/|$|[[:space:]]))'
+  local protp='(\.gitconfig|\.git/config|git/config|\.git/hooks|githooks|review-gate-prepush|\.openqodex)'
+  local tool='(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|cp|mv|ln|rm|truncate|chmod|install|rsync|dd)([^[:alnum:]_-]|$)'
+  # cp/mv/ln/install/rsync write only their destination (and mv removes its sources): when command-segments.mjs could
+  # work that out (field 6/7), only those paths count, so `cp ~/.gitconfig /tmp/backup` is a read. When it couldn't
+  # (xargs cp, bash -c 'cp ...', no node), any protected path in the command counts. The other tools write what they name.
+  local copiers='(^|[^[:alnum:]_-])(cp|mv|ln|install|rsync)([^[:alnum:]_-]|$)'
+  local others='(^|[^[:alnum:]_-])(tee|sed[[:space:]]+-i|perl[[:space:]]+-[[:alnum:]]*i|rm|truncate|chmod|dd)([^[:alnum:]_-]|$)'
+  tool_writes_prot() {
+    local sub text tg alone names wr parsed
+    while IFS="$US" read -r sub text tg alone names wr parsed; do
+      printf '%s' "$text" | grep -Eq -- "$prot" || continue
+      printf '%s' "$text" | grep -Eq -- "$others" && return 0
+      if [ "$parsed" = 1 ]; then printf '%s' "$wr" | grep -Eq -- "$protp" && return 0
+      else printf '%s' "$text" | grep -Eq -- "$copiers" && return 0; fi
+    done <<<"$segtsv"
+    return 1
+  }
+  if m '(^|[^[:alnum:]_])(REVIEW_GATE_[[:alnum:]_]*|OPENQODEX_[[:alnum:]_]*)[[:space:]]*=' || m '(^|[^[:alnum:]_])REVIEW_GATE_PREPUSH([^[:alnum:]_]|$)'; then
+    why="it sets a REVIEW_GATE_* / OPENQODEX_* variable. The gate's settings, and the REVIEW_GATE_PREPUSH=off switch, are Tim's."
+  elif m '(^|[^[:alnum:]_.-])review.gate([[:space:]]+[^;&|]*)?[[:space:]]prepush-accept([^[:alnum:]_-]|$)'; then
+    why="prepush-accept declines OpenQodex's findings instead of fixing them: that waiver is Tim's call (REVIEW_GATE_PREPUSH=off in Claude Code's environment), never the agent's. Fix the findings and run \`review-gate prepush\` again."
+  elif m "$git" && m '--no-ve'; then   # any git command: an alias can be a push
+    why="--no-verify skips git's hooks, the pre-push review hook among them."
+  elif seg_push_c; then
+    why="a git push may only take -c credential.helper=...: any other -c or --config-env can switch the pre-push hook off."
+  elif m "$git" && mi 'hookspath' && ! mi '^[[:space:]]*git[[:space:]]+(-C[[:space:]]+[^[:space:];&|]+[[:space:]]+)?config([[:space:]]+--(global|local|system|show-origin|show-scope))*[[:space:]]+--get(-all)?[[:space:]]+core\.hookspath[[:space:]]*$'; then
+    why="it sets or overrides core.hooksPath (git -c, --config-env, git config): the pre-push hook would not run."
+  elif m "$git" && mi '(^|[^[:alnum:]_])include(if\.[^[:space:]]*)?\.path' && mi '(^|[^[:alnum:]_-])config([^[:alnum:]_-]|$)|(^|[[:space:]])-c[[:space:]]'; then
+    why="it sets include.path/includeIf.*.path: git would read another config file, which can switch the pre-push hook off."
+  elif m "$git" && m '(^|[^[:alnum:]_-])(send-pack|http-push)([^[:alnum:]_-]|$)'; then
+    why="git send-pack/http-push publish refs without running the pre-push hook."
+  elif m "$git" && m '(^|[^[:alnum:]_-])config([[:space:]]+[^;&|]*)?[[:space:]](--remove-section|--rename-section|--edit|-e)([[:space:]]|$)'; then
+    why="it edits or removes git config sections, which can drop core.hooksPath."
+  elif { m "$git" || m 'review.gate'; } && env_reaches_git; then
+    why="it overrides GIT_CONFIG*, GIT_DIR, GIT_COMMON_DIR, HOME, XDG_*, PATH, BASH_ENV/ENV/SHELLOPTS/BASHOPTS/BASH_FUNC_* or LD_* for git or the gate: another config, another git/bash, or code run before the hook."
+  elif { m "$git" || m 'review.gate'; } && m '(^|[^[:alnum:]_])(export[[:space:]]+-[[:alnum:]]*f|(declare|typeset)[[:space:]]+-[[:alnum:]]*(fx|xf))'; then
+    why="it exports a shell function (export -f): bash would run it in place of a command the hooks call."
+  elif m "$git" && m '(^|[^[:alnum:]_-])(env[[:space:]]+(-[[:alpha:]]*[iu]|--ignore-environment|--unset)|unset[[:space:]]+[^;&|]*(HOME|XDG_CONFIG_HOME|GIT_))'; then
+    why="it clears HOME/XDG_CONFIG_HOME/GIT_* for git: git would read another config, without the hook."
+  elif m 'install-githooks' && m '--uninstall'; then
+    why="it uninstalls the pre-push hook."
+  elif printf '%s\n' "$targets" | grep -Eq -- "$protp" ||
+       seg2 "(^|[^0-9&>])>>?\|?[[:space:]]*[^[:space:]]*$protp" . || tool_writes_prot ||
+       { [ "$crude" = 1 ] && m "$prot" && m "((^|[^0-9&>])>|$tool)"; } ||
+       { { printf '%s' "$targets" | grep -q '[^[:space:]]' || seg2 "$tool" .; } &&
+         { seg2 "$prot" '(^|[^[:alnum:]_])(cd|pushd)[[:space:]]' || seg2 "[[:alnum:]_]\+?=[^[:space:]]*$protp" .; }; }; then
+    # a redirect to the path, or a writing tool and the path in one command; or a cd into it / a variable holding it,
+    # and any write
+    why="it writes a git config file, a hooks folder, or a pre-push review record (review-gate-prepush/, .openqodex/) directly."
+  elif m "$git" && m "$push"; then
+    # A repo-local core.hooksPath (husky sets one) wins over the global one: the gate's hook would not run there.
+    local want got
+    want="$(realpath -e "$here/../githooks" 2>/dev/null)"   # empty when githooks/ is missing: then nothing passes
+    got="$(git -C "$session_cwd" config --get core.hooksPath 2>/dev/null || true)"
+    case "$got" in "~/"*) got="$HOME/${got#\~/}" ;; esac
+    [ -n "$got" ] && case "$got" in /*) ;; *) got="$(git -C "$session_cwd" rev-parse --show-toplevel 2>/dev/null)/$got" ;; esac
+    [ -n "$got" ] && got="$(realpath -m "$got")"
+    [ -n "$want" ] && [ "$got" = "$want" ] ||
+      why="core.hooksPath in $session_cwd is ${got:-unset}, not $want, so git's pre-push review hook would not run (install-githooks --global; a repo-local core.hooksPath, as husky sets, overrides it)."
+  fi
+  [ -z "$why" ] && return 0
+  echo "BLOCKED by the pre-push review gate: $why Push with a plain \`git push\`: the git hook checks the OpenQodex review (review-gate prepush). If the gate is wrong, stop and ask Tim." >&2
+  exit 2
+}
+bypass_check
 
 # `gh pr ready` is the only way the gate lets a PR out of draft: the resolver also blocks the
 # GraphQL ready mutation sent by an API client (gh api, curl, ...) wherever it runs, and lets
@@ -45,7 +183,6 @@ mention_re='(^|[^[:alnum:]_-]|\\[nt])gh([[:space:]]|\\t)+pr([[:space:]]|\\t)+(cr
 printf '%s' "$cmd" | grep -Eq "$mention_re" ||
   printf '%s' "$cmd" | sed -E "s/[\"']//g; s/\\\\([^nt])/\\1/g" | grep -Eq "$mention_re" || exit 0
 
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 gate="$here/../review-gate"
 
 # Fail-open if the gate helper is missing/unreadable — never wedge the shell.
@@ -54,8 +191,6 @@ gate="$here/../review-gate"
 # Which checkout(s) do the PR(s) come from? Not necessarily the session's cwd: the
 # resolver follows `cd` before each `gh pr create`, checks `--repo` against that checkout's
 # remotes and prefers the worktree holding `--head` (resolve-pr-target.mjs).
-session_cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null || true)"
-[ -n "$session_cwd" ] && [ -d "$session_cwd" ] || session_cwd="$PWD"
 # The session's checkout (its toplevel), so a session in a subdirectory or via a symlink
 # isn't told it was "gated on another repo".
 session_top="$(git -C "$session_cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$session_cwd")"
@@ -128,9 +263,10 @@ while IFS= read -r t; do
   [ -n "$t" ] || continue
   dir="$(printf '%s' "$t" | jq -r '.dir')"
   rev="$(printf '%s' "$t" | jq -r '.rev // empty')"
+  tbranch="$(printf '%s' "$t" | jq -r '.branch // empty')"   # the PR's branch: its base is what the review is judged by
   note="$(printf '%s' "$t" | jq -r '.note // empty')"
   where="$dir${rev:+ @ ${rev:0:12}}"
-  out="$( (cd "$dir" && bash "$gate" check ${rev:+--rev "$rev"}) 2>&1 >/dev/null )"; rc=$?
+  out="$( (cd "$dir" && bash "$gate" check ${rev:+--rev "$rev"} ${tbranch:+--branch "$tbranch"}) 2>&1 >/dev/null )"; rc=$?
   [ -n "$note" ] && msgs="${msgs:+$msgs
 }review-gate: $note"
   case "$rc" in

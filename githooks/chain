@@ -1,0 +1,7 @@
+#!/bin/sh
+# Every other hook githooks(5) lists (client and server side) is a link to this file: it runs the repo's own
+# .git/hooks/<name>, which setting core.hooksPath would otherwise switch off. Not push-to-checkout: its mere
+# presence replaces git's own receive.denyCurrentBranch=updateInstead work-tree update.
+h="$(git rev-parse --git-common-dir)/hooks/$(basename "$0")"
+[ -x "$h" ] && [ "$(readlink -f "$h")" != "$(readlink -f "$0")" ] && exec "$h" "$@"
+exit 0
