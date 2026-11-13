@@ -206,6 +206,15 @@ verify_prepush() {
   base_ok "$b" "$br" || { bad "the reviewed base ${b:0:12} is not on origin's default branch or the PR's base: review the whole change (\`review-gate prepush\` picks the PR's base)"; return 1; }
   jq -e --slurpfile m "$m" "$MANIFEST_MATCHES" "$rd/manifest.json" >/dev/null 2>&1 ||
     { bad "the review's manifest doesn't show the whole punch list supplied"; return 1; }
+  # The punch list it was given must be the one on main now (checked before the verdict: a review against an older
+  # list is moot either way, and `prepush --wait` reviews again rather than report its stale verdict). A failed fetch
+  # blocks.
+  cur="$(mktemp)"
+  if ! punch_list "$cur"; then rm -f "${cur:?}"; bad "couldn't fetch the current punch list from $PUNCH_REPO main (a failed fetch never passes)"; return 1; fi
+  if [ "$(grep -v '^#' "$cur" | cut -f1,2)" != "$(jq -r '.punch.files[] | [.name, .blob] | @tsv' "$m" | LC_ALL=C sort)" ]; then
+    rm -f "${cur:?}"; bad "the punch list on $PUNCH_REPO main changed since the review (reviewed at $(jq -r .punch.ref "$m" | cut -c1-12)); run \`review-gate prepush\` again"; return 1
+  fi
+  rm -f "${cur:?}"
   case "$v" in
     passed) ;;
     blocked)
@@ -213,20 +222,13 @@ verify_prepush() {
         { bad "OpenQodex blocked it ($(jq -r .counts "$m"); $BLOCK_ON and above block): fix them, or \`review-gate prepush-accept --reason ...\`. Report: $rd/report.html"; return 1; } ;;
     *) bad "verdict '$v'"; return 1 ;;
   esac
-  # The punch list it was given must be the one on main now. A failed fetch blocks.
-  cur="$(mktemp)"
-  if ! punch_list "$cur"; then rm -f "${cur:?}"; bad "couldn't fetch the current punch list from $PUNCH_REPO main (a failed fetch never passes)"; return 1; fi
-  if [ "$(grep -v '^#' "$cur" | cut -f1,2)" != "$(jq -r '.punch.files[] | [.name, .blob] | @tsv' "$m" | LC_ALL=C sort)" ]; then
-    rm -f "${cur:?}"; bad "the punch list on $PUNCH_REPO main changed since the review (reviewed at $(jq -r .punch.ref "$m" | cut -c1-12)); run \`review-gate prepush\` again"; return 1
-  fi
-  rm -f "${cur:?}"
   [ "$v" = passed ] || echo "review-gate: pre-push review findings for ${sha:0:12} ($(jq -r .counts "$m")) were ACCEPTED, not fixed — reason: $(jq -r .accepted.reason "$m") (report: $rd/report.html)" >&2
   return 0
 }
 
 # One prepush/prepush-accept at a time per repository (they share OpenQodex's last-review record). The lock is in the
 # common git dir, so every worktree of the repository shares it.
-# prepush_lock [<seconds>]: without a wait, a held lock is refused at once (exit 2). With one (`prepush --wait`), it
+# prepush_lock [<seconds>] [accept]: without a wait, a held lock is refused at once (exit 2). With one (`prepush --wait`), it
 # blocks on the lock itself (flock -w), never on a process search: `until ! pgrep -f "openqodex review"` matches its
 # own shell and never ends (#30/#31 stalled ~40 min each). Still held after <seconds>: exit 6; INT/TERM/HUP while
 # waiting: exit 130. Sets lock_waited=1 when another run held it, and lock_mark to a file made before the wait (a
@@ -242,7 +244,10 @@ prepush_lock() {
     lock_mark="$(mktemp "$pdir/.wait.XXXXXX")" || die "couldn't create a wait marker in $pdir"
   fi
   flock -n 9 && return 0
-  [ -n "${1:-}" ] || die "another prepush/prepush-accept is running in this repository; wait for it with \`review-gate prepush --wait\` (never a pgrep loop)"
+  if [ -z "${1:-}" ]; then
+    [ "${2:-}" = accept ] && die "another prepush/prepush-accept is running in this repository; let it finish, then run prepush-accept again"
+    die "another prepush/prepush-accept is running in this repository; wait for it with \`review-gate prepush --wait\` (never a pgrep loop)"
+  fi
   # flock runs in the background and is waited for: bash runs a trap only once a foreground child ends, `wait` at once.
   # The lock it takes belongs to fd 9's open file description, which this shell shares, so it stays held after flock.
   local fp
@@ -271,11 +276,16 @@ report_waited() {
   if [ "$fresh" = 1 ] && jq -e --arg root "$top" --arg base "$base" '.repo_root == $root and .base_ref == $base' "$m" >/dev/null 2>&1; then
     v="$(jq -r '.verdict + (if .accepted then " (findings accepted)" else "" end)' "$m")"
     echo "review-gate: the run waited for reviewed ${head:0:12} here against $base: $v; not reviewing it again" >&2
-    if verify_prepush "$head" "$branch"; then
+    local why
+    if why="$(verify_prepush "$head" "$branch" 2>&1)"; then
+      [ -z "$why" ] || echo "$why" >&2   # accepted findings are announced
       echo "review-gate: pre-push review passed for $branch @ ${head:0:12} (the run waited for; OpenQodex vs $base)"
       exit 0
     fi
-    [ "$v" != blocked ] || exit 1
+    # Blocked by its findings: that is the result. Failing for any other reason (a punch list changed since): it no
+    # longer holds, so review again rather than report a stale verdict.
+    if [ "$v" = blocked ] && [[ "$why" == *"OpenQodex blocked it"* ]]; then echo "$why" >&2; exit 1; fi
+    echo "$why" >&2
     echo "review-gate: that review no longer holds (above); reviewing ${head:0:12} again" >&2
     return 0
   fi
@@ -323,6 +333,10 @@ run_prepush() {
   [ -n "$base" ] || base="$(default_base)"
   git rev-parse --verify -q "$base^{commit}" >/dev/null || die "base '$base' is not a commit here (fetch it, or pass --base <ref>)"
   prepush_lock "$wait"
+  # A long wait: HEAD may have moved meanwhile (a commit, a checkout). Everything above was worked out for $head.
+  if [ "$lock_waited" = 1 ] && [ "$(git rev-parse HEAD 2>/dev/null)" != "$head" ]; then
+    rm -f "${lock_mark:?}"; die "HEAD moved while waiting for the lock (was ${head:0:12}); nothing reviewed: run prepush again"
+  fi
   [ "$lock_waited" = 0 ] || report_waited
   [ -z "$lock_mark" ] || rm -f "${lock_mark:?}"
   # Survivors of an earlier run that outlived KILL: no new review while any of them is alive.
@@ -513,7 +527,7 @@ run_accept() {
   [ "${1:-}" = "--reason" ] || die "usage: prepush-accept --reason \"why the findings are not being fixed\""
   reason="$(printf '%s' "${2:-}" | tr '\n\r' '  ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
   [ "${#reason}" -ge 10 ] || die "--reason must say why each finding is not being fixed (10+ characters)"
-  prepush_lock
+  prepush_lock "" accept
   local log; log="$(bypass_log)"
   [ -f "$m" ] || die "no finished pre-push review of ${head:0:12} to accept (an unfinished review can't be accepted): run \`review-gate prepush\`"
   [ "$(jq -r .verdict "$m")" = blocked ] || die "the pre-push review of ${head:0:12} has no blocking findings; nothing to accept"

@@ -316,11 +316,12 @@ reviewed change exactly the commit you push) it:
 `$GIT_COMMON_DIR/review-gate-prepush/`, shared by every worktree). A second one is refused at once (exit 2) unless it
 is given `--wait`, which blocks on that lock itself (`flock -w`) for `<secs>` (1 to 86,400), by default the longest
 run another prepush can make with this environment's settings (`REVIEW_GATE_PREPUSH_TIMEOUT` + `_GRACE` +
-`_KILL_AFTER` + 300 s, 2,250 s by default; a run started with longer ones can outlast it). Then:
+`_KILL_AFTER` + 300 s, 2,250 s by default; a run started with longer ones, or several waiters queued behind one
+another, can outlast it: pass a longer `--wait=<secs>`). HEAD moving during the wait: exit 2, nothing reviewed. Then:
 
 - the run it waited for reviewed HEAD in this worktree against the same base: it reports that result as
   `check-prepush` judges it, without a second review: exit 0 when it holds (passed, or findings accepted), 1 when it
-  is blocked;
+  is blocked by its findings;
 - anything else: no record of HEAD (another commit), another worktree's or another base's review, a run that failed
   (its cause may be its own: a dirty tree, a timeout) or a record that no longer holds: it reviews HEAD itself;
 - the lock is still held after `<secs>`: exit 6, nothing reviewed; INT/TERM/HUP while waiting: exit 130.

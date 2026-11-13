@@ -139,6 +139,32 @@ change wait-3
 bgrun STUB_OQ=blocked; n0="$(oqn)"; waitrun; waitdone
 [ "$(oqn)" = "$n0" ] || { out="$out (OpenQodex ran again)"; rc=98; }
 expect "a waited-for review that blocked HEAD is reported as blocked (exit 1)" 1 "OpenQodex blocked it"
+# Freshness: a record of HEAD from before the wait is not the waited-for run's, so HEAD is reviewed again.
+change wait-fresh; prepush
+hold; n0="$(oqn)"; bg=""; waitrun; unhold; waitdone
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "a record of HEAD older than the wait is not reported: --wait reviews again" 0 "left no review"
+# A waited-for review that no longer holds (the punch list changed on main while it ran) is reviewed again, even blocked.
+change wait-stale
+cp "$T/punch/review/PUNCH_LIST.md" "$T/punch0"
+bgrun STUB_OQ=blocked; n0="$(oqn)"; waitrun
+printf -- '- 1.2 a new item\n' >>"$T/punch/review/PUNCH_LIST.md"
+waitdone
+cp "$T/punch0" "$T/punch/review/PUNCH_LIST.md"
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+[[ "$out" == *"no longer holds"* ]] || rc=97
+expect "a waited-for blocked review whose punch list changed since is reviewed again, not reported as blocked" 0 "pre-push review passed"
+prepush
+# HEAD moving while waiting: nothing reviewed.
+change wait-move
+hold; bg=""; waitrun; change wait-moved; unhold; waitdone
+expect "HEAD moving during the wait exits 2, nothing reviewed" 2 "HEAD moved while waiting"
+# prepush-accept, refused while a review runs, isn't told to use prepush --wait.
+hold
+out="$(cd "$W" && bash "$gate" prepush-accept --reason "declined: a reason long enough" 2>&1)"; rc=$?
+unhold
+[[ "$out" != *"--wait"* ]] || rc=97
+expect "prepush-accept refused while the lock is held says to run it again, not prepush --wait" 2 "then run prepush-accept again"
 # A waited-for run that failed: its reason may be its own (a dirty tree, another worktree), so HEAD is reviewed here.
 change wait-4
 bgrun STUB_OQ=incomplete; n0="$(oqn)"; waitrun; waitdone
