@@ -51,6 +51,8 @@ expect "every primary passed this head: no pre-push review needed at ready/merge
   "pre-push review not required"
 REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 run "$T/np" "gh pr create --fill"
 expect "REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 still requires it" 2 stderr "no passing pre-push review"
+out="$(cd "$T/np" && REVIEW_GATE_MERGE_NEEDS_PREPUSH=true bash "$gate" check 2>&1)"; rc=$?
+expect "REVIEW_GATE_MERGE_NEEDS_PREPUSH=true is refused, never read as off" 2 stdout "must be 0 or 1"
 mkrepo "$T/np2" acme/noprepush2 && (cd "$T/np2" && bash "$gate" record kodus >/dev/null &&
   bash "$gate" record-skip coderabbit --reason "not installed on this repo" >/dev/null && bash "$gate" record codex >/dev/null)
 run "$T/np2" "gh pr create --fill"
