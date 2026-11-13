@@ -261,6 +261,7 @@ This repo only adds glue: fetching the punch list, binding a review to a commit,
 
 ```bash
 review-gate prepush [--base <ref>]   # default base: the PR's base (gh pr view), else origin/main
+review-gate prepush --wait[=<secs>]  # another prepush is running: wait for it, then run or report (below)
 # fix every finding at minor or above (and the same bug class elsewhere), commit, run it again, then push
 review-gate prepush-accept --reason "why each finding is not being fixed"   # declining, for this commit only
 review-gate status                   # shows the pre-push review of HEAD
@@ -310,6 +311,23 @@ reviewed change exactly the commit you push) it:
    change id. Exit 2 (incomplete, no reviewer that can start,
    OpenQodex failing), "Nothing to review", HEAD moving during the run: nothing passes, exit 4, and the reason is
    kept in `<sha>.last`.
+
+**One at a time, and `--wait`.** One `prepush`/`prepush-accept` runs at a time per repository (a lock in
+`$GIT_COMMON_DIR/review-gate-prepush/`, shared by every worktree). A second one is refused at once (exit 2) unless it
+is given `--wait`, which blocks on that lock itself (`flock -w`) for `<secs>` (1 to 86,400), by default the longest
+run another prepush can make with this environment's settings (`REVIEW_GATE_PREPUSH_TIMEOUT` + `_GRACE` +
+`_KILL_AFTER` + 300 s, 2,250 s by default; a run started with longer ones, or several waiters queued behind one
+another, can outlast it: pass a longer `--wait=<secs>`). HEAD moving during the wait: exit 2, nothing reviewed. Then:
+
+- the run it waited for reviewed HEAD in this worktree against the same base: it reports that result as
+  `check-prepush` judges it, without a second review: exit 0 when it holds (passed, or findings accepted), 1 when it
+  is blocked by its findings;
+- anything else: no record of HEAD (another commit), another worktree's or another base's review, a run that failed
+  (its cause may be its own: a dirty tree, a timeout) or a record that no longer holds: it reviews HEAD itself;
+- the lock is still held after `<secs>`: exit 6, nothing reviewed; INT/TERM/HUP while waiting: exit 130.
+
+Wait with `--wait`, never with a process search: `until ! pgrep -f "openqodex review"` matches the shell running it
+and never ends (two ~40 min stalls on pr-orchestrator #30/#31, 2026-11-13).
 
 **Findings.** A `blocked` review exits 1. Fix the findings. Declining them for that commit with
 `prepush-accept --reason "..."` (only after a finished review with findings; an unfinished review can't be

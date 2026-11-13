@@ -81,6 +81,117 @@ mkdir -p "$W/.git/review-gate-prepush"
 flock "$W/.git/review-gate-prepush/lock" bash -c "cd '$W' && bash '$gate' prepush --base origin/main" >"$T/lk" 2>&1; rc=$?; out="$(cat "$T/lk")"
 expect "a second prepush while one runs is refused" 2 "another prepush/prepush-accept is running"
 
+# ── prepush --wait: block on the lock itself (flock -w), then run or report ──
+# Agents hand-rolled `until ! pgrep -f "openqodex review"`, which matches its own shell (#30/#31 stalled ~40 min).
+# No wall-clock windows: holders keep the lock until the test lets them go (a gate file), and the waiter is checked
+# to be waiting on the lock (its own message) before they do.
+lk="$W/.git/review-gate-prepush/lock"
+oqn() { wc -l <"$T/oq-args" 2>/dev/null | tr -d ' '; }   # OpenQodex runs so far (the stub logs each one's arguments)
+nope() { fail=$((fail + 1)); echo "FAIL - $1"; }
+# hold / unhold: another holder of the lock (not a review) until unhold. flock -o: flock alone holds it, so killing
+# flock frees it; its sleep (pid in $T/held) goes too.
+hold() { rm -f "$T/held"; flock -o "$lk" bash -c 'echo $$ >"$1"; exec sleep 600' _ "$T/held" & holder=$!
+  for _ in $(seq 1 100); do [ -s "$T/held" ] && return; sleep 0.1; done; nope "hold never took the lock"; }
+unhold() { kill "$holder" "$(cat "$T/held" 2>/dev/null)" 2>/dev/null; wait "$holder" 2>/dev/null; }
+# bgrun <env...>: a real prepush in the background (in $BW, default $W) whose OpenQodex waits for $T/gate; returns
+# once that OpenQodex has started (so the run holds the lock)
+bgrun() { local n; n="$(oqn)"; rm -f "$T/gate"
+  (cd "${BW:-$W}" && env STUB_OQ_GATE="$T/gate" "$@" bash "$gate" prepush --base origin/main) >"$T/bg.out" 2>&1 & bg=$!
+  for _ in $(seq 1 100); do [ "$(oqn)" != "$n" ] && return; sleep 0.1; done
+  nope "the background prepush never started OpenQodex: $(cat "$T/bg.out")"; }
+# waitrun [args]: `prepush --wait` in the background; returns once it says it is waiting on the lock
+waitrun() { (cd "$W" && bash "$gate" prepush --base origin/main "${@:---wait}") >"$T/w.out" 2>&1 & wp=$!
+  for _ in $(seq 1 100); do grep -q "waiting up to" "$T/w.out" 2>/dev/null && return; kill -0 "$wp" 2>/dev/null || break; sleep 0.1; done
+  nope "prepush --wait did not wait on the lock: $(cat "$T/w.out")"; }
+# waitdone: let the holder (bgrun's review, if any) finish, then collect the waiter's exit code and output
+waitdone() { touch "$T/gate"; [ -z "${bg:-}" ] || wait "$bg"; bg=""; wait "$wp"; rc=$?; out="$(cat "$T/w.out")"; }
+change wait-1
+hold; n0="$(oqn)"; bg=""
+waitrun --wait=60; unhold; waitdone
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "prepush --wait waits on the lock, then reviews (red without the wait: refused at once, exit 2)" 0 "pre-push review passed"
+[[ "$out" == *"waiting up to 60s"* && "$out" == *"left no review"* ]] || rc=97
+expect "and says it is waiting, and that the holder left no review of HEAD" 0
+hold
+prepush --wait=1
+expect "a wait that runs out exits 6, having reviewed nothing" 6 "stopped waiting"
+unhold
+ls -a "$W/.git/review-gate-prepush" | grep -q '^\.wait\.' && { rc=96; out="$(ls -a "$W/.git/review-gate-prepush")"; } || rc=0
+expect "and leaves no wait marker behind" 0
+hold
+(cd "$W" && exec bash "$gate" prepush --base origin/main --wait=60) >"$T/w.out" 2>&1 & wp=$!
+for _ in $(seq 1 100); do grep -q "waiting up to" "$T/w.out" && break; sleep 0.1; done
+kill -TERM "$wp"; wait "$wp"; rc=$?; out="$(cat "$T/w.out")"; unhold
+ls -a "$W/.git/review-gate-prepush" | grep -q '^\.wait\.' && rc=96
+expect "a wait cancelled by TERM exits 130 and leaves no wait marker behind" 130
+prepush --wait=abc
+expect "--wait=<not seconds> is a usage error" 2 "whole number of seconds"
+prepush --wait=0
+expect "--wait=0 is a usage error too" 2 "whole number of seconds"
+# The run waited for reviewed HEAD (this worktree, this base): its result is reported, HEAD isn't reviewed twice.
+change wait-2
+bgrun; n0="$(oqn)"; waitrun; waitdone
+[ "$(oqn)" = "$n0" ] || { out="$out (OpenQodex ran again: $n0 -> $(oqn))"; rc=98; }
+expect "prepush --wait after another review of HEAD reports its pass, without a second review" 0 "the run waited for reviewed"
+push -q origin feat
+expect "and that commit can be pushed" 0
+change wait-3
+bgrun STUB_OQ=blocked; n0="$(oqn)"; waitrun; waitdone
+[ "$(oqn)" = "$n0" ] || { out="$out (OpenQodex ran again)"; rc=98; }
+expect "a waited-for review that blocked HEAD is reported as blocked (exit 1)" 1 "OpenQodex blocked it"
+# Freshness: a record of HEAD from before the wait is not the waited-for run's, so HEAD is reviewed again.
+change wait-fresh; prepush
+hold; n0="$(oqn)"; bg=""; waitrun; unhold; waitdone
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "a record of HEAD older than the wait is not reported: --wait reviews again" 0 "left no review"
+# A waited-for review that no longer holds (the punch list changed on main while it ran) is reviewed again, even blocked.
+change wait-stale
+cp "$T/punch/review/PUNCH_LIST.md" "$T/punch0"
+bgrun STUB_OQ=blocked; n0="$(oqn)"; waitrun
+printf -- '- 1.2 a new item\n' >>"$T/punch/review/PUNCH_LIST.md"
+waitdone
+cp "$T/punch0" "$T/punch/review/PUNCH_LIST.md"
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+[[ "$out" == *"no longer holds"* ]] || rc=97
+expect "a waited-for blocked review whose punch list changed since is reviewed again, not reported as blocked" 0 "pre-push review passed"
+prepush
+# HEAD moving while waiting: nothing reviewed.
+change wait-move
+hold; bg=""; waitrun; change wait-moved; unhold; waitdone
+expect "HEAD moving during the wait exits 2, nothing reviewed" 2 "HEAD moved while waiting"
+# prepush-accept, refused while a review runs, isn't told to use prepush --wait.
+hold
+out="$(cd "$W" && bash "$gate" prepush-accept --reason "declined: a reason long enough" 2>&1)"; rc=$?
+unhold
+[[ "$out" != *"--wait"* ]] || rc=97
+expect "prepush-accept refused while the lock is held says to run it again, not prepush --wait" 2 "then run prepush-accept again"
+# A waited-for run that failed: its reason may be its own (a dirty tree, another worktree), so HEAD is reviewed here.
+change wait-4
+bgrun STUB_OQ=incomplete; n0="$(oqn)"; waitrun; waitdone
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "after a waited-for run of HEAD that failed, --wait reviews HEAD itself" 0 "pre-push review passed"
+# Against another base: not this run's review.
+change wait-5
+bgrun; n0="$(oqn)"
+(cd "$W" && bash "$gate" prepush --base origin/feat --wait) >"$T/w.out" 2>&1 & wp=$!
+for _ in $(seq 1 100); do grep -q "waiting up to" "$T/w.out" && break; sleep 0.1; done
+waitdone
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+[[ "$out" == *"left no review"* ]] || rc=97
+expect "a waited-for review of HEAD against another base doesn't count: --wait reviews against its own" 0 "pre-push review passed"
+# Another worktree shares the lock: its review of the same commit is that worktree's, so this one reviews HEAD itself.
+git -C "$W" worktree add -q --detach "$T/w2" HEAD
+BW="$T/w2" bgrun; n0="$(oqn)"; waitrun; waitdone
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "after another worktree's review of the same commit, --wait reviews HEAD here" 0 "pre-push review passed"
+# And of another commit: the same.
+echo wt >>"$T/w2/g.txt" && git -C "$T/w2" add g.txt && git -C "$T/w2" commit -q -m wt
+BW="$T/w2" bgrun; n0="$(oqn)"; waitrun; waitdone
+[ "$(oqn)" = $((n0 + 1)) ] || { out="$out (OpenQodex runs: $n0 -> $(oqn))"; rc=98; }
+expect "after another worktree's review of another commit, --wait reviews HEAD itself" 0 "pre-push review passed"
+git -C "$W" worktree remove --force "$T/w2"
+prepush
+
 # ── a different commit ──
 change two
 push -q origin feat
