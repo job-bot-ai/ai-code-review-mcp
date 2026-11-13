@@ -11,7 +11,7 @@ set -euo pipefail
 [ "${1:-}" = review ] || { echo "stub openqodex: only review" >&2; exit 2; }
 shift
 [ -z "${STUB_OQ_ARGS:-}" ] || printf '%s\n' "$*" >>"$STUB_OQ_ARGS"
-[ -z "${STUB_OQ_DELAY:-}" ] || sleep "$STUB_OQ_DELAY"   # a review that takes a while (prepush --wait tests)
+[ -z "${STUB_OQ_GATE:-}" ] || while [ ! -e "$STUB_OQ_GATE" ]; do sleep 0.1; done   # a review that runs until the test lets it end (prepush --wait tests)
 [ -z "${STUB_OQ_ARGS:-}" ] || printf 'GH_TOKEN=%s\nGITHUB_TOKEN=%s\n' "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}" >"$(dirname "$STUB_OQ_ARGS")/oq-env"
 base="" cfg="" blk="" mode="${STUB_OQ:-passed}"
 while [ $# -gt 0 ]; do

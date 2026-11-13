@@ -314,14 +314,16 @@ reviewed change exactly the commit you push) it:
 
 **One at a time, and `--wait`.** One `prepush`/`prepush-accept` runs at a time per repository (a lock in
 `$GIT_COMMON_DIR/review-gate-prepush/`, shared by every worktree). A second one is refused at once (exit 2) unless it
-is given `--wait`, which blocks on that lock itself (`flock -w`) for `<secs>`, by default the longest run another
-prepush can make (`REVIEW_GATE_PREPUSH_TIMEOUT` + `_GRACE` + `_KILL_AFTER` + 300 s, 2,250 s by default). Then:
+is given `--wait`, which blocks on that lock itself (`flock -w`) for `<secs>` (1 to 86,400), by default the longest
+run another prepush can make with this environment's settings (`REVIEW_GATE_PREPUSH_TIMEOUT` + `_GRACE` +
+`_KILL_AFTER` + 300 s, 2,250 s by default; a run started with longer ones can outlast it). Then:
 
-- the run it waited for reviewed HEAD (or accepted its findings): it reports that result as `check-prepush` would judge it, without a second
-  review (exit 0 when it holds, 1 when it doesn't: blocked, or no longer current), or exit 4 with the reason when
-  that run failed;
-- that run left nothing for HEAD (another commit, or another worktree's): it reviews HEAD itself;
-- the lock is still held after `<secs>`: exit 6, nothing reviewed.
+- the run it waited for reviewed HEAD in this worktree against the same base: it reports that result as
+  `check-prepush` judges it, without a second review: exit 0 when it holds (passed, or findings accepted), 1 when it
+  is blocked;
+- anything else: no record of HEAD (another commit), another worktree's or another base's review, a run that failed
+  (its cause may be its own: a dirty tree, a timeout) or a record that no longer holds: it reviews HEAD itself;
+- the lock is still held after `<secs>`: exit 6, nothing reviewed; INT/TERM/HUP while waiting: exit 130.
 
 Wait with `--wait`, never with a process search: `until ! pgrep -f "openqodex review"` matches the shell running it
 and never ends (two ~40 min stalls on pr-orchestrator #30/#31, 2026-11-13).
