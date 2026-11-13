@@ -532,8 +532,16 @@ case "${1:-help}" in
       has "$r" ${passes[@]+"${passes[@]}"} ${skips[@]+"${skips[@]}"} ||
         problems+=("primary reviewer $r has no pass or skip")
     done
-    # Nothing reaches "ready" without the pre-push review the git hook requires for that commit.
+    # The pre-push review the git hook requires for that commit, unless every primary reviewer already passed this
+    # exact commit (Tim, 2026-11-13: a head Kodus and Greptile both reviewed clean on the PR doesn't wait for a local
+    # review again at `gh pr ready`/`gh pr merge`). A skip is not a pass: with a primary skipped, the pre-push review
+    # still counts. REVIEW_GATE_MERGE_NEEDS_PREPUSH=1 requires it always. The git hook itself is unchanged.
+    primaries_passed=1
+    [ "${#PRIMARY[@]}" -gt 0 ] || primaries_passed=0
+    for r in ${PRIMARY[@]+"${PRIMARY[@]}"}; do has "$r" ${passes[@]+"${passes[@]}"} || primaries_passed=0; done
     if pp="$(verify_prepush "$rev" "$to" 2>&1)"; then [ -z "$pp" ] || echo "$pp" >&2   # accepted findings are announced
+    elif [ "$primaries_passed" = 1 ] && [ "${REVIEW_GATE_MERGE_NEEDS_PREPUSH:-0}" != 1 ]; then
+      echo "review-gate: pre-push review not required for ${rev:0:12}: every primary reviewer (${PRIMARY[*]}) passed it" >&2
     else problems+=("$pp"); fi
     if [ "${#counted[@]}" -lt "$MIN" ]; then
       problems+=("${#counted[@]} of $MIN review passes (${counted[*]:-none})")
