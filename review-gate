@@ -125,12 +125,19 @@ pgh() {
 }
 
 # The round-aware threshold (Tim, 2026-11-14; pr-orchestrator punch list 3.10): late in a PR only serious findings
-# block a push. The thresholds live in $PUNCH_REPO's review/policy.yaml on main: prepush.openqodex_block_on (every
-# round) and prepush.late.{from_round, openqodex_block_on}. The PR's round is the one prorch reports in its own check
-# on the PR's head ("round N/M" in the policy's check_name, shadow or not, from the prorch GitHub App only, so no
-# other app or CI job can lower the bar). Anything unknown (no PR, no such check, an unreadable policy) blocks as
-# before: $BLOCK_ON. The every-round value never loosens $BLOCK_ON.
+# block a push. The thresholds come from $PUNCH_REPO's review/policy.yaml on main: prepush.openqodex_block_on (every
+# round) and prepush.late.{from_round, openqodex_block_on}; a readable policy without a late rule gets ours
+# (LATE_FROM_ROUND, LATE_BLOCK_ON). The round is the later of two sources:
+#   - local: this branch's own pre-push reviews, one per recorded commit on it (local_round); the one that works
+#     today, while prorch's rounds can't move (pr-orchestrator JOB-48);
+#   - prorch: "round N/M" in prorch's own check on the open PR's head (the policy's check_name, shadow or not, from
+#     the prorch GitHub App only, so no other app or CI job can lower the bar).
+# The local count is the pusher's own record: it can only loosen what the pusher's own gate blocks (the same trust as
+# prepush-accept, which is logged). An unreadable policy, a detached head or an unreadable record blocks as before:
+# $BLOCK_ON. The every-round value never loosens $BLOCK_ON.
 PRORCH_APP="${REVIEW_GATE_PRORCH_APP:-jbot-orchestrator}"
+LATE_FROM_ROUND=5        # "after round 4" (Tim, 2026-11-14)
+LATE_BLOCK_ON=major      # minors stop blocking; they are printed for the PR's follow-up issue (below_bar)
 sev_rank() { case "$1" in nitpick) echo 0 ;; minor) echo 1 ;; major) echo 2 ;; critical) echo 3 ;; *) echo -1 ;; esac; }
 # at_or_above <report.json> <severity>: how many of its findings reach that severity.
 at_or_above() {
@@ -147,9 +154,25 @@ below_bar() {
   echo "review-gate: $n minor finding(s) did not block (late in the PR: $2 and above block). Put each in the PR's follow-up issue:" >&2
   jq -r '.findings[]? | select(.severity == "minor") | "  - \(.title) (\(.file_path // "?"):\(.line_number // "?"))"' "$rd/report.json" >&2
 }
-# effective_block_on <branch>: prints "<block_on> <round|?> <why>" (why: one word, for the log).
+# local_round <branch> <tip> <base commit>: how many of this branch's commits have a recorded pre-push review: records
+# naming the branch whose commit is on it (an ancestor of the tip, not of the base), so a reused branch name or a
+# merged older branch adds nothing (3.4). A commit rebased away stops counting (stricter, never looser).
+local_round() {
+  local n=0 f s
+  for f in "$pdir"/*.json; do
+    [ -f "$f" ] || continue
+    s="$(jq -r --arg b "$1" 'select(.branch == $b) | .sha // empty' "$f" 2>/dev/null)" || continue
+    [[ "$s" =~ ^[0-9a-f]{40}$ ]] || continue
+    git merge-base --is-ancestor "$s" "$2" 2>/dev/null || continue
+    ! git merge-base --is-ancestor "$s" "$3" 2>/dev/null || continue
+    n=$((n + 1))
+  done
+  echo "$n"
+}
+# effective_block_on <branch> <tip> <base commit> <this run>: prints "<block_on> <round|?> <why>" (why: one word, for
+# the log). <this run>: 1 while a review of the tip is being run (its record isn't written yet), else 0.
 effective_block_on() {
-  local br="$1" pol vals base from late cn head title rnd
+  local br="$1" tip="$2" mb="$3" this="$4" pol vals base from late cn head title rnd lr src
   pol="$(pgh api -H "Accept: application/vnd.github.raw" "repos/$PUNCH_REPO/contents/review/policy.yaml?ref=main" 2>/dev/null </dev/null)" ||
     { echo "$BLOCK_ON ? no-policy"; return 0; }
   vals="$(printf '%s' "$pol" | python3 -I -c '
@@ -159,24 +182,35 @@ try:
     p = d.get("prepush") or {}
     late = p.get("late") or {}
     fr = late.get("from_round")
-    print(d.get("check_name") or "", p.get("openqodex_block_on") or "", fr if isinstance(fr, int) and not isinstance(fr, bool) and fr > 0 else "", late.get("openqodex_block_on") or "")
+    f = lambda v: str(v or "").replace("|", "").replace("\n", " ")
+    # A late rule that is there but unreadable prints "bad" for its round: never the gate default.
+    frs = str(fr) if isinstance(fr, int) and not isinstance(fr, bool) and fr > 0 else ("" if fr is None else "bad")
+    print("ok|" + "|".join((f(d.get("check_name")), f(p.get("openqodex_block_on")), frs, f(late.get("openqodex_block_on")))))
 except Exception:
-    print("")' 2>/dev/null)" || vals=""
-  read -r cn base from late <<<"$vals"
+    print("err")' 2>/dev/null)" || vals="err"
+  # "|"-separated: read keeps an empty field in its place (whitespace separators would shift the ones after it).
+  local ok; IFS='|' read -r ok cn base from late <<<"$vals"
+  [ "$ok" = ok ] || { echo "$BLOCK_ON ? bad-policy"; return 0; }
   # Every round: the policy's value, never looser than ours.
   [ "$(sev_rank "${base:-}")" -ge 0 ] && [ "$(sev_rank "$base")" -le "$(sev_rank "$BLOCK_ON")" ] || base="$BLOCK_ON"
-  { [ -n "${cn:-}" ] && [[ "${from:-}" =~ ^[0-9]+$ ]] && [ "$(sev_rank "${late:-}")" -ge 0 ] && [ -n "$br" ]; } ||
-    { echo "$base ? no-late-rule"; return 0; }
-  # This repo's own branch only: a fork's open PR with the same branch name is not this push's PR (punch list 3.4).
+  # No late rule in the policy (pr-orchestrator part (a) not landed yet): ours. A malformed one blocks as before.
+  if [ -z "${from:-}" ] && [ -z "${late:-}" ]; then from="$LATE_FROM_ROUND"; late="$LATE_BLOCK_ON"; fi
+  { [[ "${from:-}" =~ ^[0-9]+$ ]] && [ "$(sev_rank "${late:-}")" -ge 0 ]; } || { echo "$base ? bad-late-rule"; return 0; }
+  { [ -n "$br" ] && [ "$br" != HEAD ] && [[ "$tip" =~ ^[0-9a-f]{40}$ ]] && [[ "$mb" =~ ^[0-9a-f]{40}$ ]]; } ||
+    { echo "$base ? no-branch"; return 0; }
+  lr=$(( $(local_round "$br" "$tip" "$mb") + this )); rnd="$lr"; src=local
+  # prorch's round, when it reports one. This repo's own branch only: a fork's open PR with the same branch name is
+  # not this push's PR (punch list 3.4).
   head="$(pgh pr view "$br" --json headRefOid,state,isCrossRepository \
     -q 'select(.state == "OPEN" and .isCrossRepository == false) | .headRefOid' 2>/dev/null </dev/null)" || head=""
-  [[ "$head" =~ ^[0-9a-f]{40}$ ]] || { echo "$base ? no-open-pr"; return 0; }
-  title="$(pgh api "repos/{owner}/{repo}/commits/$head/check-runs?per_page=100" 2>/dev/null </dev/null | jq -r --arg app "$PRORCH_APP" --arg cn "$cn" '
-    [.check_runs[] | select(.app.slug == $app and (.name == $cn or .name == ($cn + " (shadow)")))]
-    | sort_by(.started_at // "") | last | .output.title // ""' 2>/dev/null)" || title=""
-  rnd="$(printf '%s' "$title" | grep -oE 'round [0-9]+/[0-9]+' | tail -n 1 | sed -E 's#round ([0-9]+)/.*#\1#')" || rnd=""
-  [[ "$rnd" =~ ^[0-9]+$ ]] || { echo "$base ? no-round"; return 0; }
-  if [ "$rnd" -ge "$from" ]; then echo "$late $rnd late"; else echo "$base $rnd early"; fi
+  if [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
+    title="$(pgh api "repos/{owner}/{repo}/commits/$head/check-runs?per_page=100" 2>/dev/null </dev/null | jq -r --arg app "$PRORCH_APP" --arg cn "${cn:-review-policy}" '
+      [.check_runs[] | select(.app.slug == $app and (.name == $cn or .name == ($cn + " (shadow)")))]
+      | sort_by(.started_at // "") | last | .output.title // ""' 2>/dev/null)" || title=""
+    title="$(printf '%s' "$title" | grep -oE 'round [0-9]+/[0-9]+' | tail -n 1 | sed -E 's#round ([0-9]+)/.*#\1#')" || title=""
+    if [[ "$title" =~ ^[0-9]+$ ]] && [ "$title" -gt "$rnd" ]; then rnd="$title"; src=prorch; fi
+  fi
+  if [ "$rnd" -ge "$from" ]; then echo "$late $rnd late-$src"; else echo "$base $rnd early-$src"; fi
 }
 
 # punch_list <out.tsv>: the punch list on $PUNCH_REPO main, one "<name>\t<git blob id>\t<path>" line per file, then
@@ -247,7 +281,9 @@ verify_prepush() {
   jq -e --slurpfile m "$m" '.completion.status == "complete" and .change_id == $m[0].change_id and .verdict == $m[0].verdict' \
     "$rd/report.json" >/dev/null 2>&1 || { bad "the report is not a complete review of this change"; return 1; }
   # The threshold for this push now (round-aware): a review run at it or at a stricter one counts.
-  local need nr rb; read -r need nr _ < <(effective_block_on "$br"); rb="$(jq -r .block_on "$m")"
+  # The round under the branch the review was recorded for, as run_prepush counted it (this record included).
+  local need nr rb; rb="$(jq -r .block_on "$m")"
+  read -r need nr _ < <(effective_block_on "$(jq -r '.branch // empty' "$m")" "$sha" "$(jq -r '.base_sha // empty' "$m")" 0)
   { [ "$(sev_rank "$rb")" -ge 0 ] && [ "$(sev_rank "$rb")" -le "$(sev_rank "$need")" ]; } ||
     { bad "reviewed with block_on_severity $rb; the gate uses $need now (round $nr)"; return 1; }
   b="$(jq -r .base_sha "$m")"
@@ -421,7 +457,10 @@ run_prepush() {
   local st mb; mb="$(git merge-base "$base" "$head")" && st="$(oq_state_files "$mb" "$head")" || fail "couldn't diff $base..HEAD"
   [ -z "$st" ] || fail "the change commits files under .openqodex/, which OpenQodex neither reviews nor counts in its change id (remove them): $(printf '%s' "$st" | head -n 3 | tr '\n' ' ')"
   # This push's threshold (round-aware, effective_block_on): written into the review's config and its record.
-  local blk eround ewhy; read -r blk eround ewhy < <(effective_block_on "$branch")
+  # This run counts as a round unless this commit already has a record on this branch (a review run again).
+  local blk eround ewhy this=1
+  [ "$(jq -r .branch "$pdir/$head.json" 2>/dev/null)" = "$branch" ] && this=0
+  read -r blk eround ewhy < <(effective_block_on "$branch" "$head" "$mb" "$this")
   [ "$(sev_rank "${blk:-}")" -ge 0 ] || blk="$BLOCK_ON"
   echo "review-gate: blocking at $blk (round $eround: $ewhy)" >&2
   # The current punch list, checked against its git blob ids, copied where OpenQodex reads convention files.

@@ -559,41 +559,64 @@ expect "prepush-accept writes the acceptance to the bypass log, wherever XDG_STA
 
 # ── round-aware threshold (pr-orchestrator 3.10): late in a PR only serious findings block ──
 pol="$T/punch/review/policy.yaml"
-printf 'check_name: review-policy\nprepush:\n  openqodex_block_on: minor\n  late:\n    from_round: 5\n    openqodex_block_on: major\n' >"$pol"
+latepol() { printf 'check_name: review-policy\nprepush:\n  openqodex_block_on: minor\n  late:\n    from_round: 5\n    openqodex_block_on: major\n' >"$pol"; }
 checks() {   # checks <round> [app]: prorch's check on the PR head
   printf '{"check_runs": [{"name": "review-policy (shadow)", "app": {"slug": "%s"}, "started_at": "2026-11-14T00:00:00Z",
     "output": {"title": "round 0 failed (no pre-push review); round %s/6, waiting on Kodus"}}]}' "${2:-jbot-orchestrator}" "$1"
 }
+fresh() { git -C "$W" checkout -q -B "$1" origin/main; }   # a branch with no pre-push reviews yet
+latepol
 export STUB_PR_HEAD=2222222222222222222222222222222222222222
-: >"$T/oq-args"; change late1; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
-expect "after round 4 a minor finding doesn't block the push" 0 "blocking at major (round 5: late)"
+# prorch's round (each case on a fresh branch, so the branch's own count stays below it)
+fresh pr5; : >"$T/oq-args"; change late1; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "after round 4 (prorch's) a minor finding doesn't block the push" 0 "blocking at major (round 5: late-prorch)"
 expect "and the minor finding is listed for the PR's follow-up issue, not dropped" 0 "a rare bug (f.txt:1)"
 grep -q -- '--block-on-severity major' "$T/oq-args"; rc=$?
 expect "OpenQodex runs at major late in the PR" 0
-STUB_CHECKS="$(checks 5)" push -q origin feat
+STUB_CHECKS="$(checks 5)" push -q origin pr5
 expect "and the push passes while the PR is late" 0
 change late2; STUB_CHECKS="$(checks 3)" STUB_OQ=minoronly prepush
-expect "before round 5 a minor finding still blocks" 1 "blocking at minor (round 3: early)"
-STUB_CHECKS="$(checks 5)" push -q origin feat
+expect "before round 5 a minor finding still blocks" 1 "blocking at minor (round 3: early-prorch)"
+STUB_CHECKS="$(checks 5)" push -q origin pr5
 expect "a minor-level review that only a minor blocked passes once the PR is late" 0 "minor finding(s) did not block"
 change late3; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
-STUB_CHECKS="$(checks 1)" push -q origin feat
-expect "a review run at major doesn't count once the PR is back in round 1" 1 "the gate uses minor now"
-change late4; STUB_CHECKS="$(checks 5 some-ci)" STUB_OQ=minoronly prepush
-expect "a round from another app's check is ignored (blocks as before)" 1 "blocking at minor (round ?: no-round)"
-change late5; STUB_OQ=minoronly prepush
-expect "no prorch check on the PR head blocks as before" 1 "no-round"
-change late5f; STUB_PR_CROSS=1 STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
-expect "a fork's open PR with the same branch name doesn't lower the bar (3.4)" 1 "no-open-pr"
-change late6; unset STUB_PR_HEAD; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
-expect "no open PR blocks as before" 1 "no-open-pr"
-export STUB_PR_HEAD=2222222222222222222222222222222222222222
+STUB_CHECKS="$(checks 1)" push -q origin pr5
+expect "a review run at major doesn't count once the PR is back below round 5" 1 "the gate uses minor now (round 3)"
+fresh ci; change late4; STUB_CHECKS="$(checks 5 some-ci)" STUB_OQ=minoronly prepush
+expect "a round from another app's check is ignored" 1 "blocking at minor (round 1: early-local)"
+fresh nocheck; change late5; STUB_OQ=minoronly prepush
+expect "no prorch check on the PR head: the branch's own count decides" 1 "blocking at minor (round 1: early-local)"
+fresh fork; change late5f; STUB_PR_CROSS=1 STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "a fork's open PR with the same branch name doesn't lower the bar (3.4)" 1 "blocking at minor (round 1: early-local)"
+fresh nopr; unset STUB_PR_HEAD; change late6; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "no open PR: the branch's own count decides" 1 "blocking at minor (round 1: early-local)"
+# the branch's own count (no prorch round), under a policy with no late rule: the gate's own (from round 5, major)
 printf 'check_name: review-policy\nprepush:\n  openqodex_block_on: major\n' >"$pol"
-change late7; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
-expect "a policy without the late rule, or one looser than the gate's every-round floor, blocks as before" 1 "blocking at minor (round ?: no-late-rule)"
+fresh loc
+for i in 1 2 3 4; do
+  change "loc$i"; STUB_OQ=minoronly prepush
+  expect "round $i of the branch's own pre-push reviews: a minor still blocks (and a looser every-round value doesn't loosen it)" 1 "blocking at minor (round $i: early-local)"
+done
+change loc5; STUB_OQ=minoronly prepush
+expect "the branch's 5th pre-push review: minors no longer block (the gate's default late rule)" 0 "blocking at major (round 5: late-local)"
+STUB_OQ=minoronly prepush
+expect "reviewing the same commit again is not another round" 0 "blocking at major (round 5: late-local)"
+push -q origin loc
+expect "and the push passes on the branch's own count" 0
+fresh loc; change reuse1; STUB_OQ=minoronly prepush
+expect "a reused branch name starts from round 1: the old branch's commits aren't on it (3.4)" 1 "blocking at minor (round 1: early-local)"
+printf 'check_name: review-policy\nprepush:\n  late:\n    from_round: soon\n    openqodex_block_on: major\n' >"$pol"
+fresh bad; change bad1; STUB_OQ=minoronly prepush
+expect "a malformed late rule blocks as before" 1 "blocking at minor (round ?: bad-late-rule)"
+printf 'prepush: [unclosed\n' >"$pol"
+fresh badyaml; change bady1; STUB_OQ=minoronly prepush
+expect "a policy that doesn't parse blocks as before (never the gate's default late rule)" 1 "blocking at minor (round ?: bad-policy)"
 rm -f "$pol"
-change late8; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+fresh nopol; change late8; STUB_OQ=minoronly prepush
 expect "no readable policy blocks as before" 1 "no-policy"
+latepol; git -C "$W" checkout -q --detach && change detached && STUB_OQ=minoronly prepush
+expect "a detached head blocks as before" 1 "no-branch"
+git -C "$W" checkout -q feat; rm -f "$pol"
 unset STUB_PR_HEAD
 
 # ── install-githooks ──
