@@ -3,7 +3,7 @@
 A thin [MCP](https://modelcontextprotocol.io) stdio server that wraps local
 AI **code-review CLIs** so any MCP client (Claude Code, etc.) can run reviews as
 tool calls — no PR required — plus a **PR gate**: open the PR as a draft, let the PR
-reviewers (Kodus + Greptile; CodeRabbit was retired on 2026-11-12) review it, and
+reviewers (Kodus + CodeRabbit; Greptile is out of credits, Tim 2026-11-13) review it, and
 `gh pr ready` is blocked until two reviews are green on the PR's final commit.
 
 Reviewers wrapped (each shells out to its CLI; no review logic reimplemented):
@@ -82,7 +82,7 @@ Each reviewer exposes a `*_status` tool (CLI version + auth) and a `*_review` to
 `review-gate` + `hooks/pre-pr-coderabbit-gate.sh` enforce "two independent reviews
 before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
 
-- `gh pr create --draft` (or `-d`) is **always allowed**: Kodus and Greptile only review a PR that exists, so the draft is how they get to see it.
+- `gh pr create --draft` (or `-d`) is **always allowed**: Kodus and CodeRabbit only review a PR that exists, so the draft is how they get to see it (CodeRabbit skips drafts unless asked: comment `@coderabbitai review`).
   `gh pr ready --undo` is not gated either.
 - `gh pr ready` and a **non-draft** `gh pr create` are blocked until `review-gate check`
   passes for the PR's commit. For `gh pr ready` that is the PR's head on GitHub (looked up
@@ -108,14 +108,14 @@ before a PR is ready". Wired as a Claude Code `PreToolUse` hook:
 1. at least **two different reviewers** have a pass recorded for the commit
    (`REVIEW_GATE_MIN`, default 2);
 2. every **primary** reviewer has a pass **or** an announced skip. Primaries are
-   `kodus greptile` (CodeRabbit was retired on 2026-11-12);
+   `kodus coderabbit` (Tim 2026-11-13: CodeRabbit back in for Greptile, which is out of credits);
    override with `REVIEW_GATE_PRIMARY` (`REVIEW_GATE_REQUIRED` is read as a legacy alias);
 3. a `self` pass only counts once `codex` has a pass or a skip (Codex is the first fallback);
 4. the commit has a **pre-push review**, the same check the git pre-push hook makes: a finished OpenQodex review
    of exactly that commit that passed (or whose findings were declined with `prepush-accept`, which every check
    announces), given the punch list that is on main now. See the next section.
 
-Reviewers: `kodus`, `greptile` (primaries; `coderabbit` stays valid for old records), `codex` (fallback), `self`
+Reviewers: `kodus`, `coderabbit` (primaries; `greptile` stays valid for old records), `codex` (fallback), `self`
 (the agent's own thorough review, last resort). `agy` stays valid for old records. `kimi`
 (the retired `kimi-review` pass) is no longer a reviewer: a leftover kimi marker is ignored
 and never counts.
@@ -188,9 +188,9 @@ Workflow:
 
 ```bash
 gh pr create --draft ...                 # always allowed; Kodus reviews it automatically
-# start Greptile: comment `@greptileai review`
+# start CodeRabbit: comment `@coderabbitai review`
 # fix high findings, fix medium ones or say why not, push, request a re-review; then for each clean pass:
-./review-gate record kodus               # and: record greptile
+./review-gate record kodus               # and: record coderabbit
 gh pr ready                              # now allowed
 ```
 
@@ -508,7 +508,7 @@ real review on a throwaway repo; then bump `OQ_VERSION` (and the stub) in a revi
 
 - `CODERABBIT_BIN` / `CODEX_BIN` — explicit binary paths (if not on `PATH`)
 - `CODERABBIT_TIMEOUT_SECONDS` (default 600) / `CODEX_TIMEOUT_SECONDS` (default 900)
-- `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus greptile`; valid: `kodus coderabbit greptile codex self agy`)
+- `REVIEW_GATE_PRIMARY` — space-separated primary reviewers (default `kodus coderabbit`; valid: `kodus coderabbit greptile codex self agy`)
 - `REVIEW_GATE_MIN` — how many different reviewers must pass (default 2)
 - the pre-push settings are listed above
 
