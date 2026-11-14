@@ -147,12 +147,14 @@ at_or_above() {
 # below_bar <record> <severity>: the findings at minor or above that didn't block because the PR is late are not
 # dropped: they are printed, to go into the PR's follow-up issue with its other deferred P3s.
 below_bar() {
-  local rd n; rd="$(jq -r .run_dir "$1")"
-  [ "$(sev_rank "$2")" -gt 1 ] || return 0
-  n="$(jq -r '[.findings[]? | select(.severity == "minor")] | length' "$rd/report.json" 2>/dev/null || echo 0)"
+  local rd n r; rd="$(jq -r .run_dir "$1")"; r="$(sev_rank "$2")"
+  [ "$r" -gt 1 ] || return 0
+  # every finding from minor up to (not including) this push's threshold: with a late rule of critical, majors too
+  local sel='.findings[]? | select(({minor:1, major:2, critical:3}[.severity] // 0) as $s | $s >= 1 and $s < $r)'
+  n="$(jq -r --argjson r "$r" "[$sel] | length" "$rd/report.json" 2>/dev/null || echo 0)"
   [ "$n" -gt 0 ] 2>/dev/null || return 0
-  echo "review-gate: $n minor finding(s) did not block (late in the PR: $2 and above block). Put each in the PR's follow-up issue:" >&2
-  jq -r '.findings[]? | select(.severity == "minor") | "  - \(.title) (\(.file_path // "?"):\(.line_number // "?"))"' "$rd/report.json" >&2
+  echo "review-gate: $n finding(s) below $2 did not block (late in the PR: $2 and above block). Put each in the PR's follow-up issue:" >&2
+  jq -r --argjson r "$r" "$sel"' | "  - \(.severity): \(.title) (\(.file_path // "?"):\(.line_number // "?"))"' "$rd/report.json" >&2
 }
 # local_round <branch> <tip> <base commit>: how many of this branch's commits have a recorded pre-push review: records
 # naming the branch whose commit is on it (an ancestor of the tip, not of the base), so a reused branch name or a
@@ -457,10 +459,10 @@ run_prepush() {
   local st mb; mb="$(git merge-base "$base" "$head")" && st="$(oq_state_files "$mb" "$head")" || fail "couldn't diff $base..HEAD"
   [ -z "$st" ] || fail "the change commits files under .openqodex/, which OpenQodex neither reviews nor counts in its change id (remove them): $(printf '%s' "$st" | head -n 3 | tr '\n' ' ')"
   # This push's threshold (round-aware, effective_block_on): written into the review's config and its record.
-  # This run counts as a round unless this commit already has a record on this branch (a review run again).
-  local blk eround ewhy this=1
-  [ "$(jq -r .branch "$pdir/$head.json" 2>/dev/null)" = "$branch" ] && this=0
-  read -r blk eround ewhy < <(effective_block_on "$branch" "$head" "$mb" "$this")
+  # This run is one round: this commit's old record, if any, was removed above, so a review run again is the same
+  # round, never another.
+  local blk eround ewhy
+  read -r blk eround ewhy < <(effective_block_on "$branch" "$head" "$mb" 1)
   [ "$(sev_rank "${blk:-}")" -ge 0 ] || blk="$BLOCK_ON"
   echo "review-gate: blocking at $blk (round $eround: $ewhy)" >&2
   # The current punch list, checked against its git blob ids, copied where OpenQodex reads convention files.

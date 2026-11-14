@@ -578,7 +578,7 @@ expect "and the push passes while the PR is late" 0
 change late2; STUB_CHECKS="$(checks 3)" STUB_OQ=minoronly prepush
 expect "before round 5 a minor finding still blocks" 1 "blocking at minor (round 3: early-prorch)"
 STUB_CHECKS="$(checks 5)" push -q origin pr5
-expect "a minor-level review that only a minor blocked passes once the PR is late" 0 "minor finding(s) did not block"
+expect "a minor-level review that only a minor blocked passes once the PR is late" 0 "finding(s) below major did not block"
 change late3; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
 STUB_CHECKS="$(checks 1)" push -q origin pr5
 expect "a review run at major doesn't count once the PR is back below round 5" 1 "the gate uses minor now (round 3)"
