@@ -315,8 +315,10 @@ cp "$m" "$T/m2"; prev="$(git -C "$W" rev-parse HEAD~1)"; pm="${m%/*}/$prev.json"
 push -q origin HEAD~1:refs/heads/prev
 expect "a record copied to another commit's name blocks" 1 "unreadable record"
 rm -f "$pm"
+REVIEW_GATE_BLOCK_ON=nitpick push -q origin feat
+expect "a review run at a looser block_on_severity than the gate's doesn't count" 1 "block_on_severity"
 REVIEW_GATE_BLOCK_ON=critical push -q origin feat
-expect "a review run with another block_on_severity doesn't count" 1 "block_on_severity"
+expect "a review run at a stricter block_on_severity than the gate's counts (3.10)" 0
 push -q origin feat
 expect "the untouched record passes" 0
 
@@ -554,6 +556,45 @@ out="$(cd "$W" && XDG_STATE_HOME="$T/q" HOME="$T/q" bash "$gate" prepush-accept 
 grep -q $'\tprepush-accept\t.*declined: covered by an upstream check' "$REVIEW_GATE_BYPASS_LOG" || rc=9
 [ ! -e "$T/q" ] || rc=8
 expect "prepush-accept writes the acceptance to the bypass log, wherever XDG_STATE_HOME/HOME point" 0 "logged to"
+
+# ── round-aware threshold (pr-orchestrator 3.10): late in a PR only serious findings block ──
+pol="$T/punch/review/policy.yaml"
+printf 'check_name: review-policy\nprepush:\n  openqodex_block_on: minor\n  late:\n    from_round: 5\n    openqodex_block_on: major\n' >"$pol"
+checks() {   # checks <round> [app]: prorch's check on the PR head
+  printf '{"check_runs": [{"name": "review-policy (shadow)", "app": {"slug": "%s"}, "started_at": "2026-11-14T00:00:00Z",
+    "output": {"title": "round 0 failed (no pre-push review); round %s/6, waiting on Kodus"}}]}' "${2:-jbot-orchestrator}" "$1"
+}
+export STUB_PR_HEAD=2222222222222222222222222222222222222222
+: >"$T/oq-args"; change late1; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "after round 4 a minor finding doesn't block the push" 0 "blocking at major (round 5: late)"
+expect "and the minor finding is listed for the PR's follow-up issue, not dropped" 0 "a rare bug (f.txt:1)"
+grep -q -- '--block-on-severity major' "$T/oq-args"; rc=$?
+expect "OpenQodex runs at major late in the PR" 0
+STUB_CHECKS="$(checks 5)" push -q origin feat
+expect "and the push passes while the PR is late" 0
+change late2; STUB_CHECKS="$(checks 3)" STUB_OQ=minoronly prepush
+expect "before round 5 a minor finding still blocks" 1 "blocking at minor (round 3: early)"
+STUB_CHECKS="$(checks 5)" push -q origin feat
+expect "a minor-level review that only a minor blocked passes once the PR is late" 0 "minor finding(s) did not block"
+change late3; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+STUB_CHECKS="$(checks 1)" push -q origin feat
+expect "a review run at major doesn't count once the PR is back in round 1" 1 "the gate uses minor now"
+change late4; STUB_CHECKS="$(checks 5 some-ci)" STUB_OQ=minoronly prepush
+expect "a round from another app's check is ignored (blocks as before)" 1 "blocking at minor (round ?: no-round)"
+change late5; STUB_OQ=minoronly prepush
+expect "no prorch check on the PR head blocks as before" 1 "no-round"
+change late5f; STUB_PR_CROSS=1 STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "a fork's open PR with the same branch name doesn't lower the bar (3.4)" 1 "no-open-pr"
+change late6; unset STUB_PR_HEAD; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "no open PR blocks as before" 1 "no-open-pr"
+export STUB_PR_HEAD=2222222222222222222222222222222222222222
+printf 'check_name: review-policy\nprepush:\n  openqodex_block_on: major\n' >"$pol"
+change late7; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "a policy without the late rule, or one looser than the gate's every-round floor, blocks as before" 1 "blocking at minor (round ?: no-late-rule)"
+rm -f "$pol"
+change late8; STUB_CHECKS="$(checks 5)" STUB_OQ=minoronly prepush
+expect "no readable policy blocks as before" 1 "no-policy"
+unset STUB_PR_HEAD
 
 # ── install-githooks ──
 git init -q "$T/inst"
