@@ -6,7 +6,13 @@ set -euo pipefail
 [ -z "${PUNCH_FAIL:-}" ] || { echo "stub gh: failing as asked" >&2; exit 1; }
 case "${1:-}" in
   auth) echo stub-token; exit 0 ;;
-  pr) [ "${2:-}" = view ] && [ -n "${STUB_PR_BASE:-}" ] && { echo "$STUB_PR_BASE"; exit 0; }; exit 1 ;;
+  pr) [ "${2:-}" = view ] || exit 1
+      # the round-aware threshold asks for the open PR's head: STUB_PR_HEAD (none: no open PR)
+      # STUB_PR_CROSS=1: that PR is a fork's (the gate's isCrossRepository filter then prints nothing)
+      case "$*" in *headRefOid*) [ -n "${STUB_PR_HEAD:-}" ] || exit 1
+        case "$*" in *isCrossRepository*) [ -n "${STUB_PR_CROSS:-}" ] && exit 0 ;; esac
+        echo "$STUB_PR_HEAD"; exit 0 ;; esac
+      [ -n "${STUB_PR_BASE:-}" ] && { echo "$STUB_PR_BASE"; exit 0; }; exit 1 ;;
   api) shift ;;
   *) exit 1 ;;
 esac
@@ -15,6 +21,7 @@ raw=0
 url="$1"; path="${url#repos/*/*/}"; path="${path%%\?*}"
 case "$path" in
   commits/main) echo "${PUNCH_REF:-1111111111111111111111111111111111111111}"; exit 0 ;;
+  commits/*/check-runs) printf '%s\n' "${STUB_CHECKS:-{\"check_runs\": []\}}"; exit 0 ;;   # prorch's check (3.10)
   contents/*) rel="${path#contents/}" ;;
   *) echo "stub gh: unexpected $url" >&2; exit 1 ;;
 esac

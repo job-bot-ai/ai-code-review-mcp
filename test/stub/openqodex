@@ -72,6 +72,8 @@ done | jq -s --arg c "$cid" '{version: 1, change_id: $c, config_hash: "x", creat
   instruction_files: ., lenses: [], runtime_version: "0.18.0"}' >"$rd/manifest.json"
 case "$mode" in
   blocked|lie) verdict=blocked; status=complete; kind=complete; findings='[{"severity": "major", "title": "a bug"}, {"severity": "minor", "title": "a rare bug"}]' ;;
+  minoronly) findings='[{"severity": "minor", "title": "a rare bug", "file_path": "f.txt", "line_number": 1}]'
+    case "$blk" in minor|nitpick) verdict=blocked ;; *) verdict=passed ;; esac; status=complete; kind=complete ;;
   incomplete) verdict=incomplete; status=incomplete; kind=incomplete; findings='[]' ;;
   *) verdict=passed; status=complete; kind=complete; findings='[]' ;;
 esac
@@ -90,6 +92,7 @@ jq -n --arg d "$rd" --arg c "$cid" --arg s "$rs" \
   '{version: 2, dir: $d, shown: $d, change_id: $c, report_sha256: $s, written_at: $t}' >"$home/last-review/$rid/last-review.json"
 case "$mode" in
   blocked) echo "Blocked: 1 finding at or above $blk"; exit 1 ;;
+  minoronly) [ "$verdict" = blocked ] && { echo "Blocked: 1 finding at or above $blk"; exit 1; }; echo "Passed"; exit 0 ;;
   incomplete) echo "Review incomplete: 1 changed range was not examined" >&2; exit 2 ;;
   *) echo "Passed: no findings"; exit 0 ;;
 esac

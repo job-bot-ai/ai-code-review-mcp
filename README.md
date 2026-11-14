@@ -341,6 +341,22 @@ nothing is accepted). Every check of that commit announces the reason.
 rarely-surfacing real bugs our punch list is about sit, so `minor` maps P2 and blocking at `major` would let them
 through. Nitpicks and observations never block.
 
+**Late in a PR, only `major` and `critical` block (pr-orchestrator punch list 3.10, Tim 2026-11-14).** Repeat review
+rounds over one new minor each cost more than they find, so from a PR's 5th round on the push threshold is `major`.
+The minors that no longer block are printed, to go into the PR's follow-up issue. The round is the later of:
+
+- **the branch's own count:** one per commit on the branch (an ancestor of the tip, not of the base) with a recorded
+  pre-push review. A commit reviewed again is the same round, and a reused branch name starts again from 1. This
+  source works today. It is the pusher's own record, so it only loosens the pusher's own gate: the same trust
+  `prepush-accept` has.
+- **prorch's round:** `round N/M` in prorch's own `review-policy` check on the open PR's head, from the
+  `jbot-orchestrator` app only (`REVIEW_GATE_PRORCH_APP`), never a fork's PR with the same branch name.
+
+The rule comes from pr-orchestrator's `review/policy.yaml` on main: `prepush.openqodex_block_on` (every round; it
+never loosens `REVIEW_GATE_BLOCK_ON`) and `prepush.late.{from_round, openqodex_block_on}`. A readable policy without a
+late rule gets the gate's own (from round 5, `major`). An unreadable or unparseable policy, a malformed late rule or a
+detached head blocks at `REVIEW_GATE_BLOCK_ON` as before.
+
 **The git hook.** `githooks/pre-push`, installed with `core.hooksPath`, reads git's ref lines and, for each pushed
 branch commit, runs `review-gate check-prepush --rev <sha>`, the same function (`verify_prepush`) `review-gate check`
 uses for `gh pr ready`. (`gh pr ready` passes the PR's own branch, as the resolver found it, with `check --branch`,
@@ -480,7 +496,8 @@ never change the verdict; `openqodex doctor --install` (online, once) would fetc
 
 ### Settings (Tim's; the PreToolUse hook blocks an agent setting them)
 
-- `REVIEW_GATE_BLOCK_ON` — `block_on_severity` (default `minor`); a review run with another value doesn't count
+- `REVIEW_GATE_BLOCK_ON` — `block_on_severity` (default `minor`) in every round; late in a PR the threshold can be
+  higher (see "Late in a PR"). A review run at a looser value than the push needs doesn't count; a stricter one does
 - `REVIEW_GATE_OPENQODEX_OFFLINE=off` — let OpenQodex's network scanners run (default: `--offline`)
 - `REVIEW_GATE_OPENQODEX_MEMORY` — the scope's `MemoryMax` (default `2G`; `off` runs uncapped),
   `REVIEW_GATE_OPENQODEX_SWAP` — its `MemorySwapMax` (default `256M`)
