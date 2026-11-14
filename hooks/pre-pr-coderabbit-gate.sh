@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PreToolUse(Bash) hook: `gh pr create --draft` is always allowed (the PR reviewers —
-# Kodus, Greptile — only review a PR that exists). `gh pr ready` and a non-draft
+# Kodus, CodeRabbit — only review a PR that exists). `gh pr ready` and a non-draft
 # `gh pr create` are blocked until `review-gate check` passes (two different reviewers'
 # passes, primaries passed or skipped) for the PR's commit, in the repo the PR comes from
 # (followed from `cd`/`--repo`/`--head` by resolve-pr-target.mjs; the session cwd is only
@@ -296,11 +296,11 @@ if [ -n "$blocked" ]; then
     echo "BLOCKED by the AI code-review PR gate: two independent reviews must be green on the PR's final commit first."
     echo "$blocked"
     echo "1. Open the PR as a draft (allowed without reviews):  gh pr create --draft ..."
-    echo "2. The primary reviewers review it: Kodus + Greptile."
-    echo "   Kodus starts by itself; comment \`@greptileai review\` to start Greptile."
+    echo "2. The primary reviewers review it: Kodus + CodeRabbit."
+    echo "   Kodus starts by itself; comment \`@coderabbitai review\` to start CodeRabbit (it skips drafts unless asked)."
     echo "   Fix high findings, fix medium ones or say why not, push, request a re-review, then record each clean pass:"
     echo "       $g record kodus"
-    echo "       $g record greptile"
+    echo "       $g record coderabbit"
     echo "   Still findings after two review rounds? Don't push a third fix-by-fix round: first do a deep analysis of the"
     echo "   whole change (root cause shared by the findings, the same bug class elsewhere in the diff, tests), fix that,"
     echo "   and say in the PR body what kept coming up and why before asking for the third review."

@@ -125,13 +125,13 @@ expect "agy stays a valid reviewer for old records" 0
 (cd "$T/d2" && bash "$gate" record bogus >/dev/null 2>&1); rc=$?
 expect "an unknown reviewer is refused" 2
 
-# Default primaries: Kodus + Greptile, whatever the date (CodeRabbit retired 2026-11-12).
+# Default primaries: Kodus + CodeRabbit, whatever the date (Tim 2026-11-13: CodeRabbit back in for Greptile).
 mkdir -p "$T/fakebin"
 printf '#!/bin/sh\ncase "$*" in *+%%Y%%m%%d*) echo "${FAKE_DAY}";; *) exec /bin/date "$@";; esac\n' >"$T/fakebin/date"; chmod +x "$T/fakebin/date"
 for day in 20261112 20261118 20261119; do
   (cd "$T/d2" && FAKE_DAY=$day PATH="$T/fakebin:$PATH" REVIEW_GATE_PRIMARY= bash "$gate" status) >"$T/st" 2>&1
-  grep -q 'greptile .*\[primary\]' "$T/st" && grep -q 'kodus .*\[primary\]' "$T/st" && ! grep -q 'coderabbit .*\[primary\]' "$T/st"; rc=$?
-  expect "on $day the default primaries are kodus + greptile" 0
+  grep -q 'coderabbit .*\[primary\]' "$T/st" && grep -q 'kodus .*\[primary\]' "$T/st" && ! grep -q 'greptile .*\[primary\]' "$T/st"; rc=$?
+  expect "on $day the default primaries are kodus + coderabbit" 0
 done
 
 # ── Draft PRs and gh pr ready ──
@@ -727,9 +727,9 @@ expect "a directory that isn't a git repo is still not gated" 0 stdout "not gate
 
 # ── The block message names the current primaries ──
 run "$T/r" "gh pr ready"
-expect "the block message tells you to record greptile" 2 stderr "record greptile"
-case "$err" in *"record coderabbit"*|*coderabbitai*|*2026-11-1*) fail=$((fail + 1)); echo "FAIL - block message still names CodeRabbit or the date switch";;
-  *) pass=$((pass + 1)); echo "ok   - the block message no longer names CodeRabbit or the date switch";; esac
+expect "the block message tells you to record coderabbit" 2 stderr "record coderabbit"
+case "$err" in *"record greptile"*|*greptileai*|*2026-11-1*) fail=$((fail + 1)); echo "FAIL - block message still names Greptile or the date switch";;
+  *) pass=$((pass + 1)); echo "ok   - the block message no longer names Greptile or the date switch";; esac
 
 echo "# pass $pass"; echo "# fail $fail"
 [ "$fail" -eq 0 ]
